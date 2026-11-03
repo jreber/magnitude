@@ -32,7 +32,7 @@ const run = async (command: readonly string[], diagnostics: "all" | "errors"): P
 export interface BuildLocalInferenceOptions {
   /** Print successful build diagnostics, or retain them only for a failed build. */
   readonly diagnostics?: "all" | "errors"
-  /** The incremental debug build, or the optimized build a release ships. */
+  /** The optimized build a release ships (the default), or the incremental debug build. */
   readonly profile?: InferenceBuildProfile
 }
 
@@ -43,7 +43,7 @@ export interface BuildLocalInferenceOptions {
  */
 export const buildLocalInference = async ({
   diagnostics = "all",
-  profile = "development",
+  profile = "release",
 }: BuildLocalInferenceOptions = {}): Promise<{ readonly installationPath: string }> => {
   const host = hostById(currentHost())
   await run(["bun", "run", "catalog:build-bundle"], diagnostics)

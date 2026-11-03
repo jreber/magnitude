@@ -62,3 +62,5 @@ export const makeIcnInstances = (
 )
 
 export const IcnInstancesLive = makeIcnInstances()
+
+export { readThroughput, type IcnThroughputResult } from "./throughput.js"

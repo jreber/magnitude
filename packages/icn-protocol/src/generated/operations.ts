@@ -864,6 +864,37 @@ export const getModelInstancesOperation = {
   ],
 } as const
 
+export const getModelInstanceThroughputOperation = {
+  operationId: "getModelInstanceThroughput",
+  transport: "http",
+  method: "GET",
+  path: "/api/v1/instances/{instance_id}/throughput",
+  group: "models",
+  successes: [
+    {
+      status: 200,
+      schema: S.suspend(
+        (): S.Schema<Schemas.ModelInstanceThroughput, Schemas.ModelInstanceThroughputEncoded> =>
+          Schemas.ModelInstanceThroughput,
+      ),
+      mediaType: "application/json",
+    },
+  ],
+  errors: [
+    {
+      status: 404,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
+    {
+      status: 503,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
+  ],
+  pathParameters: S.Struct({ instance_id: S.String }),
+} as const
+
 export const getModelPropertiesOperation = {
   operationId: "getModelProperties",
   transport: "http",

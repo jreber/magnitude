@@ -301,6 +301,32 @@ mod tests {
         u64::from_le_bytes(bytes.try_into().unwrap())
     }
 
+    /// A logical region's leading rows read and write to the host within one
+    /// slab, at their logical positions; a range across a slab boundary is
+    /// refused, as one leading-axis slice lies in one slab.
+    #[test]
+    fn row_io_reads_and_writes_within_a_slab() {
+        let device = cpu();
+        let row_bytes = 8;
+        let regions = [SlabRegion { element: Element::f32(), row_shape: vec![2] }];
+        let tensor = SlabTensor::in_pool(&crate::Charges::tally(&device), &pool(&device), 256, 768, &regions).unwrap();
+        for slab in 0..3 {
+            assert_eq!(tensor.add_slab(SlabFill::Zeroed).unwrap(), slab);
+            let fill: Vec<u8> = (0..256 * row_bytes).map(|byte| (byte + slab) as u8).collect();
+            tensor.slab_region(slab, 0).unwrap().unwrap().write_from_host(&fill).unwrap();
+        }
+        let mut logical = tensor.logical_region(0).unwrap();
+        let full = logical.read_to_host().unwrap();
+        assert_eq!(full.len(), 768 * row_bytes);
+        assert_eq!(logical.read_rows_to_host(4, 12).unwrap(), &full[row_bytes * 4..row_bytes * 12]);
+        assert_eq!(logical.read_rows_to_host(256, 512).unwrap(), &full[row_bytes * 256..row_bytes * 512]);
+        let patch = vec![0xaau8; row_bytes * 2];
+        logical.write_rows_from_host(300, 302, &patch).unwrap();
+        assert_eq!(logical.read_rows_to_host(300, 302).unwrap(), patch);
+        assert!(logical.read_rows_to_host(254, 258).is_err());
+        assert!(logical.write_rows_from_host(254, 258, &vec![0u8; row_bytes * 4]).is_err());
+    }
+
     /// Slabs are granules named in the address table region by region; a
     /// freed slot names the pool's zero slab at once, beside live views of
     /// the store, and the lowest free slot is backed first.

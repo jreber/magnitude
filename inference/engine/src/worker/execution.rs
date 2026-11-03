@@ -193,6 +193,12 @@ impl<F: ProgramFamily> Driven for ExecutionOwner<F> {
                 }
                 Ok(WorkerReply::Acknowledged)
             }
+            WorkerCommand::Throughput => match &self.execution {
+                Execution::Serving(owner) | Execution::Draining(owner, _) => {
+                    Ok(WorkerReply::Throughput(owner.throughput()))
+                }
+                Execution::Stopped(cause) => Err(format!("execution stopped: {cause}")),
+            },
         }
     }
 
@@ -249,7 +255,9 @@ impl<F: ProgramFamily> Driven for ExecutionOwner<F> {
                     Err(error) => self.execution = Execution::Stopped(UnloadCause::from(&error)),
                 },
                 Execution::Draining(owner, cause) => match owner.run(now) {
-                    Ok((owner, Ran { in_flight: false, .. })) => {
+                    Ok((mut owner, Ran { in_flight: false, .. })) => {
+                        // Shutdown and memory-pressure drains both lose the RAM cache.
+                        owner.spill_on_unload();
                         self.ended = Some(owner);
                         self.execution = Execution::Stopped(cause)
                     }

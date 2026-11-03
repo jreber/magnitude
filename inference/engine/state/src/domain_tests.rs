@@ -1100,3 +1100,77 @@ fn a_window_historys_pages_stay_within_its_capped_state_bytes() {
     assert_eq!(most, cap, "a window straddling a page boundary in flight holds the capped pages");
     assert_eq!(state_bytes(&single, context, max_advance, granule, 1, context as u64).unwrap(), cap.div_ceil(slab_rows) as u64 * granule);
 }
+
+/// A checkpoint's export imports as a live state holding its rows and its
+/// bank: what it re-exports is what was saved, though every row and bank the
+/// export was read from was cleared before the import.
+#[test]
+fn an_exported_checkpoint_imports_its_rows_and_bank() {
+    let device = cpu_device();
+    let (store, _bindings) = device
+        .store(
+            64,
+            16,
+            vec![
+                HistoryDomainPlan {
+                    layout: HistoryDomainLayout::Token {
+                        components: vec![component(0, 1)],
+                    },
+                    logical_rows: 64,
+                },
+                HistoryDomainPlan {
+                    layout: HistoryDomainLayout::Window {
+                        rows: 4,
+                        components: vec![component(1, 2)],
+                    },
+                    logical_rows: 64,
+                },
+            ],
+            vec![ComponentSpec {
+                shape: vec![4],
+                dtype: DType::F32,
+            }],
+            banks(),
+        )
+        .unwrap();
+    let state = commit(store.create().unwrap(), 10);
+    assert_eq!(state.history_start(WINDOW), 6, "Window(4) at position 10");
+    let fill = |value: Option<u8>| {
+        for plane in store.history_planes().unwrap() {
+            let mut bytes = vec![0u8; plane.buffer.byte_len() as usize];
+            if let Some(value) = value {
+                for (row, chunk) in bytes.chunks_exact_mut(plane.row_bytes).enumerate() {
+                    chunk.fill(value.wrapping_add(row as u8));
+                }
+            }
+            plane.buffer.clone().write_from_host(&bytes).unwrap();
+        }
+        for arena in store.recurrent_arenas().iter() {
+            let bytes = vec![value.unwrap_or(0); arena.byte_len() as usize];
+            arena.clone().write_from_host(&bytes).unwrap();
+        }
+    };
+    fill(Some(1));
+    let exported = state.checkpoint().export().unwrap();
+    assert_eq!(exported.bank, vec![vec![1u8; 16]]);
+    drop(state);
+    fill(None);
+    let restored = store.import(&exported).unwrap();
+    assert_eq!(restored.position(), 10);
+    assert_eq!(restored.history_start(TOKEN), 0);
+    assert_eq!(restored.history_start(WINDOW), 6);
+    let reexported = restored.checkpoint().export().unwrap();
+    assert_eq!(
+        (reexported.position, reexported.tape, &reexported.starts),
+        (exported.position, exported.tape, &exported.starts)
+    );
+    assert_eq!(reexported.bank, exported.bank);
+    assert_eq!(reexported.history.len(), exported.history.len());
+    for (saved, restored) in exported.history.iter().zip(&reexported.history) {
+        assert_eq!(
+            (saved.domain, saved.region, saved.row_bytes),
+            (restored.domain, restored.region, restored.row_bytes)
+        );
+        assert_eq!(saved.bytes, restored.bytes);
+    }
+}

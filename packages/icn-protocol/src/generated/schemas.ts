@@ -2792,6 +2792,30 @@ export const ModelInstancesSnapshot = S.Struct({
 export type ModelInstancesSnapshot = S.Schema.Type<typeof ModelInstancesSnapshot>
 export type ModelInstancesSnapshotEncoded = S.Schema.Encoded<typeof ModelInstancesSnapshot>
 
+export const ModelInstanceThroughput = S.Union(
+  S.extend(
+    S.Struct({
+      instanceId: S.suspend((): S.Schema<ModelInstanceId, ModelInstanceIdEncoded> => ModelInstanceId),
+      modelId: S.suspend((): S.Schema<ModelId, ModelIdEncoded> => ModelId),
+      state: S.Literal("warming-up"),
+      windowMs: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.Struct({
+      instanceId: S.suspend((): S.Schema<ModelInstanceId, ModelInstanceIdEncoded> => ModelInstanceId),
+      modelId: S.suspend((): S.Schema<ModelId, ModelIdEncoded> => ModelId),
+      state: S.Literal("ready"),
+      tokensPerSecond: S.Number,
+      windowMs: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+)
+export type ModelInstanceThroughput = S.Schema.Type<typeof ModelInstanceThroughput>
+export type ModelInstanceThroughputEncoded = S.Schema.Encoded<typeof ModelInstanceThroughput>
+
 export const ModelLoadDetails = S.Union(
   S.extend(
     S.Struct({

@@ -21,7 +21,7 @@ use crate::{
 };
 use magnitude_family_contracts::{ModelDefinition, PreparedModelInput};
 use magnitude_state::{
-    OwnedAdvanceResolution, OwnedChainAdvance, OwnedStateAdvance,
+    ExportedState, OwnedAdvanceResolution, OwnedChainAdvance, OwnedStateAdvance,
     OwnedTailRelocation, RowDemand, SequenceState, StateCheckpoint, StateStore, StoreBindings,
     TentativeAdvance,
 };
@@ -597,6 +597,16 @@ impl ResumeState {
     /// The target store's checkpoint of the sequence.
     pub fn target(&self) -> &magnitude_state::StateCheckpoint {
         &self.target
+    }
+
+    /// The head checkpoint, when the domain has a head arena.
+    pub fn head(&self) -> Option<&StateCheckpoint> {
+        self.head.as_ref()
+    }
+
+    /// The MTP boundary feature, when the domain has one.
+    pub fn boundary(&self) -> Option<&FeatureRef> {
+        self.boundary.as_ref()
     }
 }
 

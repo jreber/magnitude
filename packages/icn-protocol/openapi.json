@@ -1441,6 +1441,57 @@
         }
       }
     },
+    "/api/v1/instances/{instance_id}/throughput": {
+      "get": {
+        "tags": [
+          "models"
+        ],
+        "operationId": "getModelInstanceThroughput",
+        "parameters": [
+          {
+            "name": "instance_id",
+            "in": "path",
+            "description": "Model instance ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Live engine throughput for the exact instance",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ModelInstanceThroughput"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Model instance not found or not ready",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Throughput observation failed or timed out",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/local-models": {
       "get": {
         "tags": [
@@ -9346,6 +9397,71 @@
           }
         },
         "additionalProperties": false
+      },
+      "ModelInstanceThroughput": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "instanceId",
+              "modelId",
+              "windowMs",
+              "state"
+            ],
+            "properties": {
+              "instanceId": {
+                "$ref": "#/components/schemas/ModelInstanceId"
+              },
+              "modelId": {
+                "$ref": "#/components/schemas/ModelId"
+              },
+              "windowMs": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "state": {
+                "type": "string",
+                "enum": [
+                  "warming-up"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "instanceId",
+              "modelId",
+              "windowMs",
+              "tokensPerSecond",
+              "state"
+            ],
+            "properties": {
+              "instanceId": {
+                "$ref": "#/components/schemas/ModelInstanceId"
+              },
+              "modelId": {
+                "$ref": "#/components/schemas/ModelId"
+              },
+              "windowMs": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "tokensPerSecond": {
+                "type": "number",
+                "format": "double"
+              },
+              "state": {
+                "type": "string",
+                "enum": [
+                  "ready"
+                ]
+              }
+            }
+          }
+        ]
       },
       "ModelInstancesInvalidation": {
         "type": "object",

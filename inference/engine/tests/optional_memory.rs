@@ -59,6 +59,7 @@ fn plain_owner(
         device: DeviceRequest::Automatic,
         kernel_cache: std::env::var_os("MAGNITUDE_TEST_KERNEL_CACHE").map(PathBuf::from),
         release: ReleaseRate::of_machine(None),
+        model_sha256: None,
     }
     .resolve()
     .unwrap();
@@ -76,6 +77,9 @@ fn plain_owner(
                 workload_state_bytes: u64::MAX,
             },
             wakes,
+            None,
+            None,
+            0,
         )
     });
     (host, vocabulary, tokenizer)
@@ -309,6 +313,7 @@ fn mtp_head_charge_releases_and_reloads_after_idle() {
         device: DeviceRequest::Automatic,
         kernel_cache: std::env::var_os("MAGNITUDE_TEST_KERNEL_CACHE").map(PathBuf::from),
         release: ReleaseRate::of_machine(None),
+        model_sha256: None,
     }
     .resolve()
     .unwrap();
@@ -426,6 +431,7 @@ fn concurrent_mtp_first_head_bind_reconciles_memory() {
         device: DeviceRequest::Automatic,
         kernel_cache: std::env::var_os("MAGNITUDE_TEST_KERNEL_CACHE").map(PathBuf::from),
         release: ReleaseRate::of_machine(None),
+        model_sha256: None,
     }
     .resolve()
     .unwrap();
@@ -510,6 +516,7 @@ fn admission_reclaims_under_a_real_process_limit() {
         device: DeviceRequest::Automatic,
         kernel_cache: std::env::var_os("MAGNITUDE_TEST_KERNEL_CACHE").map(PathBuf::from),
         release: ReleaseRate::of_machine(None),
+        model_sha256: None,
     }
     .resolve()
     .unwrap();

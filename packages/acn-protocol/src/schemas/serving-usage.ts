@@ -31,3 +31,20 @@ export const ServingUsageSnapshot = Schema.Union(
   }),
 )
 export type ServingUsageSnapshot = typeof ServingUsageSnapshot.Type
+
+export const EngineInstanceId = Schema.NonEmptyString.pipe(Schema.brand("EngineInstanceId"))
+export const EngineThroughputSnapshot = Schema.Union(
+  Schema.TaggedStruct("Unavailable", { message: Schema.String }),
+  Schema.TaggedStruct("WarmingUp", {
+    instanceId: EngineInstanceId,
+    modelId: ServingModelId,
+    windowMs: Schema.Literal(10_000),
+  }),
+  Schema.TaggedStruct("Ready", {
+    instanceId: EngineInstanceId,
+    modelId: ServingModelId,
+    windowMs: Schema.Literal(10_000),
+    tokensPerSecond: Schema.Number.pipe(Schema.nonNegative()),
+  }),
+)
+export type EngineThroughputSnapshot = typeof EngineThroughputSnapshot.Type

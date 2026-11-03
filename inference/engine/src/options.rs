@@ -425,6 +425,21 @@ pub struct ExecutionManifest {
     /// The machine's page-release rate, which a load's searches price giving
     /// memory back by.
     pub release: ReleaseRate,
+    /// The model package's SHA-256 content hash, when the host names one;
+    /// `None` identifies no model for the disk tier.
+    #[serde(default)]
+    pub model_sha256: Option<String>,
+    /// The directory the host keeps its SSD state cache under; `None` caches
+    /// no state on disk.
+    #[serde(default)]
+    pub state_cache: Option<PathBuf>,
+    /// The bytes the SSD state cache may occupy.
+    #[serde(default = "default_state_cache_budget")]
+    pub state_cache_budget_bytes: u64,
+    /// The hex identity the SSD state cache's entries are keyed by, set by
+    /// `EngineConfiguration::resolve`; `None` keys no disk state.
+    #[serde(default)]
+    pub state_cache_identity: Option<String>,
     /// How the model's Prepare tunes, and the budget its load reads records
     /// under: [`TuningSettings::STANDARD`] unless a diagnostic host chooses
     /// a budget or fresh tuning. A load never searches and reads stored
@@ -433,6 +448,44 @@ pub struct ExecutionManifest {
     /// Where the Prepare and the load each append their tuning trace (JSON
     /// Lines); `None` records none.
     pub tuning_trace: Option<PathBuf>,
+}
+
+/// The host's standing budget for the SSD state cache.
+fn default_state_cache_budget() -> u64 {
+    64 * 1024 * 1024 * 1024
+}
+
+/// The bound on the sum of every identity dir under `cache/state` (each is
+/// bounded by [`default_state_cache_budget`]); it must be at least that large.
+/// A rebuild or model change starts a new identity dir and leaves the old one;
+/// the least recently used dirs are removed past this bound.
+pub fn default_state_cache_total_budget() -> u64 {
+    128 * 1024 * 1024 * 1024
+}
+
+/// The identity a disk-cached state is keyed by: the blake3 hash over the
+/// manifest's model content hash, the KV codec identity, the template
+/// fingerprint and the engine build, in that order, each followed by one
+/// `0x00` separator byte. Never the state cache path or budget. `None` when
+/// the host names no model content hash.
+pub fn cache_identity(
+    manifest: &ExecutionManifest,
+    kv_codec_identity: &[u8],
+    template_fingerprint: &[u8],
+    engine_build: &[u8],
+) -> Option<[u8; 32]> {
+    let model_sha256 = manifest.model_sha256.as_ref()?;
+    let mut hasher = blake3::Hasher::new();
+    for input in [
+        model_sha256.as_bytes(),
+        kv_codec_identity,
+        template_fingerprint,
+        engine_build,
+    ] {
+        hasher.update(input);
+        hasher.update(&[0]);
+    }
+    Some(*hasher.finalize().as_bytes())
 }
 
 /// Device-free readiness evidence returned only after worker construction has
@@ -576,6 +629,10 @@ impl ExecutionManifest {
             kernel_cache,
             model_store,
             release,
+            model_sha256: None,
+            state_cache: None,
+            state_cache_budget_bytes: default_state_cache_budget(),
+            state_cache_identity: None,
             tuning: TuningSettings::STANDARD,
             tuning_trace: None,
         })
@@ -1183,6 +1240,21 @@ pub(crate) mod tests {
             assert_eq!(decoded.tuning_trace, manifest.tuning_trace, "{case}");
             assert!(receiver.receive().unwrap().is_none(), "{case}: one frame");
         }
+    }
+
+    #[test]
+    fn cache_identity_is_stable() {
+        let manifest = |sha: Option<&str>| ExecutionManifest {
+            model_sha256: sha.map(str::to_string),
+            ..manifest_with_kernel_cache(None)
+        };
+        let identity = |manifest: &ExecutionManifest| {
+            cache_identity(manifest, b"kv-codec", b"template", b"engine-build")
+        };
+        let named = manifest(Some("e3b0c442"));
+        assert_eq!(identity(&named), identity(&manifest(Some("e3b0c442"))));
+        assert_ne!(identity(&named), identity(&manifest(Some("9f2c1a00"))));
+        assert_eq!(identity(&manifest(None)), None);
     }
 
     /// A fixture manifest whose host named `kernel_cache`.

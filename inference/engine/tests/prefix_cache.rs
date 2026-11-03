@@ -18,19 +18,20 @@ use magnitude_engine::{
 };
 use magnitude_executor::{
     platform::{DeviceRequest, ReleaseRate},
-    Demand, ExecutionPath, ExecutorDomain, Operation, Outcome, PhysicalDecision, RequestId,
+    CompletionWake, Demand, ExecutionPath, ExecutorDomain, Operation, Outcome, PhysicalDecision, RequestId,
     ReservedResources, StateBindings, TokenId, WorkKind,
 };
 use magnitude_family_contracts::{PreparedModelInput, TokenPlan};
 use magnitude_generation::{
     EndOfGeneration, Generation, InputLayout, MethodChoice, Options, Sampling, Shaping,
 };
+use tracing::subscriber::with_default;
 use magnitude_scheduler::{
     owner::Owner,
     prefix_cache::{PrefixCacheCapacity, PrefixRetention, MIN_PREFIX_HIT},
     ServiceLimits,
 };
-use magnitude_state::KvCodec;
+use magnitude_state::{ExportedState, KvCodec};
 use owner_host::Host;
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -41,6 +42,12 @@ mod owner_host;
 const CONTEXT: usize = 4096;
 
 fn resolved(projector: bool) -> ResolvedEngineConfiguration {
+    resolved_ctx(projector, CONTEXT)
+}
+
+/// [`resolved`] with an explicit context window: the unit-06 tests prompt
+/// past `CONTEXT`.
+fn resolved_ctx(projector: bool, context_tokens: usize) -> ResolvedEngineConfiguration {
     let variable = |name: &str| {
         PathBuf::from(std::env::var_os(name).unwrap_or_else(|| panic!("set {name}")))
     };
@@ -64,12 +71,13 @@ fn resolved(projector: bool) -> ResolvedEngineConfiguration {
             numerical_profile: None,
             weight_bound: None,
         },
-        context_tokens: Some(CONTEXT),
+        context_tokens: Some(context_tokens),
         service: limits(),
         path: ExecutionPath::Native,
         device: DeviceRequest::Automatic,
         kernel_cache: std::env::var_os("MAGNITUDE_TEST_KERNEL_CACHE").map(PathBuf::from),
         release: ReleaseRate::of_machine(None),
+        model_sha256: None,
     }
     .resolve()
     .unwrap()
@@ -103,6 +111,9 @@ fn owner() -> (Host, usize, std::sync::Arc<ByteBpeTokenizer>) {
                 workload_state_bytes: u64::MAX,
             },
             wakes,
+            None,
+            None,
+            0,
         )
     });
     (host, vocabulary, tokenizer)
@@ -130,13 +141,23 @@ fn text(tokenizer: &ByteBpeTokenizer, seed: u32, len: usize) -> Vec<TokenId> {
 }
 
 fn greedy(prompt: &[TokenId], vocabulary: usize, max_tokens: usize) -> Generation {
+    greedy_ctx(prompt, vocabulary, max_tokens, CONTEXT)
+}
+
+/// [`greedy`] with an explicit context limit for prompts past `CONTEXT`.
+fn greedy_ctx(
+    prompt: &[TokenId],
+    vocabulary: usize,
+    max_tokens: usize,
+    context_limit: usize,
+) -> Generation {
     Generation::new(
         prompt.to_vec(),
         InputLayout::new(prompt.len(), vec![]).unwrap(),
         Options {
             max_tokens,
             output_capacity: max_tokens,
-            context_limit: CONTEXT,
+            context_limit,
             vocabulary,
             stop_tokens: BTreeSet::new(),
             suppressed_tokens: BTreeSet::new(),
@@ -187,7 +208,7 @@ fn run(host: &mut Host, vocabulary: usize, prompts: &[Vec<TokenId>], max_tokens:
         .iter()
         .map(|prompt| (prompt.clone(), Vec::new()))
         .collect::<Vec<_>>();
-    run_with_cache_points(host, vocabulary, &requests, max_tokens)
+    run_with_cache_points(host, vocabulary, &requests, max_tokens, CONTEXT)
 }
 
 /// [`run`] with each prompt's declared cache points.
@@ -196,6 +217,7 @@ fn run_with_cache_points(
     vocabulary: usize,
     requests: &[(Vec<TokenId>, Vec<usize>)],
     max_tokens: usize,
+    context_limit: usize,
 ) -> Vec<Turn> {
     let prompts = requests
         .iter()
@@ -205,7 +227,7 @@ fn run_with_cache_points(
         .iter()
         .map(|(prompt, cache_points)| {
             host.admit(
-                greedy(prompt, vocabulary, max_tokens),
+                greedy_ctx(prompt, vocabulary, max_tokens, context_limit),
                 text_input(prompt),
                 PrefixRetention::Retain {
                     cache_points: cache_points.clone(),
@@ -328,7 +350,9 @@ fn a_growing_conversation_stays_within_the_charged_workload_state() {
     let (domain, bindings, plan) =
         build_native_domain(&resolved.manifest, resolved.host.shared_package()).unwrap();
     let workload = plan.capacity().workload_state_bytes;
-    let mut host = Host::new(|wakes| Owner::with_resource_plan(domain, bindings, limits(), &plan, wakes));
+    let mut host = Host::new(|wakes| {
+        Owner::with_resource_plan(domain, bindings, limits(), &plan, wakes, None, None, 0)
+    });
     let mut prompt = text(&tokenizer, 1, 300);
     let mut previous: Option<usize> = None;
     for turn in 0..12 {
@@ -370,7 +394,9 @@ fn distinct_conversations_commit_no_state_beyond_the_charged_workload() {
     let (domain, bindings, plan) =
         build_native_domain(&resolved.manifest, resolved.host.shared_package()).unwrap();
     let workload = plan.capacity().workload_state_bytes;
-    let mut host = Host::new(|wakes| Owner::with_resource_plan(domain, bindings, limits(), &plan, wakes));
+    let mut host = Host::new(|wakes| {
+        Owner::with_resource_plan(domain, bindings, limits(), &plan, wakes, None, None, 0)
+    });
     let mut released = false;
     for conversation in 0..24 {
         let prompt = text(&tokenizer, 200 + conversation, 600);
@@ -431,7 +457,7 @@ fn short_rewritten_turns_resume_where_the_previous_turn_left_its_prompt() {
         let mut prompt = history.clone();
         prompt.extend(&suffix);
         let [done] =
-            run_with_cache_points(&mut host, vocabulary, &[(prompt, vec![opened, left])], 4)
+            run_with_cache_points(&mut host, vocabulary, &[(prompt, vec![opened, left])], 4, CONTEXT)
                 .try_into()
                 .ok()
                 .unwrap();
@@ -485,7 +511,7 @@ fn a_changed_last_message_resumes_at_its_declared_start() {
     assert_ne!(messages[2].0[system.len()], lead[0]);
     let mut cached = Vec::new();
     for request in &messages {
-        let [done] = run_with_cache_points(&mut host, vocabulary, &[request.clone()], 8)
+        let [done] = run_with_cache_points(&mut host, vocabulary, &[request.clone()], 8, CONTEXT)
             .try_into()
             .ok()
             .unwrap();
@@ -624,26 +650,13 @@ fn encode(
     bindings
 }
 
-/// Forward the input rows `range` and return the last row's logits.
-fn forward(
+/// Run one forward operation and return its last row's logits.
+fn launch(
     domain: &mut ExecutorDomain,
     mut bindings: StateBindings,
-    request: RequestId,
-    input: &PreparedModelInput,
-    range: std::ops::Range<usize>,
+    operation: Operation,
 ) -> (Vec<f32>, StateBindings) {
-    let rows = range.len();
-    let operation = Operation::Forward {
-        request,
-        kind: WorkKind::Prefill,
-        tokens: input.tokens()[range.clone()].to_vec(),
-        position: range.start,
-        conditioning: None,
-        demand: Demand::LOGITS,
-        select: Vec::new(),
-        committed: rows,
-        prime: None,
-    };
+    let rows = operation.row_count();
     let operations = [operation];
     let ReservedResources::Target(reservation) = domain
         .reserve(&mut bindings, &operations)
@@ -672,8 +685,138 @@ fn forward(
     (logits, bindings)
 }
 
+/// Forward the input rows `range` and return the last row's logits.
+fn forward(
+    domain: &mut ExecutorDomain,
+    mut bindings: StateBindings,
+    request: RequestId,
+    input: &PreparedModelInput,
+    range: std::ops::Range<usize>,
+) -> (Vec<f32>, StateBindings) {
+    let rows = range.len();
+    let operation = Operation::Forward {
+        request,
+        kind: WorkKind::Prefill,
+        tokens: input.tokens()[range.clone()].to_vec(),
+        position: range.start,
+        conditioning: None,
+        demand: Demand::LOGITS,
+        select: Vec::new(),
+        committed: rows,
+        prime: None,
+    };
+    launch(domain, bindings, operation)
+}
+
+/// Forward one already-sampled decode token at `position` and return its
+/// logits: a one-row prefill over the current state.
+fn forward_token(
+    domain: &mut ExecutorDomain,
+    bindings: StateBindings,
+    request: RequestId,
+    token: TokenId,
+    position: usize,
+) -> (Vec<f32>, StateBindings) {
+    launch(
+        domain,
+        bindings,
+        Operation::Forward {
+            request,
+            kind: WorkKind::Prefill,
+            tokens: vec![token],
+            position,
+            conditioning: None,
+            demand: Demand::LOGITS,
+            select: Vec::new(),
+            committed: 1,
+            prime: None,
+        },
+    )
+}
+
 fn bits(values: &[f32]) -> Vec<u32> {
     values.iter().map(|value| value.to_bits()).collect()
+}
+
+/// Counts `restore_hit` tracing events (MUST 1); share the counter via the Arc.
+#[derive(Clone, Default)]
+struct RestoreHits(std::sync::Arc<std::sync::atomic::AtomicU64>);
+
+impl RestoreHits {
+    fn get(&self) -> u64 {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+struct HitVisitor {
+    hit: bool,
+}
+impl Default for HitVisitor {
+    fn default() -> Self {
+        Self { hit: false }
+    }
+}
+impl tracing::field::Visit for HitVisitor {
+    fn record_debug(&mut self, _f: &tracing::field::Field, _v: &dyn std::fmt::Debug) {}
+    fn record_bool(&mut self, f: &tracing::field::Field, v: bool) {
+        if f.name() == "restore_hit" && v {
+            self.hit = true;
+        }
+    }
+}
+
+impl tracing::Subscriber for RestoreHits {
+    fn enabled(&self, _m: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+    fn new_span(&self, _a: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn event(&self, event: &tracing::Event<'_>) {
+        let mut v = HitVisitor::default();
+        event.record(&mut v);
+        if v.hit {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    fn record(&self, _s: &tracing::span::Id, _v: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _s: &tracing::span::Id, _f: &tracing::span::Id) {}
+    fn enter(&self, _s: &tracing::span::Id) {}
+    fn exit(&self, _s: &tracing::span::Id) {}
+}
+
+fn argmax(logits: &[f32]) -> TokenId {
+    logits
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1.total_cmp(b.1))
+        .map(|(i, _)| TokenId(i as u32))
+        .unwrap_or_else(|| TokenId(0))
+}
+
+/// Greedily decode `steps` tokens from a state at `position`: the first
+/// token comes from `first_logits` (the last prefill row), each later one
+/// is the argmax of the previous decode row's logits. Returns the tokens
+/// and every row's logits, in step order (one logits row per token).
+fn greedy_decode(
+    domain: &mut ExecutorDomain,
+    mut bindings: StateBindings,
+    request: RequestId,
+    first_logits: Vec<f32>,
+    position: usize,
+    steps: usize,
+) -> (Vec<TokenId>, Vec<Vec<f32>>, StateBindings) {
+    let mut logits_rows = vec![first_logits.clone()];
+    let mut tokens = Vec::with_capacity(steps);
+    let mut next = argmax(&first_logits);
+    for _ in 0..steps {
+        tokens.push(next);
+        let (logits, b) = forward_token(domain, bindings, request, next, position + tokens.len() - 1);
+        bindings = b;
+        logits_rows.push(logits.clone());
+        next = argmax(&logits);
+    }
+    (tokens, logits_rows, bindings)
 }
 
 /// A prompt with one image (`VISION_IMAGE`, or llama.cpp's `test-1.jpeg`)
@@ -813,4 +956,577 @@ fn image_conditioning_survives_eviction_and_cached_resumption() {
     domain.close(resumed).unwrap();
 
     drop(after_image);
+}
+
+/// The state export of a real checkpoint (cold tier unit 01C): two exports
+/// of the same checkpoint agree, history and bank byte counts match their
+/// row counts, and prefilling a different prompt leaves the exported bytes
+/// untouched.
+#[test]
+#[ignore = "requires a Metal or CUDA device and MAGNITUDE_TEST_GGUF"]
+fn cold_tier_export_roundtrip() {
+    let resolved = resolved(false);
+    let tokenizer = resolved.host.shared_tokenizer();
+    let (mut domain, mut bindings, _) =
+        build_native_domain(&resolved.manifest, resolved.host.shared_package()).unwrap();
+
+    // Five distinct 512-token segments, one 2048-token prefill.
+    let prompt_a: Vec<TokenId> = (0..5)
+        .flat_map(|i| text(&tokenizer, 100u32 + i as u32, 512))
+        .take(2048)
+        .collect();
+    let input_a = text_input(&prompt_a);
+    let request_a = RequestId(1);
+    domain.install_input(request_a, input_a.clone()).unwrap();
+    let encodes = domain.open_served(&mut bindings, request_a, None).unwrap();
+    assert!(encodes.is_empty(), "plain text has nothing to encode");
+    for chunk in 0..4 {
+        let start = chunk * 512;
+        bindings = forward(&mut domain, bindings, request_a, &input_a, start..start + 512).1;
+    }
+    let held = domain.resume_state(request_a).unwrap();
+    domain.close(request_a).unwrap();
+    let _ = domain.shrink_state(&mut bindings, CompletionWake::new(|| {})).unwrap();
+
+    let first = held.target().export().unwrap();
+    assert_eq!(first.position, 2048);
+    let second = held.target().export().unwrap();
+    assert_eq!(first, second, "two exports of the same checkpoint agree");
+
+    let mut history_bytes = 0;
+    for region in &first.history {
+        let rows: usize = region.ranges.iter().map(|(s, e)| e - s).sum();
+        assert_eq!(
+            region.bytes.len(),
+            region.row_bytes * rows,
+            "domain {} region {} exports its rows",
+            region.domain,
+            region.region
+        );
+        history_bytes += region.bytes.len();
+    }
+    assert!(history_bytes > 0, "a 2K prefill exports history rows");
+
+    let arenas = held.target().store().recurrent_arenas();
+    assert_eq!(first.bank.len(), arenas.len(), "one bank row per recurrent arena");
+    for (row, arena) in first.bank.iter().zip(arenas.iter()) {
+        assert_eq!(
+            row.len() as u64,
+            arena.byte_len() / arena.extents()[0],
+            "one bank row of the arena's row size"
+        );
+    }
+
+    // A different prefill must not disturb the first checkpoint's rows.
+    let prompt_b = text(&tokenizer, 999, 512);
+    let input_b = text_input(&prompt_b);
+    let request_b = RequestId(2);
+    domain.install_input(request_b, input_b.clone()).unwrap();
+    let encodes = domain.open_served(&mut bindings, request_b, None).unwrap();
+    assert!(encodes.is_empty());
+    bindings = forward(&mut domain, bindings, request_b, &input_b, 0..512).1;
+    domain.close(request_b).unwrap();
+    let again = held.target().export().unwrap();
+    assert_eq!(first, again, "the first export is stable across other prefills");
+}
+
+/// What an export saves, without where its rows lay: an import places the
+/// rows afresh, so only their position, recurrent version, starts, bank and
+/// bytes in logical order are its to reproduce.
+fn saved_content(saved: &ExportedState) -> impl PartialEq + std::fmt::Debug + '_ {
+    (
+        saved.position,
+        saved.tape,
+        &saved.starts,
+        &saved.bank,
+        saved
+            .history
+            .iter()
+            .map(|region| (region.domain, region.region, region.row_bytes, &region.bytes))
+            .collect::<Vec<_>>(),
+    )
+}
+
+/// The state import of an exported checkpoint (cold tier unit 02): after the
+/// original state is evicted and its rows are reused by a different prefill,
+/// importing the export back into the store reproduces it byte-for-byte.
+#[test]
+#[ignore = "requires a Metal or CUDA device and MAGNITUDE_TEST_GGUF"]
+fn cold_tier_import_roundtrip() {
+    let resolved = resolved(false);
+    let tokenizer = resolved.host.shared_tokenizer();
+    let (mut domain, mut bindings, _) =
+        build_native_domain(&resolved.manifest, resolved.host.shared_package()).unwrap();
+
+    // Five distinct 512-token segments, one 2048-token prefill.
+    let prompt_a: Vec<TokenId> = (0..5)
+        .flat_map(|i| text(&tokenizer, 100u32 + i as u32, 512))
+        .take(2048)
+        .collect();
+    let input_a = text_input(&prompt_a);
+    let request_a = RequestId(1);
+    domain.install_input(request_a, input_a.clone()).unwrap();
+    let encodes = domain.open_served(&mut bindings, request_a, None).unwrap();
+    assert!(encodes.is_empty(), "plain text has nothing to encode");
+    for chunk in 0..4 {
+        let start = chunk * 512;
+        bindings = forward(&mut domain, bindings, request_a, &input_a, start..start + 512).1;
+    }
+    let held = domain.resume_state(request_a).unwrap();
+    let original = held.target().export().unwrap();
+    assert_eq!(original.position, 2048);
+    let store = std::rc::Rc::clone(held.target().store());
+    drop(held);
+    domain.close(request_a).unwrap();
+    let _ = domain.shrink_state(&mut bindings, CompletionWake::new(|| {})).unwrap();
+
+    // A different prefill reuses the freed rows, then frees them again.
+    let prompt_b = text(&tokenizer, 999, 512);
+    let input_b = text_input(&prompt_b);
+    let request_b = RequestId(2);
+    domain.install_input(request_b, input_b.clone()).unwrap();
+    let encodes = domain.open_served(&mut bindings, request_b, None).unwrap();
+    assert!(encodes.is_empty());
+    bindings = forward(&mut domain, bindings, request_b, &input_b, 0..512).1;
+    domain.close(request_b).unwrap();
+    let _ = domain.shrink_state(&mut bindings, CompletionWake::new(|| {})).unwrap();
+
+    let imported = store.import(&original).unwrap();
+    let restored = imported.checkpoint().export().unwrap();
+    assert_eq!(
+        saved_content(&original),
+        saved_content(&restored),
+        "import reproduces the exported state byte-for-byte"
+    );
+}
+
+/// The SSD cold tier keeps evicted prefixes on disk: A's retained prefix is
+/// pushed out of the RAM cache by larger distinct prefixes, spilled to the
+/// state-cache directory, and a later request extending A's path resumes from
+/// the disk entry instead of re-prefilling.
+#[test]
+#[ignore = "requires a Metal or CUDA device and MAGNITUDE_TEST_GGUF"]
+fn cold_tier_spill_restore() {
+    let resolved = resolved(false);
+    let vocabulary = resolved.manifest.definition.decoder.vocabulary as usize;
+    let tokenizer = resolved.host.shared_tokenizer();
+    let (domain, bindings, plan) =
+        build_native_domain(&resolved.manifest, resolved.host.shared_package()).unwrap();
+
+    let identity = [7u8; 32];
+    let dir = std::env::temp_dir()
+        .join(format!("magnitude-cold-tier-spill-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut host = Host::new(|wakes| {
+        Owner::with_resource_plan(
+            domain,
+            bindings,
+            limits(),
+            &plan,
+            wakes,
+            Some(identity),
+            Some(dir.clone()),
+            8 * 1024 * 1024 * 1024,
+        )
+    });
+
+    let prompt_a: Vec<TokenId> = (0..5)
+        .flat_map(|i| text(&tokenizer, 100u32 + i as u32, 512))
+        .take(2048)
+        .collect();
+    let [first] = run(&mut host, vocabulary, &[prompt_a], 12)
+        .try_into()
+        .ok()
+        .unwrap();
+    assert_eq!(first.cached, 0);
+    let path_a = path(&first);
+    eprintln!(
+        "A: prompt={} path={} prefixes={}",
+        path_a.len(),
+        path_a.len(),
+        host.owner().cached_prefixes()
+    );
+
+    // The tier dir holds one identity subdir; a spill is any entry file.
+    let spilled = || -> bool {
+        std::fs::read_dir(&dir)
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .find_map(|identity_dir| {
+                std::fs::read_dir(identity_dir.join("entries"))
+                    .ok()
+                    .and_then(|entries| entries.flatten().next().map(|_| true))
+            })
+            .unwrap_or(false)
+    };
+
+    // Distinct larger prompts until A's LRU prefix is evicted and spilled.
+    for i in 0..6u32 {
+        let prompt_b: Vec<TokenId> = (0..8)
+            .flat_map(|j| text(&tokenizer, 300u32 + i * 100 + j, 512))
+            .take(3800)
+            .collect();
+        let [turn] = run(&mut host, vocabulary, &[prompt_b], 12)
+            .try_into()
+            .ok()
+            .unwrap();
+        eprintln!(
+            "B{i}: prompt={} cached={} prefixes={} spilled={}",
+            turn.prompt.len(),
+            turn.cached,
+            host.owner().cached_prefixes(),
+            spilled()
+        );
+        if spilled() {
+            break;
+        }
+    }
+    assert!(spilled(), "A's retained prefix was evicted and spilled to disk");
+
+    // A' extends A's full path; the RAM cache no longer holds it, so the
+    // request must resume from the spilled disk entry.
+    let prompt_a2: Vec<TokenId> = path_a
+        .iter()
+        .copied()
+        .chain(text(&tokenizer, 990, 40))
+        .collect();
+    let a2_prompt_len = prompt_a2.len();
+    let [second] = run(&mut host, vocabulary, &[prompt_a2], 8)
+        .try_into()
+        .ok()
+        .unwrap();
+    eprintln!(
+        "A': prompt={} cached={} prefixes={}",
+        a2_prompt_len,
+        second.cached,
+        host.owner().cached_prefixes()
+    );
+    assert_eq!(
+        second.cached,
+        path_a.len(),
+        "A' resumes at A's spilled position"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The SSD cold tier's restore is numerically exact: a prefix spilled to
+/// disk and restored through the owner resumes the same continuation a
+/// fresh engine produces (same tokens), and at the domain level the
+/// restored state yields bitwise-identical logits to an uninterrupted
+/// prefill at every decode step (cold tier unit 06).
+const CONTEXT_06: usize = 16384;
+const PROMPT_06: usize = 8192;
+const DECODE_STEPS: usize = 32;
+
+/// The SSD cold tier's restore is numerically exact: a prefix spilled to
+/// disk and restored through the owner resumes the same continuation a
+/// fresh engine produces (same tokens), and at the domain level the
+/// restored state yields bitwise-identical logits to an uninterrupted
+/// prefill at every decode step (cold tier unit 06).
+#[test]
+#[ignore = "requires a Metal or CUDA device and MAGNITUDE_TEST_GGUF"]
+fn cold_tier_restore_matches_fresh_prefill() {
+    cold_tier_restore_matches_fresh_prefill_impl(false);
+}
+
+/// The restart variant: the engine (domain + owner) is dropped and rebuilt
+/// between the spill and the restore; the disk entry must survive the
+/// restart and restore identically.
+#[test]
+#[ignore = "requires a Metal or CUDA device and MAGNITUDE_TEST_GGUF"]
+fn cold_tier_restore_matches_fresh_prefill_after_restart() {
+    cold_tier_restore_matches_fresh_prefill_impl(true);
+}
+
+fn cold_tier_restore_matches_fresh_prefill_impl(restart: bool) {
+    let resolved = resolved_ctx(false, CONTEXT_06);
+    let vocabulary = resolved.manifest.definition.decoder.vocabulary as usize;
+    let tokenizer = resolved.host.shared_tokenizer();
+
+    // Eight thousand tokens: sixteen distinct 512-token segments.
+    let prompt: Vec<TokenId> = (0..16)
+        .flat_map(|i| text(&tokenizer, 400u32 + i as u32, 512))
+        .take(PROMPT_06)
+        .collect();
+
+    // -- Part A: the owner path, end to end.
+    let identity = [7u8; 32];
+    let dir = std::env::temp_dir()
+        .join(format!("magnitude-cold-tier-06-{}-{}", restart as u8, std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let spilled = || -> bool {
+        std::fs::read_dir(&dir)
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .find_map(|identity_dir| {
+                std::fs::read_dir(identity_dir.join("entries"))
+                    .ok()
+                    .and_then(|entries| entries.flatten().next().map(|_| true))
+            })
+            .unwrap_or(false)
+    };
+
+    let build_owner = || -> Host {
+        let (domain, bindings, plan) =
+            build_native_domain(&resolved.manifest, resolved.host.shared_package()).unwrap();
+        Host::new(|wakes| {
+            Owner::with_resource_plan(
+                domain,
+                bindings,
+                limits(),
+                &plan,
+                wakes,
+                Some(identity),
+                Some(dir.clone()),
+                8 * 1024 * 1024 * 1024,
+            )
+        })
+    };
+
+    // P: a full 8K prefill, thirty-two greedy tokens.
+    let mut host = build_owner();
+    let [first] = run_with_cache_points(
+        &mut host,
+        vocabulary,
+        &[(prompt.clone(), vec![])],
+        DECODE_STEPS,
+        CONTEXT_06,
+    )
+    .try_into()
+    .ok()
+    .unwrap();
+    assert_eq!(first.cached, 0);
+    let path_p = path(&first);
+    assert_eq!(path_p.len(), PROMPT_06 + DECODE_STEPS);
+    eprintln!(
+        "P: prompt={} path={} prefixes={}",
+        path_p.len(),
+        path_p.len(),
+        host.owner().cached_prefixes()
+    );
+
+    // Distinct longer prompts until P's LRU prefix is evicted and spilled.
+    for i in 0..6u32 {
+        let prompt_e: Vec<TokenId> = (0..24)
+            .flat_map(|j| text(&tokenizer, 600u32 + i * 100 + j, 512))
+            .take(12288)
+            .collect();
+        let [turn] = run_with_cache_points(
+            &mut host,
+            vocabulary,
+            &[(prompt_e, vec![])],
+            DECODE_STEPS,
+            CONTEXT_06,
+        )
+        .try_into()
+        .ok()
+        .unwrap();
+        eprintln!(
+            "E{i}: prompt={} cached={} prefixes={} spilled={}",
+            turn.prompt.len(),
+            turn.cached,
+            host.owner().cached_prefixes(),
+            spilled()
+        );
+        if spilled() {
+            break;
+        }
+    }
+    assert!(spilled(), "P's retained prefix was evicted and spilled to disk");
+
+    // A' extends P's full path; the RAM cache no longer holds it, so the
+    // request must resume from the spilled disk entry.
+    let prompt_a2: Vec<TokenId> = path_p
+        .iter()
+        .copied()
+        .chain(text(&tokenizer, 990, 40))
+        .collect();
+
+    // If the restart variant, drop and rebuild the engine between spill and
+    // restore — the disk entries must survive.
+    if restart {
+        drop(host);
+        host = build_owner();
+    }
+
+    let hits = RestoreHits::default();
+    let [second] = with_default(hits.clone(), || {
+        run_with_cache_points(
+            &mut host,
+            vocabulary,
+            &[(prompt_a2.clone(), vec![])],
+            DECODE_STEPS,
+            CONTEXT_06,
+        )
+    })
+    .try_into()
+    .ok()
+    .unwrap();
+    assert_eq!(
+        second.cached,
+        path_p.len(),
+        "A' resumes at P's spilled position"
+    );
+    assert_eq!(
+        hits.get(),
+        1,
+        "A' restored exactly one disk entry (MUST 1)"
+    );
+
+    // Fresh engine: no cold tier (no identity/dir), must prefill from zero.
+    drop(host);
+    let (domain, bindings, plan) =
+        build_native_domain(&resolved.manifest, resolved.host.shared_package()).unwrap();
+    let mut fresh = Host::new(|wakes| {
+        Owner::with_resource_plan(
+            domain,
+            bindings,
+            limits(),
+            &plan,
+            wakes,
+            None,
+            None,
+            0,
+        )
+    });
+    let fresh_hits = RestoreHits::default();
+    let [third] = with_default(fresh_hits.clone(), || {
+        run_with_cache_points(
+            &mut fresh,
+            vocabulary,
+            &[(prompt_a2.clone(), vec![])],
+            DECODE_STEPS,
+            CONTEXT_06,
+        )
+    })
+    .try_into()
+    .ok()
+    .unwrap();
+    assert_eq!(
+        third.cached,
+        0,
+        "the fresh engine prefills from the start"
+    );
+    assert_eq!(
+        fresh_hits.get(),
+        0,
+        "the fresh engine never restores"
+    );
+    assert_eq!(
+        second.output, third.output,
+        "the cold restore continues identically to a fresh prefill"
+    );
+
+    // -- Part B: domain-level logit equivalence.
+    // Fresh reference: uninterrupted 8K prefill + greedy decode, every logits
+    // row captured.
+    drop(fresh);
+    let (mut domain, mut bindings, _) =
+        build_native_domain(&resolved.manifest, resolved.host.shared_package()).unwrap();
+    let input_p = text_input(&prompt);
+
+    let fresh_req = RequestId(1);
+    domain.install_input(fresh_req, input_p.clone()).unwrap();
+    assert!(domain.open_served(&mut bindings, fresh_req, None).unwrap().is_empty());
+    let mut fresh_logits: Vec<Vec<f32>> = Vec::with_capacity(16);
+    for chunk in 0..16 {
+        let start = chunk * 512;
+        let (logits, b) = forward(&mut domain, bindings, fresh_req, &input_p, start..start + 512);
+        bindings = b;
+        fresh_logits.push(logits);
+    }
+    let (fresh_tokens, fresh_rows, b) = greedy_decode(
+        &mut domain,
+        bindings,
+        fresh_req,
+        fresh_logits.last().unwrap().clone(),
+        PROMPT_06,
+        DECODE_STEPS - 1,
+    );
+    bindings = b;
+    assert_eq!(
+        fresh_rows.len(),
+        DECODE_STEPS,
+        "one logits row per token"
+    );
+    domain.close(fresh_req).unwrap();
+    let _ = domain
+        .shrink_state(&mut bindings, CompletionWake::new(|| {}))
+        .unwrap();
+
+    // Restored side: same prefill, exported at 8192, state released and rows
+    // freed, then restored into a new request.
+    let export_req = RequestId(2);
+    domain.install_input(export_req, input_p.clone()).unwrap();
+    assert!(domain.open_served(&mut bindings, export_req, None).unwrap().is_empty());
+    let mut export_logits: Vec<Vec<f32>> = Vec::with_capacity(16);
+    for chunk in 0..16 {
+        let start = chunk * 512;
+        let (logits, b) = forward(&mut domain, bindings, export_req, &input_p, start..start + 512);
+        bindings = b;
+        export_logits.push(logits);
+    }
+    // The chunk logits must match the fresh side: the prefill is deterministic.
+    for (i, (a, b)) in fresh_logits.iter().zip(&export_logits).enumerate() {
+        assert_eq!(bits(a), bits(b), "chunk {} logit rows", i);
+    }
+    let held = domain.resume_state(export_req).unwrap();
+    let exported = held.target().export().unwrap();
+    assert_eq!(exported.position, PROMPT_06);
+    drop(held);
+    if restart {
+        drop(domain);
+        drop(bindings);
+        let (d, b, _) =
+            build_native_domain(&resolved.manifest, resolved.host.shared_package()).unwrap();
+        domain = d;
+        bindings = b;
+    } else {
+        domain.release_state(&[export_req]).unwrap();
+        domain.close(export_req).unwrap();
+        let _ = domain
+            .shrink_state(&mut bindings, CompletionWake::new(|| {}))
+            .unwrap();
+    }
+
+    // A new request restores the export and continues the same continuation.
+    let restore_req = RequestId(3);
+    domain.install_input(restore_req, input_p.clone()).unwrap();
+    // The rows it opens with: the history it restores and the steps it decodes.
+    let rows = (PROMPT_06 + DECODE_STEPS) as u64;
+    let unchained = domain.unchained(&mut bindings).expect("no chain is under way");
+    let encodes = domain
+        .restore_state(unchained, restore_req, &exported, None, rows)
+        .unwrap();
+    assert!(
+        encodes.is_empty(),
+        "a restored text state encodes nothing"
+    );
+    let (restored_tokens, restored_rows, _) = greedy_decode(
+        &mut domain,
+        bindings,
+        restore_req,
+        export_logits.last().unwrap().clone(),
+        PROMPT_06,
+        DECODE_STEPS - 1,
+    );
+    assert_eq!(
+        restored_tokens, fresh_tokens,
+        "the restored state continues the same token continuation"
+    );
+    for (i, (a, b)) in restored_rows.iter().zip(&fresh_rows).enumerate() {
+        assert_eq!(
+            bits(a),
+            bits(b),
+            "step {} decode logits",
+            i
+        );
+    }
+    domain.close(restore_req).unwrap();
+
+    let _ = std::fs::remove_dir_all(&dir);
 }

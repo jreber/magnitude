@@ -9,7 +9,7 @@
 use super::binding::GenerationBinding;
 use super::protocol::{
     Admission, ExecutionTimings, HostMessage, HostRequestId, MemoryObservation, RequestProgress,
-    RequestState, RoomClaimId, StoreHeadroom, WorkerMessage,
+    RequestState, RoomClaimId, StoreHeadroom, ThroughputSnapshot, WorkerMessage,
 };
 use super::transport::{MessageReceiver, MessageSender, TransportError};
 use super::WorkerExit;
@@ -176,6 +176,7 @@ pub(crate) struct Session {
     room: Option<(RoomClaimId, RoomClaim)>,
     statuses: Vec<(HostRequestId, Call<UnloadCause>)>,
     observations: Vec<Call<UnloadCause>>,
+    throughputs: Vec<Call<UnloadCause>>,
     /// The model stopped serving; the session ends once every open request
     /// has delivered its terminal outcome.
     unloading: Option<UnloadCause>,
@@ -205,6 +206,7 @@ impl Session {
             room: None,
             statuses: Vec::new(),
             observations: Vec::new(),
+            throughputs: Vec::new(),
             unloading,
         }
     }
@@ -250,6 +252,7 @@ impl Session {
         self.room = None;
         self.statuses.clear();
         self.observations.clear();
+        self.throughputs.clear();
         self.loaded.execution.stop();
         let exit = match exit {
             WorkerExit::Shutdown => match self.send(WorkerMessage::Unloaded { cause: UnloadCause::Shutdown }) {
@@ -334,6 +337,12 @@ impl Session {
                     self.observations.push(call);
                 }
             }
+            HostMessage::Throughput => match self.dispatch(WorkerCommand::Throughput) {
+                Ok(call) => self.throughputs.push(call),
+                Err(error) => self.send(WorkerMessage::Throughput {
+                    snapshot: Err(undispatched(error)),
+                })?,
+            },
             HostMessage::ClaimMeasurementRoom { claim, bytes } => {
                 match self.dispatch(WorkerCommand::ClaimMeasurementRoom { bytes }) {
                     Ok(call) => self.room = Some((claim, RoomClaim::Dispatched(call))),
@@ -565,6 +574,37 @@ impl Session {
                 })?,
                 Err(CallError::Stopped(cause)) => self.send(WorkerMessage::Observed {
                     observation: Err(RequestError::ModelUnloaded { cause }),
+                })?,
+            }
+        }
+        let mut index = 0;
+        while index < self.throughputs.len() {
+            let Poll::Ready(reply) = Self::poll_call(&waker, &mut self.throughputs[index]) else {
+                index += 1;
+                continue;
+            };
+            self.throughputs.swap_remove(index);
+            match reply {
+                Ok(WorkerReply::Throughput(snapshot)) => {
+                    let ipc = ThroughputSnapshot {
+                        window_ms: snapshot.window_ms,
+                        ready: snapshot.ready,
+                        accepted_tokens: snapshot.accepted_tokens,
+                    };
+                    self.send(WorkerMessage::Throughput {
+                        snapshot: Ok(ipc),
+                    })?
+                }
+                Ok(_) => self.send(WorkerMessage::Throughput {
+                    snapshot: Err(RequestError::internal(
+                        "execution owner returned an invalid throughput reply",
+                    )),
+                })?,
+                Err(CallError::Refused(reason)) => self.send(WorkerMessage::Throughput {
+                    snapshot: Err(RequestError::internal(reason)),
+                })?,
+                Err(CallError::Stopped(cause)) => self.send(WorkerMessage::Throughput {
+                    snapshot: Err(RequestError::ModelUnloaded { cause }),
                 })?,
             }
         }

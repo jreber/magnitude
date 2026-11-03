@@ -7,7 +7,8 @@
 
 use super::protocol::{
     Admission, EngineBuild, ExecutionTimings, HostMessage, HostRequestId,
-    LoadProgress, MemoryObservation, RequestProgress, RoomClaimId, WorkerMessage,
+    LoadProgress, MemoryObservation, RequestProgress, RoomClaimId, ThroughputSnapshot,
+    WorkerMessage,
 };
 use super::transport::{HostTransport, MessageReceiver, MessageSender};
 use crate::census::AllocationCensus;
@@ -104,6 +105,7 @@ struct State {
     /// claim takes.
     room: Option<(RoomClaimId, Shared<RoomAnswer>)>,
     next_claim: u64,
+    throughput: Option<Shared<ThroughputSnapshot>>,
     /// Why the connection ended; every later operation fails with it.
     closed: Option<RequestError>,
     /// The census the worker pushed last, and how many it pushed
@@ -150,6 +152,9 @@ impl State {
             reply.lock().unwrap().fulfill(Err(error.clone()));
         }
         if let Some((_, reply)) = self.room.take() {
+            reply.lock().unwrap().fulfill(Err(error.clone()));
+        }
+        if let Some(reply) = self.throughput.take() {
             reply.lock().unwrap().fulfill(Err(error.clone()));
         }
         self.closed = Some(error);
@@ -241,6 +246,13 @@ impl State {
                     let (_, reply) = self.room.take().expect("the pending claim");
                     reply.lock().unwrap().fulfill(room);
                 }
+            }
+            WorkerMessage::Throughput { snapshot } => {
+                let reply = self
+                    .throughput
+                    .take()
+                    .ok_or("throughput reply without a query")?;
+                reply.lock().unwrap().fulfill(snapshot);
             }
             WorkerMessage::Unloaded { cause } => {
                 self.unloaded = true;
@@ -629,6 +641,15 @@ impl EngineClient {
     /// experts again from what is stored.
     pub fn reprice(&self) -> Result<(), RequestError> {
         self.connection.send(HostMessage::Reprice)
+    }
+
+    /// A live accepted-output token snapshot over the worker's ten-second window.
+    pub async fn throughput(&self) -> Result<ThroughputSnapshot, RequestError> {
+        let reply = self.shared(
+            |state| &mut state.throughput,
+            HostMessage::Throughput,
+        )?;
+        Self::wait(reply).await
     }
 
     /// Ask the worker to unload and exit. Open requests fail with

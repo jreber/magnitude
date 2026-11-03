@@ -2,6 +2,31 @@
 
 use super::*;
 
+/// Where an opened request's state comes from.
+#[derive(Clone, Copy)]
+enum Opening<'a> {
+    /// Fresh state at zero.
+    Fresh,
+    /// A resume state's, at its position.
+    Resume(&'a ResumeState),
+    /// Saved state exported from this domain's stores, imported into them.
+    Import {
+        target: &'a ExportedState,
+        head: Option<&'a ExportedState>,
+    },
+}
+
+impl Opening<'_> {
+    /// The position the opened state is at.
+    fn position(self) -> usize {
+        match self {
+            Self::Fresh => 0,
+            Self::Resume(from) => from.position(),
+            Self::Import { target, .. } => target.position,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OpenRequirements {
     target_banks: usize,
@@ -66,9 +91,36 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// request holds its reservation, backed.
     pub fn open_state(
         &mut self,
-        mut unchained: Unchained<'_>,
+        unchained: Unchained<'_>,
         request: RequestId,
         from: Option<&ResumeState>,
+        rows: u64,
+    ) -> Result<Vec<Operation>, DomainError> {
+        self.open(unchained, request, from.map_or(Opening::Fresh, Opening::Resume), rows)
+    }
+
+    /// Make a request with installed input resident from saved state
+    /// exported from this domain's stores ([`StateCheckpoint::export`]), the
+    /// SSD cold tier's: as [`Self::open_state`] opens from a resume state,
+    /// the saved rows imported into the stores where it would fork one. The
+    /// sequence holds the first `position` tokens of its input, and no
+    /// image's features: the cold tier saves no state conditioned on one.
+    pub fn restore_state(
+        &mut self,
+        unchained: Unchained<'_>,
+        request: RequestId,
+        target: &ExportedState,
+        head: Option<&ExportedState>,
+        rows: u64,
+    ) -> Result<Vec<Operation>, DomainError> {
+        self.open(unchained, request, Opening::Import { target, head }, rows)
+    }
+
+    fn open(
+        &mut self,
+        mut unchained: Unchained<'_>,
+        request: RequestId,
+        opening: Opening<'_>,
         rows: u64,
     ) -> Result<Vec<Operation>, DomainError> {
         let installed = self.input.get(&request).expect("invariant violated: an opened request has no installed input");
@@ -77,7 +129,11 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             "invariant violated: request {} opens already resident",
             request.0
         );
-        let resumes = from.map_or(0, ResumeState::position) as u64;
+        let from = match opening {
+            Opening::Resume(from) => Some(from),
+            Opening::Fresh | Opening::Import { .. } => None,
+        };
+        let resumes = opening.position() as u64;
         assert!(
             resumes <= rows,
             "invariant violated: request {} resumes at row {resumes}, past the {rows} rows it opens with",
@@ -97,9 +153,10 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             })
             .map_err(DomainError::request_short)?;
         self.conclude_chain()?;
-        let (target, head) = match from {
-            Some(from) => self.fork_resume_state(from),
-            None => self.fresh_state(&mut unchained)?,
+        let (target, head) = match opening {
+            Opening::Resume(from) => self.fork_resume_state(from),
+            Opening::Fresh => self.fresh_state(&mut unchained)?,
+            Opening::Import { target, head } => self.import_state(&mut unchained, request, target, head)?,
         };
         let position = target.position();
         reservation.grow(position as u64);
@@ -117,10 +174,13 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         let installed = self.input.get_mut(&request).expect("input checked above");
         installed.resident = true;
         installed.boundary = from.and_then(|from| from.boundary.clone());
-        // A resumed sequence holds the tokens of the state it resumes.
-        installed.tokens = from.map_or_else(Default::default, |from| {
-            input::TokenHistory::starting(&from.tokens)
-        });
+        // A resumed sequence holds the tokens of the state it resumes; an
+        // imported one, those of its input before its position.
+        installed.tokens = match opening {
+            Opening::Resume(from) => input::TokenHistory::starting(&from.tokens),
+            Opening::Import { .. } => input::TokenHistory::starting(&installed.input.tokens()[..position]),
+            Opening::Fresh => Default::default(),
+        };
         let spans = installed.input.layout().spans();
         let mut encodes = Vec::new();
         for (identity, slot) in &mut installed.images {
@@ -158,6 +218,50 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         let rows = self.execution.resources().target_state().context_rows as u64;
         let unchained = self.unchained(bindings).expect("invariant violated: a test opens a request beside a chain");
         self.open_state(unchained, request, from, rows)
+    }
+
+    /// Import saved state into this domain's stores as fresh histories hold
+    /// it ([`StateStore::import`]): each store first grows by the whole
+    /// pages its saved rows take and the bank the import claims, as an open
+    /// provisions its banks ([`Self::provision_open`]).
+    fn import_state(
+        &mut self,
+        unchained: &mut Unchained<'_>,
+        request: RequestId,
+        target: &ExportedState,
+        head: Option<&ExportedState>,
+    ) -> Result<(SequenceState, Option<SequenceState>), DomainError> {
+        if self.head_store.is_some() != head.is_some() {
+            return Err(DomainError::invariant(
+                "restore state head does not match the domain head arena",
+            ));
+        }
+        let installed = self.input.get(&request).expect("invariant violated: an opened request has no installed input");
+        if installed.input.tokens().len() < target.position {
+            return Err(DomainError::invariant(
+                "restore position exceeds the admitted input tokens",
+            ));
+        }
+        self.conclude_chain()?;
+        let requirements = self.open_requirements();
+        let target_demands = self.target_store.import_demands(target);
+        let head_demands = self
+            .head_store
+            .as_ref()
+            .zip(head)
+            .map(|(store, saved)| store.import_demands(saved));
+        self.grant_state_growth(unchained.bindings(), false, &target_demands, &[], requirements.target_banks())?;
+        if let Some(demands) = head_demands {
+            self.grant_state_growth(unchained.bindings(), true, &demands, &[], requirements.head_banks())?;
+        }
+        let target = self.target_store.import(target)?;
+        let head = self
+            .head_store
+            .as_ref()
+            .zip(head)
+            .map(|(store, saved)| store.import(saved))
+            .transpose()?;
+        Ok((target, head))
     }
 
     fn fresh_state(

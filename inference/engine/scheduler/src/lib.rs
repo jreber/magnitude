@@ -4,6 +4,7 @@
 //! completion events. Model-family execution and protocol publication remain
 //! in composition crates above this boundary.
 
+pub mod cold_tier;
 pub mod domain;
 pub mod owner;
 pub mod policy;
@@ -12,7 +13,9 @@ pub mod protocol;
 pub mod publication;
 pub mod round_driver;
 pub mod serving;
+pub mod throughput;
 pub mod worker;
 pub use magnitude_executor::workload;
 
 pub use policy::ServiceLimits;
+pub use throughput::ThroughputSnapshot;

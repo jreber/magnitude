@@ -1929,6 +1929,22 @@ impl Tensor {
     pub fn write_from_host(&mut self, bytes: &[u8]) -> Result<(), TensorError> {
         self.inner.write_from_host(bytes)
     }
+    /// The bytes of leading rows `[start, end)`, read to the host. The range
+    /// is contiguous (one leading-axis slice) and within the leading extent.
+    pub fn read_rows_to_host(&self, start: u64, end: u64) -> Result<Vec<u8>, TensorError> {
+        Ok(self.slice_leading(start, end)?.read_to_host()?)
+    }
+    /// Replace the bytes of leading rows `[start, end)` from `bytes`, whose
+    /// length must be those rows' canonical byte count. The range is
+    /// contiguous (one leading-axis slice) and within the leading extent.
+    pub fn write_rows_from_host(
+        &mut self,
+        start: u64,
+        end: u64,
+        bytes: &[u8],
+    ) -> Result<(), TensorError> {
+        self.slice_leading(start, end)?.write_from_host(bytes)
+    }
     /// Write a canonical upload tensor's physical bytes in place as `fill`
     /// hands them over, each chunk at its byte offset, holding the tensor's
     /// host access until `fill` returns: never a second whole tensor on the
@@ -6555,4 +6571,36 @@ pub mod precision {
     pub use seismic_lang::precision::*;
 }
 
+#[cfg(test)]
+mod row_io_tests {
+    use super::*;
 
+    #[test]
+    fn row_io_matches_full_read_and_writes_land_in_original() {
+        let device = Devices::discover(&[])
+            .unwrap()
+            .open_backend(BackendName::Cpu)
+            .unwrap();
+        let (rows, cols, row_bytes): (u64, u64, usize) = (16, 4, 16);
+        let fill: Vec<u8> = (0..(rows * cols * 4) as u32).map(|i| i as u8).collect();
+        let mut tensor =
+            Tensor::from_host(&Charges::tally(&device), Element::u32(), &[rows, cols], &fill).unwrap();
+        let full = tensor.read_to_host().unwrap();
+        assert_eq!(full, fill);
+        assert_eq!(
+            tensor.read_rows_to_host(3, 7).unwrap(),
+            &full[row_bytes * 3..row_bytes * 7]
+        );
+        let patch = vec![0xaau8; row_bytes * 2];
+        tensor.write_rows_from_host(10, 12, &patch).unwrap();
+        let after = tensor.read_to_host().unwrap();
+        assert_eq!(&after[row_bytes * 10..row_bytes * 12], &patch);
+        for (index, row) in after.chunks_exact(row_bytes).enumerate() {
+            if (10..12).contains(&index) {
+                continue;
+            }
+            assert_eq!(row, &fill[index * row_bytes..(index + 1) * row_bytes]);
+        }
+    }
+
+}
