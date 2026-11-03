@@ -1537,7 +1537,7 @@ fn target_with_pending_priming(
             .unwrap(),
     );
     let slot = domain
-        .head_slot(request, &[TokenId(2)], 0, &[], &advance, 0)
+        .head_slot(request, &[TokenId(2)], 0, &[], None, &advance, 0)
         .unwrap();
     let batch = crate::batching::ValidatedHeadBatch::from_slots(
         &[slot],
@@ -1581,6 +1581,51 @@ fn target_with_pending_priming(
         continuation: None,
     });
     (domain, flight, control)
+}
+
+/// A head with no proposals shares a chained batch's step count with a
+/// drafting head: it borrows that head's selection instead of failing the
+/// whole launch.
+#[test]
+fn headless_proposals_borrow_a_batch_selection() {
+    let request = RequestId(94);
+    let (mut domain, mut bindings) = fixture_on(
+        None,
+        false,
+        true,
+        platform::DeviceRequest::Backend(seismic::BackendName::Cpu),
+    )
+    .expect("head selection tests require the CPU fixture");
+    open(&mut domain, &mut bindings, request);
+    let mut operation = prefill(request, 0);
+    if let Operation::Forward {
+        tokens, committed, ..
+    } = &mut operation
+    {
+        tokens.push(TokenId(2));
+        *committed = 2;
+    }
+    let _flight = submit_reserved_target(&mut domain, bindings, vec![operation]);
+    let advance = TentativeAdvance::Accepted(
+        OwnedStateAdvance::begin(domain.head.remove(&request).unwrap(), 1)
+            .ok()
+            .unwrap(),
+    );
+    let spec = crate::SelectSpec {
+        sampling: crate::Sampling::Greedy,
+        seed: 0,
+        position: 0,
+        domain: 0,
+        mask: None,
+        shaping: crate::Shaping::default(),
+        history: None,
+    };
+    assert!(domain
+        .head_slot(request, &[TokenId(2)], 0, &[], None, &advance, 1)
+        .is_err());
+    domain
+        .head_slot(request, &[TokenId(2)], 0, &[], Some(&spec), &advance, 1)
+        .unwrap();
 }
 
 fn publish_before_priming(

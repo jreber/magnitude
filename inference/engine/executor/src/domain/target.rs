@@ -199,7 +199,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                     .map_err(|error| error.to_string())
                 }),
             Some(crate::DraftForm::Chained) => self
-                .head_slot(request, &prime.tokens, prime.position, &[], &advance, 0)
+                .head_slot(request, &prime.tokens, prime.position, &[], None, &advance, 0)
                 .and_then(|slot| {
                     crate::batching::ValidatedHeadBatch::from_slots(
                         &[slot],

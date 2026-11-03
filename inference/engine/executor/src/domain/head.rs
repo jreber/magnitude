@@ -135,6 +135,13 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         }
         let vocabulary = self.definition.decoder.vocabulary as usize;
         let class_limits = self.head_class_limits().map_err(SubmitFailure::Failed)?;
+        // A request with no proposals (a priming head) shares the batch's
+        // step count; it borrows another request's selection, which is
+        // discarded.
+        let fallback = operations.iter().find_map(|operation| match operation {
+            Operation::Head { proposals, .. } => proposals.last(),
+            _ => None,
+        });
         let batch = match form {
             DraftForm::Chained => operations
                 .iter()
@@ -146,7 +153,9 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                         position,
                         proposals,
                         ..
-                    } => self.head_slot(*request, tokens, *position, proposals, advance, steps),
+                    } => self.head_slot(
+                        *request, tokens, *position, proposals, fallback, advance, steps,
+                    ),
                     _ => unreachable!("validated head group"),
                 })
                 .collect::<Result<Vec<_>, _>>()
@@ -579,6 +588,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         tokens: &[TokenId],
         position: usize,
         proposals: &[SelectSpec],
+        fallback: Option<&SelectSpec>,
         advance: &TentativeAdvance,
         steps: usize,
     ) -> Result<HeadSlot, String> {
@@ -660,7 +670,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 visible.push([appended, appended + 1]);
             }
         }
-        let last = proposals.last();
+        let last = proposals.last().or(fallback);
         let selections = (0..steps)
             .map(|step| {
                 let spec = proposals
