@@ -222,7 +222,29 @@ impl<S> CachedPrefix<S> {
     pub fn position(&self) -> usize {
         self.tokens.len()
     }
+
+    pub fn tokens(&self) -> &[TokenId] {
+        &self.tokens
+    }
+
+    pub fn conditioning(&self) -> &[String] {
+        &self.conditioning
+    }
 }
+
+/// The identity of an evicted entry: its token path, the media identities
+/// it conditioned on, the method it was retained under, and its position.
+#[derive(Clone, Debug)]
+pub struct CachedPrefixKeyInfo<'a> {
+    pub tokens: &'a [TokenId],
+    pub conditioning: &'a [String],
+    pub method: &'a MethodCheckpoint,
+    pub position: usize,
+    pub point: CachePoint,
+}
+
+/// Reports each evicted entry, before its state drops.
+pub type EvictHook<S> = dyn for<'a> FnMut(&'a CachedPrefixKeyInfo<'a>, &'a S);
 
 /// Thread-confined prefix cache. States are owned by the cache; a hit only
 /// borrows the entry while the executor forks its numerical state and the
@@ -232,6 +254,7 @@ pub struct PrefixCache<S> {
     clock: u64,
     next_id: u64,
     entries: Vec<CachedPrefix<S>>,
+    on_evict: Option<Box<EvictHook<S>>>,
 }
 
 impl<S> PrefixCache<S> {
@@ -241,7 +264,13 @@ impl<S> PrefixCache<S> {
             clock: 0,
             next_id: 1,
             entries: Vec::new(),
+            on_evict: None,
         }
+    }
+
+    /// Reports each evicted entry, before the evicted state drops.
+    pub fn on_evict(&mut self, hook: impl FnMut(&CachedPrefixKeyInfo<'_>, &S) + 'static) {
+        self.on_evict = Some(Box::new(hook));
     }
 
     pub const fn max_entries(&self) -> usize {
@@ -449,6 +478,7 @@ impl<S> PrefixCache<S> {
         let unused = self.victim(|entry| !held.contains(&entry.id));
         match unused.or_else(|| self.victim(|_| true)) {
             Some(index) => {
+                self.notify_evict(index);
                 self.entries.remove(index);
                 true
             }
@@ -492,6 +522,7 @@ impl<S> PrefixCache<S> {
         let Some(index) = self.unspared(held) else {
             return false;
         };
+        self.notify_evict(index);
         self.entries.remove(index);
         true
     }
@@ -545,8 +576,22 @@ impl<S> PrefixCache<S> {
             .collect()
     }
 
-    /// Drop every entry without submitted uses.
-    pub fn evict_all(&mut self) {
+    /// Drop every entry without submitted uses. Unload, not capacity
+    /// pressure: the hook hears at most `limit` entries, the conversation's
+    /// checkpoints first, then the most recently used.
+    pub fn evict_all(&mut self, limit: usize) {
+        let conversation = self.conversation_checkpoints();
+        let mut unsubmitted: Vec<(bool, u64, usize)> = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| entry.submitted == 0)
+            .map(|(index, entry)| (conversation.contains(&entry.id), entry.last_use, index))
+            .collect();
+        unsubmitted.sort_by(|first, second| (second.0, second.1).cmp(&(first.0, first.1)));
+        for (_, _, index) in unsubmitted.into_iter().take(limit) {
+            self.notify_evict(index);
+        }
         self.entries.retain(|entry| entry.submitted != 0);
     }
 
@@ -554,8 +599,24 @@ impl<S> PrefixCache<S> {
         let Some(index) = self.victim(|entry| entry.id != keep) else {
             return false;
         };
+        self.notify_evict(index);
         self.entries.remove(index);
         true
+    }
+
+    fn notify_evict(&mut self, index: usize) {
+        let Some(hook) = self.on_evict.as_deref_mut() else {
+            return;
+        };
+        let entry = &self.entries[index];
+        let info = CachedPrefixKeyInfo {
+            tokens: &entry.tokens,
+            conditioning: &entry.conditioning,
+            method: &entry.method,
+            position: entry.position(),
+            point: entry.point,
+        };
+        hook(&info, entry.state());
     }
 
     fn tick(&mut self) -> Result<u64, String> {
@@ -1012,7 +1073,7 @@ mod tests {
         let hit = lookup_any(&mut cache, &owned).unwrap();
         assert_eq!(hit.position(), 100);
         cache.begin_submitted(hit.id()).unwrap();
-        cache.evict_all();
+        cache.evict_all(8);
         assert_eq!(cache.len(), 1);
         assert!(!referenced(1080) && referenced(1100));
         assert!(!cache.evict_one(&BTreeSet::new()));
@@ -1143,5 +1204,85 @@ mod tests {
         assert!(!retain(&mut cache, &second, 64, rows(1..2)));
         assert_eq!(cache.len(), 1);
         assert!(lookup_any(&mut cache, &second).is_none());
+    }
+
+    /// The eviction hook reports the evicted entry's key and state at every
+    /// eviction site: overflow evictions and releases, never the rollback of
+    /// a just-inserted entry, and on unload exactly the most recent eight.
+    #[test]
+    fn the_eviction_hook_reports_every_eviction() {
+        thread_local! {
+            /// Each eviction's `(position, state rows)`.
+            static EVICTED: std::cell::RefCell<Vec<(usize, BTreeSet<u32>)>> =
+                const { std::cell::RefCell::new(Vec::new()) };
+        }
+        let record = |cache: &mut PrefixCache<Rows>| {
+            cache.on_evict(|info, state| {
+                EVICTED.with_borrow_mut(|evicted| {
+                    evicted.push((info.position, state.0.clone()));
+                });
+            });
+        };
+        let recorded = || EVICTED.with_borrow(|evicted| evicted.clone());
+
+        // Overflow eviction: the least recently used unsubmitted entry.
+        let mut cache = PrefixCache::new(capacity(2));
+        record(&mut cache);
+        assert!(retain(&mut cache, &text(64, "a"), 64, rows(1000..1064)));
+        assert!(retain(&mut cache, &text(64, "b"), 64, rows(1100..1164)));
+        assert!(retain(&mut cache, &text(64, "c"), 64, rows(1200..1264)));
+        assert_eq!(recorded(), vec![(64, rows(1000..1064).0.clone())]);
+
+        // Rollback: the just-inserted entry is rejected because the only
+        // other entry is in submitted use; nothing is evicted.
+        let mut cache = PrefixCache::new(capacity(1));
+        record(&mut cache);
+        let owned = text(64, "d");
+        assert!(retain(&mut cache, &owned, 64, rows(1300..1364)));
+        let hit = lookup_any(&mut cache, &owned).unwrap();
+        cache.begin_submitted(hit.id()).unwrap();
+        assert!(!retain(&mut cache, &text(64, "e"), 64, rows(1400..1464)));
+        assert_eq!(recorded().len(), 1, "a rollback is not an eviction");
+
+        // Release: the entry beyond the latest conversation's checkpoints.
+        let mut cache = PrefixCache::new(capacity(8));
+        record(&mut cache);
+        assert!(retain(&mut cache, &text(64, "f"), 64, rows(1500..1564)));
+        assert!(retain(&mut cache, &text(64, "g"), 64, rows(1600..1664)));
+        assert!(cache.release_unspared(&BTreeSet::new()));
+        assert!(!cache.release_unspared(&BTreeSet::new()));
+        assert_eq!(
+            recorded(),
+            vec![
+                (64, rows(1000..1064).0.clone()),
+                (64, rows(1500..1564).0.clone())
+            ]
+        );
+
+        // Unload: exactly the most recent eight unsubmitted entries.
+        let mut cache = PrefixCache::new(capacity(16));
+        record(&mut cache);
+        for (i, name) in "abcdefghij".chars().enumerate() {
+            let i = i as u32;
+            let owned = text(64, &name.to_string());
+            assert!(retain(
+                &mut cache,
+                &owned,
+                64,
+                rows(1700 + i * 1000..1764 + i * 1000)
+            ));
+        }
+        cache.evict_all(8);
+        let evicted = recorded();
+        assert_eq!(evicted.len(), 10);
+        let unloaded = evicted
+            .iter()
+            .skip(2)
+            .map(|(position, state)| (*position, state.clone()))
+            .collect::<BTreeSet<_>>();
+        let expected = (2..10)
+            .map(|i| (64, rows(1700 + i * 1000..1764 + i * 1000).0.clone()))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(unloaded, expected);
     }
 }

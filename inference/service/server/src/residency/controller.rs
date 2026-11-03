@@ -28,7 +28,7 @@ use magnitude_service_contracts::models::{
     CatalogModelOptimizer, CatalogOptimizationProgress, CatalogPackageRemover,
     InstalledModelPackages as _, MemoryShortage, ModelAssessment, ModelAssessmentDomainSnapshot,
     ModelAssessmentEntryState, ModelAssessments, ModelAssessmentsSnapshot, ModelId, ModelInstance,
-    ModelInstanceId,
+    ModelInstanceLifecycle, ModelInstanceThroughput, ModelInstanceId,
     ModelInstancesInvalidation, ModelInstancesSnapshot, ModelLoadDevice, ModelLoadPlan,
     ModelLoadStage, ModelPackageId, ModelServingConfiguration, ServingProfile,
 };
@@ -57,6 +57,8 @@ use crate::worker_process::WorkerLauncher;
 pub const MODEL_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 /// How long a released worker has to unload and exit before it is killed.
 pub(crate) const GRACEFUL_EXIT: std::time::Duration = std::time::Duration::from_secs(2);
+/// How long a graceful release lets the worker write its newest KV checkpoints to disk.
+pub(crate) const RELEASE_EXIT: std::time::Duration = std::time::Duration::from_secs(10);
 /// The same bound for an explicit stop, which must end active execution promptly.
 const INTERRUPTED_EXIT: std::time::Duration = std::time::Duration::from_millis(500);
 
@@ -247,8 +249,61 @@ impl ModelInstances {
         self.residency.stop(instance_id).await
     }
 
+    pub async fn shutdown(&self) {
+        self.residency.shutdown().await
+    }
+
     pub async fn instances(&self) -> Result<ModelInstancesSnapshot, InventoryError> {
         self.residency.snapshot().await
+    }
+
+    pub async fn throughput(
+        &self,
+        instance_id: ModelInstanceId,
+    ) -> Result<ModelInstanceThroughput, InventoryError> {
+        let snapshot = self.residency.snapshot().await?;
+        let instance = snapshot
+            .instances
+            .iter()
+            .find(|i| i.id == instance_id)
+            .ok_or_else(|| InventoryError::NotFound(instance_id.0.clone()))?;
+        if !matches!(instance.lifecycle, ModelInstanceLifecycle::Ready { .. }) {
+            return Err(InventoryError::NotReady(instance_id.0.clone()));
+        }
+        let model_id = instance.model_id.clone();
+        match self.supervisor.throughput_for_instance(&instance_id).await {
+            Ok(Some(snapshot)) => {
+                let still_ready = self
+                    .residency
+                    .snapshot()
+                    .await?
+                    .instances
+                    .iter()
+                    .any(|i| i.id == instance_id && matches!(i.lifecycle, ModelInstanceLifecycle::Ready { .. }));
+                if !still_ready {
+                    return Err(InventoryError::NotFound(instance_id.0.clone()));
+                }
+                if snapshot.window_ms != 10_000 {
+                    return Err(InventoryError::Upstream("unexpected throughput window".into()));
+                }
+                if snapshot.ready {
+                    Ok(ModelInstanceThroughput::Ready {
+                        instance_id,
+                        model_id,
+                        window_ms: snapshot.window_ms,
+                        tokens_per_second: snapshot.accepted_tokens as f64 / 10.0,
+                    })
+                } else {
+                    Ok(ModelInstanceThroughput::WarmingUp {
+                        instance_id,
+                        model_id,
+                        window_ms: snapshot.window_ms,
+                    })
+                }
+            }
+            Ok(None) => Err(InventoryError::NotFound(instance_id.0.clone())),
+            Err(_) => Err(InventoryError::Upstream("throughput observation failed".into())),
+        }
     }
 
     pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<ModelInstancesInvalidation> {
@@ -296,6 +351,13 @@ impl magnitude_service_api::ModelInstanceController for ModelInstances {
 
     fn instances(&self) -> BoxFuture<'_, Result<ModelInstancesSnapshot, InventoryError>> {
         Box::pin(ModelInstances::instances(self))
+    }
+
+    fn throughput(
+        &self,
+        instance_id: ModelInstanceId,
+    ) -> BoxFuture<'_, Result<ModelInstanceThroughput, InventoryError>> {
+        Box::pin(ModelInstances::throughput(self, instance_id))
     }
 
     /// The current revision, then every change.
@@ -877,7 +939,7 @@ impl ModelResidencyDriver for EngineResidency {
             // interrupted release then kills it after a short bound instead of the graceful one.
             worker.shutdown();
             let mut deadline = tokio::time::Instant::now()
-                + if interrupt_immediately { INTERRUPTED_EXIT } else { GRACEFUL_EXIT };
+                + if interrupt_immediately { INTERRUPTED_EXIT } else { RELEASE_EXIT };
             let result = loop {
                 match worker.try_wait() {
                     Ok(Some(_)) => break Ok(()),

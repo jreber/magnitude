@@ -60,6 +60,7 @@ fn each_run_reconciles_at_most_one_cpu_flight() {
         device: "cpu".parse::<DeviceRequest>().unwrap(),
         kernel_cache: std::env::var_os("MAGNITUDE_TEST_KERNEL_CACHE").map(PathBuf::from),
         reserves: MemoryReserves::standard(),
+        model_sha256: None,
     }
     .resolve()
     .unwrap();

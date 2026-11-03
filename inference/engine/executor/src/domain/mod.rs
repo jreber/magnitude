@@ -22,8 +22,9 @@ use crate::{
 };
 use magnitude_family_contracts::{ModelDefinition, PreparedModelInput};
 use magnitude_state::{
-    Holder, InFlightState, OwnedAdvanceResolution, OwnedStateAdvance, OwnedTailRelocation,
-    RowDemand, SequenceState, StateCheckpoint, StateStore, StoreBindings, TentativeAdvance,
+    ExportedState, Holder, InFlightState, OwnedAdvanceResolution, OwnedStateAdvance,
+    OwnedTailRelocation, RowDemand, SequenceState, StateCheckpoint, StateStore, StoreBindings,
+    TentativeAdvance,
 };
 use seismic::Tensor;
 mod draft;
@@ -483,6 +484,21 @@ pub struct ResumeState {
 impl ResumeState {
     pub fn position(&self) -> usize {
         self.target.position()
+    }
+
+    /// The target checkpoint: the pinned rows and claims this state resumes from.
+    pub fn checkpoint(&self) -> &StateCheckpoint {
+        &self.target
+    }
+
+    /// The head checkpoint, when the domain has a head arena.
+    pub fn head(&self) -> Option<&StateCheckpoint> {
+        self.head.as_ref()
+    }
+
+    /// The MTP boundary feature, when the domain has one.
+    pub fn boundary(&self) -> Option<&FeatureRef> {
+        self.boundary.as_ref()
     }
 }
 

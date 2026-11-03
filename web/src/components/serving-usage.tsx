@@ -19,9 +19,11 @@ export function ServingUsage() {
   const [model, setModel] = useState("")
   const client = useAgentClient()
   const result = useAtomValue(client.Models.GetServingUsage({ period, timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone, model: model ? Option.some(ServingModelId.make(model)) : Option.none() })).result
+  const throughputResult = useAtomValue(client.Models.GetEngineThroughput({})).result
   const catalog = useLocalModels()
   const names = Result.isSuccess(catalog) ? new Map(catalog.value.models.map(model => [String(model.modelId), formatLocalModelDisplayName(model)])) : new Map<string, string>()
   const snapshot = Result.isSuccess(result) ? result.value : null
+  const throughput = Result.isSuccess(throughputResult) ? throughputResult.value : null
   return <section aria-label="Local usage" className="mt-6 space-y-6">
     <div className="flex flex-wrap items-center justify-between gap-3">
       <Select value={model} onValueChange={value => setModel(value ?? "")}>
@@ -43,7 +45,27 @@ export function ServingUsage() {
     </div>
     {snapshot?._tag === "Available" ? <UsageActivity days={snapshot.dailyActivity} /> : Result.isInitial(result) ? <UsageActivity days={null} /> : null}
     <div className="space-y-6 border-t border-slate-200 pt-6 dark:border-slate-750">
-      {snapshot?._tag === "Available" ? <UsageFigures usage={snapshot} /> : Result.isInitial(result) ? <LoadingRegion label="Loading usage"><div className="space-y-6"><UsageFigures usage={null} /></div></LoadingRegion> : <ErrorNotice title="Couldn’t load usage history" description="Usage information is unavailable right now. This does not mean there has been no activity." />}
+      {snapshot?._tag === "Available" ? <UsageFigures usage={snapshot} /> : Result.isInitial(result) ? <LoadingRegion label="Loading usage"><div className="space-y-6"><UsageFigures usage={null} /></div></LoadingRegion> : <ErrorNotice title="Couldn't load usage history" description="Usage information is unavailable right now. This does not mean there has been no activity." />}
+    </div>
+    <div className="border-t border-slate-200 pt-5 dark:border-slate-750">
+      <div className="min-w-0">
+        <p className="flex items-center gap-2 text-sm text-slate-500">
+          <GaugeIcon className="size-4" />
+          Engine throughput (live)
+          <ActionTooltip label="Accepted output across concurrent requests over the last 10 seconds, including stalls and idle time. Not GPU execution-only timing." trigger={<button type="button" aria-label="Accepted output across concurrent requests over the last 10 seconds, including stalls and idle time. Not GPU execution-only timing." className="inline-flex rounded-sm text-slate-500 hover:text-slate-700 focus-visible:outline-2 focus-visible:outline-blue-500 dark:hover:text-slate-300"><InfoIcon aria-hidden="true" className="size-3.5" /></button>} />
+        </p>
+        <p className="mt-1 text-xs text-slate-400">{throughput?._tag === "WarmingUp" || throughput?._tag === "Ready" ? (names.get(throughput.modelId) ?? throughput.modelId) : null}</p>
+        <p className="mt-3 text-2xl tabular-nums" data-usage="engine-throughput">
+          {throughput === null && Result.isInitial(throughputResult)
+            ? <SkeletonLine className="h-8 text-2xl" width="160px" />
+            : throughput?._tag === "Ready"
+              ? `${decimal(throughput.tokensPerSecond)} tokens/s`
+              : throughput?._tag === "WarmingUp"
+                ? "Warming up"
+                : "—"}
+        </p>
+        {throughput?._tag === "Unavailable" && <p className="mt-1 text-xs text-slate-500">{throughput.message}</p>}
+      </div>
     </div>
   </section>
 }
@@ -59,7 +81,7 @@ export function UsageFigures({ usage }: { usage: Extract<ServingUsageSnapshot, {
     <div className={pageLayout.usageTokens}>{metrics.map(({ label, value, icon: Icon, note }) => <div key={label} className="min-w-0"><p className="flex items-center gap-2 text-sm text-slate-500"><Icon className="size-4" />{label}{label === "Cached input" && usage && <ActionTooltip label={cachePercentage} trigger={<button type="button" aria-label={cachePercentage} className="inline-flex rounded-sm text-slate-500 hover:text-slate-700 focus-visible:outline-2 focus-visible:outline-blue-500 dark:hover:text-slate-300"><InfoIcon aria-hidden="true" className="size-3.5" /></button>} />}</p><p className="mt-3 font-heading text-3xl tabular-nums" data-usage={label}>{value ?? <SkeletonLine className="h-9 text-3xl" width="100px" />}</p>{note && <p className="mt-1 text-xs text-slate-500">{note}</p>}</div>)}</div>
     <div className={`${pageLayout.usageTiming} border-t border-slate-200 pt-5 dark:border-slate-750`}>
       <div className="min-w-0"><p className="flex items-center gap-2 text-sm text-slate-500"><ArrowsLeftRightIcon className="size-4" />Requests</p><p className="mt-4 text-2xl tabular-nums" data-usage="requests">{usage ? number(usage.requests) : <SkeletonLine className="h-8 text-2xl" width="100px" />}</p></div>
-      <div className="min-w-0"><p className="flex items-center gap-2 text-sm text-slate-500"><GaugeIcon className="size-4" />Generation speed</p><p className="mt-4 text-2xl tabular-nums" data-usage="speed">{!usage ? <SkeletonLine className="h-8 text-2xl" width="160px" /> : usage.tokensPerSecond === null ? "—" : `${decimal(usage.tokensPerSecond)} tokens/s`}</p></div>
+      <div className="min-w-0"><p className="flex items-center gap-2 text-sm text-slate-500"><GaugeIcon className="size-4" />Per-request speed</p><p className="mt-4 text-2xl tabular-nums" data-usage="speed">{!usage ? <SkeletonLine className="h-8 text-2xl" width="160px" /> : usage.tokensPerSecond === null ? "—" : `${decimal(usage.tokensPerSecond)} tokens/s`}</p></div>
       <div className="min-w-0"><p className="flex items-center gap-2 text-sm text-slate-500"><TimerIcon className="size-4" />Time to first token</p><p className="mt-4 text-2xl tabular-nums" data-usage="ttft">{!usage ? <SkeletonLine className="h-8 text-2xl" width="120px" /> : usage.timeToFirstTokenMs === null ? "—" : usage.timeToFirstTokenMs < 1000 ? `${decimal(usage.timeToFirstTokenMs)} ms` : `${decimal(usage.timeToFirstTokenMs / 1000)} s`}</p></div>
     </div>
   </>

@@ -372,6 +372,27 @@ export const getModelInstances = HttpApiEndpoint.get("getModelInstances", "/api/
     { status: 500 },
   )
 
+export const getModelInstanceThroughput = HttpApiEndpoint.get(
+  "getModelInstanceThroughput",
+  "/api/v1/instances/:instance_id/throughput",
+)
+  .setPath(S.Struct({ instance_id: S.String }))
+  .addSuccess(
+    S.suspend(
+      (): S.Schema<Schemas.ModelInstanceThroughput, Schemas.ModelInstanceThroughputEncoded> =>
+        Schemas.ModelInstanceThroughput,
+    ),
+    { status: 200 },
+  )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+    { status: 404 },
+  )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+    { status: 503 },
+  )
+
 export const getModelProperties = HttpApiEndpoint.post("getModelProperties", "/api/v1/models/:model_id/properties")
   .setPath(S.Struct({ model_id: S.String }))
   .addSuccess(
@@ -853,6 +874,7 @@ export const ModelsGroup = HttpApiGroup.make("models")
   .add(getModelAssessments)
   .add(getModelInstance)
   .add(getModelInstances)
+  .add(getModelInstanceThroughput)
   .add(getModelProperties)
   .add(previewModelLoad)
   .add(stopModelInstance)

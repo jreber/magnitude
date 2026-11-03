@@ -7,7 +7,7 @@
 
 use super::protocol::{
     Admission, EngineBuild, ExecutionTimings, HostMessage, HostRequestId,
-    LoadProgress, MemoryObservation, RequestProgress, WorkerMessage,
+    LoadProgress, MemoryObservation, RequestProgress, ThroughputSnapshot, WorkerMessage,
 };
 use super::transport::{HostTransport, MessageReceiver, MessageSender};
 use crate::error::{LoadError, RequestError};
@@ -97,6 +97,7 @@ struct State {
     next_id: u64,
     requests: HashMap<HostRequestId, RequestSlot>,
     observation: Option<Shared<MemoryObservation>>,
+    throughput: Option<Shared<ThroughputSnapshot>>,
     /// Why the connection ended; every later operation fails with it.
     closed: Option<RequestError>,
 }
@@ -117,6 +118,9 @@ impl State {
             slot.wake();
         }
         if let Some(reply) = self.observation.take() {
+            reply.lock().unwrap().fulfill(Err(error.clone()));
+        }
+        if let Some(reply) = self.throughput.take() {
             reply.lock().unwrap().fulfill(Err(error.clone()));
         }
         self.closed = Some(error);
@@ -172,6 +176,13 @@ impl State {
                     .take()
                     .ok_or("observation reply without a query")?;
                 reply.lock().unwrap().fulfill(observation);
+            }
+            WorkerMessage::Throughput { snapshot } => {
+                let reply = self
+                    .throughput
+                    .take()
+                    .ok_or("throughput reply without a query")?;
+                reply.lock().unwrap().fulfill(snapshot);
             }
             WorkerMessage::Unloaded { cause } => {
                 self.close(RequestError::ModelUnloaded { cause });
@@ -449,6 +460,15 @@ impl EngineClient {
         let reply = self.shared(
             |state| &mut state.observation,
             HostMessage::Observe,
+        )?;
+        Self::wait(reply).await
+    }
+
+    /// A live accepted-output token snapshot over the worker's ten-second window.
+    pub async fn throughput(&self) -> Result<ThroughputSnapshot, RequestError> {
+        let reply = self.shared(
+            |state| &mut state.throughput,
+            HostMessage::Throughput,
         )?;
         Self::wait(reply).await
     }

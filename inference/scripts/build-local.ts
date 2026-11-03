@@ -45,7 +45,7 @@ export const buildLocalInference = async ({
   const host = hostById(currentHost())
   await run(["bun", "run", "catalog:build-bundle"], diagnostics)
   console.log(`[dev] Building the inference service for ${host.id}...`)
-  const build = await buildInferenceBinary({ host, profile: "development", diagnostics })
+  const build = await buildInferenceBinary({ host, profile: "release", diagnostics })
   const target = resolve(INFERENCE_ROOT, "target")
   const staging = await mkdtemp(resolve(target, ".development-"))
   try {

@@ -1,6 +1,6 @@
 import { Configuration as Rpcs } from "@magnitudedev/sdk";
 import { Effect } from "effect";
-import { Group, QueryClient } from "@magnitudedev/effect-query";
+import { Group, Mutation, QueryClient } from "@magnitudedev/effect-query";
 import { mutation, query } from "./bind";
 
 const GetProviderAuth = query(
@@ -42,6 +42,12 @@ const RegenerateNetworkApiKey = mutation(Rpcs.regenerateNetworkApiKey, (client) 
   synchronize: () => QueryClient.invalidate(GetNetworkAccess.match({})),
 });
 const GetServerMachine = query(Rpcs.getServerMachine, (client) => client.configuration.getServerMachine);
+
+/**
+ * Primary-model selection and work admission share one serialization boundary:
+ * a turn must never observe the selection before its mutation has synchronized.
+ */
+export const turnAdmissionScope = Mutation.MutationScope("turn-admission");
 
 export const Configuration = Group.make({
   GetProviderAuth,

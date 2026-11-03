@@ -5,11 +5,15 @@
 
 use crate::error::{ArtifactError, LoadError, ResolveError, UnsupportedModel};
 use crate::host::HostArtifacts;
-use crate::options::{ExecutionManifest, InputModalities, ModelPolicy, PackageOptions, ReadyInfo};
+use crate::options::{
+    cache_identity, ExecutionManifest, InputModalities, ModelPolicy, PackageOptions, ReadyInfo,
+};
 use crate::execution::LoadAttempt;
 use crate::worker::{
-    connect_worker, load_prepared, protocol::LoadProgress, run_worker, start_worker_process,
-    transport::channel_pair, EngineClient, Preparation, WorkerConnection,
+    connect_worker, load_prepared,
+    protocol::{EngineBuild, LoadProgress},
+    run_worker, start_worker_process, transport::channel_pair, EngineClient, Preparation,
+    WorkerConnection,
 };
 use magnitude_executor::UnpreparedUnits;
 use magnitude_artifacts::PackageIdentity;
@@ -46,6 +50,10 @@ pub struct EngineConfiguration {
     /// The host's threshold policy (`MemoryReserves::standard()` for the
     /// service and CLI). The engine never defaults it.
     pub reserves: MemoryReserves,
+    /// The host's model content identity for the disk tier: the model's
+    /// content-derived identity, which changes exactly when its content does.
+    /// `None` names no model, so no disk-cached state is keyed to one.
+    pub model_sha256: Option<String>,
 }
 
 /// The two authorities produced by host resolution: host artifacts (chat
@@ -75,7 +83,15 @@ impl EngineConfiguration {
             .model
             .resolve_admitted(definition, host.draft_unavailable())
             .map_err(invalid)?;
-        let manifest = ExecutionManifest::new(
+        // The SSD state cache sits beside the kernel cache it is derived
+        // from: `<kernel cache's parent>/state`. No kernel cache directory
+        // means no state cache: never a fallback directory.
+        let state_cache = self
+            .kernel_cache
+            .as_ref()
+            .and_then(|kernel_cache| kernel_cache.parent())
+            .map(|parent| parent.join("state"));
+        let mut manifest = ExecutionManifest::new(
             host.package().manifest(),
             definition.clone(),
             model,
@@ -86,6 +102,46 @@ impl EngineConfiguration {
             self.reserves,
         )
         .map_err(invalid)?;
+        manifest.state_cache = state_cache;
+        manifest.model_sha256 = self.model_sha256;
+        // The identity a disk-cached state is keyed by, published once per
+        // engine start; `none` when the host names no model content hash.
+        // The identity a disk-cached state is keyed by, published once per
+        // engine start; `None` when the host names no model content hash.
+        // Carried in the manifest so the worker, which may run in a separate
+        // process, opens the tier under the same key the host logs.
+        manifest.state_cache_identity = cache_identity(
+            &manifest,
+            manifest.model.kv_codec.identity().as_bytes(),
+            host.template_inspection().fingerprint.as_bytes(),
+            EngineBuild::current().0.as_bytes(),
+        )
+        .map(|identity| {
+            identity
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        });
+        let dir = match &manifest.state_cache {
+            Some(dir) => dir.display().to_string(),
+            None => "none".to_string(),
+        };
+        tracing::info!(
+            "cold tier identity={} dir={}",
+            manifest.state_cache_identity.as_deref().unwrap_or("none"),
+            dir
+        );
+        if let (Some(dir), Some(identity)) = (&manifest.state_cache, &manifest.state_cache_identity) {
+            // Reclaim the dirs of earlier builds and models; never fails a load.
+            match magnitude_scheduler::cold_tier::collect_identity_dirs(
+                dir,
+                identity,
+                crate::options::default_state_cache_total_budget(),
+            ) {
+                Ok(_) => {}
+                Err(error) => tracing::warn!(%error, "cold-tier gc could not read the state dir"),
+            }
+        }
         Ok(ResolvedEngineConfiguration { host, manifest })
     }
 }

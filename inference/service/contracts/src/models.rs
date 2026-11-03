@@ -889,6 +889,25 @@ pub struct ModelInstancesInvalidation {
 }
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum ModelInstanceThroughput {
+    #[serde(rename_all = "camelCase")]
+    WarmingUp {
+        instance_id: ModelInstanceId,
+        model_id: ModelId,
+        window_ms: u64,
+    },
+    #[serde(rename_all = "camelCase")]
+    Ready {
+        instance_id: ModelInstanceId,
+        model_id: ModelId,
+        window_ms: u64,
+        tokens_per_second: f64,
+    },
+}
+
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelFileRole {

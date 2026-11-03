@@ -8,6 +8,7 @@
 use crate::prefix_cache::PrefixRetention;
 use crate::publication::PublicationReceiver;
 use crate::owner::{AdmissionError, Status};
+use crate::throughput::ThroughputSnapshot;
 use magnitude_executor::platform::DomainReading;
 use magnitude_executor::{MemoryChargeReconciliation, RequestId};
 use magnitude_family_contracts::PreparedModelInput;
@@ -28,6 +29,8 @@ pub enum WorkerCommand {
     Status { request: RequestId },
     /// The memory heap's classified holdings and standing.
     Observe,
+    /// A live accepted-output token snapshot over the owner's ten-second window.
+    Throughput,
 }
 
 /// A live request's scheduling status and progress.
@@ -55,6 +58,7 @@ pub enum WorkerReply {
         /// A fresh reading of every memory domain the device uses.
         readings: Vec<DomainReading>,
     },
+    Throughput(ThroughputSnapshot),
     Acknowledged,
 }
 

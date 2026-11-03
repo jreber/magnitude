@@ -43,6 +43,7 @@ use magnitude_chat::{
 };
 use magnitude_grammar::CacheLimits;
 use magnitude_scheduler::{
+    cold_tier::EntryKey,
     owner::Owner,
     worker::{Driven, SpawnError, Wakes, Worker, WorkerWakeHandle},
 };
@@ -333,12 +334,25 @@ fn load(
         let backend = built.domain.execution_backend();
         let host_table_bytes = built.domain.host_table_bytes();
         let resources = ResourcePlanSummary::from_plan(&built.plan).map_err(internal)?;
+        // The identity the host resolved onto the manifest; `None` keys no
+        // disk state, and an identity that no longer parses disables the
+        // tier with a warning rather than failing the load.
+        let cold_identity = match manifest.state_cache_identity.as_deref() {
+            None => None,
+            Some(hex) => EntryKey::from_hex(hex).map(|key| key.bytes()).or_else(|| {
+                tracing::warn!("invalid state-cache identity {hex}; SSD state cache disabled");
+                None
+            }),
+        };
         let owner = Owner::with_resource_plan(
             built.domain,
             built.bindings,
             manifest.service.clone(),
             &built.plan,
             Arc::new(wakes) as Arc<dyn Wakes>,
+            cold_identity,
+            manifest.state_cache.clone(),
+            manifest.state_cache_budget_bytes,
         )
         .map_err(internal)?;
         let census = owner

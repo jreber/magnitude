@@ -2273,6 +2273,7 @@ dependencies = [
 name = "magnitude-engine"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "flate2",
  "libc",
  "magnitude-artifacts",
@@ -2304,6 +2305,7 @@ dependencies = [
  "sha2 0.11.0",
  "tempfile",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -2317,6 +2319,7 @@ dependencies = [
  "magnitude-serving",
  "magnitude-state",
  "serde_json",
+ "sha2 0.11.0",
  "tokio",
  "tracing-subscriber",
 ]
@@ -2538,11 +2541,14 @@ dependencies = [
 name = "magnitude-scheduler"
 version = "0.1.0"
 dependencies = [
+ "blake3",
+ "libc",
  "magnitude-executor",
  "magnitude-family-contracts",
  "magnitude-generation",
  "magnitude-state",
  "serde",
+ "serde_json",
  "tracing",
 ]
 

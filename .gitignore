@@ -35,3 +35,11 @@ packages/launcher/bin/magnitude.js
 packages/acn-protocol/src/rpc-version.ts
 
 .humanlayer/tasks/
+
+# Agent / review artifacts
+.opencode/plans/
+.ai-jail
+.claude/worktrees/
+.claude/distillation
+.scout/scout.config.yaml
+REPORT-L3-*.md

@@ -1,7 +1,7 @@
 {
   "generator": "@magnitudedev/openapi-effect",
   "generatorVersion": "0.0.1",
-  "protocolHash": "74c464b55850cfbc452aaac761ee02c0b37739fd16494e6c78242c77a9cfe2e9",
+  "protocolHash": "b94c4ba7f40812e7cb09c7b00a250dea2b59fe1c71e615e440eeaaf4dbfd08ac",
   "configHash": "35eaa09ad05c284228c67845b4e6f4db4aa545ca4a74ee0d812d04c6af53ee75",
   "files": [
     "api.ts",
@@ -31,6 +31,7 @@
     "getLocalModelsConfiguration",
     "getModelAssessments",
     "getModelInstance",
+    "getModelInstanceThroughput",
     "getModelInstances",
     "getModelProperties",
     "health",

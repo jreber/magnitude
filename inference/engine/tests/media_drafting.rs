@@ -182,6 +182,7 @@ fn run(arguments: &Arguments) -> Result<(), String> {
         device: arguments.device,
         kernel_cache: arguments.cache_dir.clone(),
         reserves: MemoryReserves::standard(),
+        model_sha256: None,
     }
     .resolve()
     .map_err(|error| error.to_string())?;

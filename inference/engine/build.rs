@@ -83,6 +83,10 @@ fn main() {
         .take(12)
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
+    // This value is an input to the cold-tier cache identity (`options.rs`
+    // `cache_identity`): any source change starts a new, empty
+    // `cache/state/IDENTITY_HEX` dir, and old dirs are reclaimed by
+    // `collect_identity_dirs`.
     println!(
         "cargo:rustc-env=MAGNITUDE_ENGINE_BUILD={}+src.{hash}",
         std::env::var("CARGO_PKG_VERSION").expect("package version")

@@ -100,7 +100,7 @@ fn main() -> anyhow::Result<()> {
     match cli.command {
         // The engine worker owns standard output for its protocol: it exports no telemetry and
         // runs no async runtime of the service's. Its events go to standard error, which the
-        // service records in its log, at the level the launcher sets (`RUST_LOG`).
+        // service records in its log, at the service's own level (`RUST_LOG`, inherited).
         Command::InferenceWorker => {
             worker_process::install_parent_watchdog()?;
             telemetry::init_worker();
@@ -306,6 +306,8 @@ async fn run(command: Command) -> anyhow::Result<()> {
             if let Some(auth_token) = auth_token {
                 state = state.with_authorization(auth_token);
             }
+            let shutdown_instances = instances.clone();
+            let release_instances = instances.clone();
             let serving = magnitude_serving::Serving::new(Arc::new(ServiceModels::new(instances)));
             let listener = tokio::net::TcpListener::bind(bind)
                 .await
@@ -342,8 +344,12 @@ async fn run(command: Command) -> anyhow::Result<()> {
                         },
                         None => interrupt_signal().await,
                     }
+                    // Release the worker first: open streaming connections can hold the
+                    // graceful drain past the parent's kill, and the worker spills on release.
+                    release_instances.shutdown().await;
                 })
                 .await?;
+            shutdown_instances.shutdown().await;
             tracing::info!("inference service stopped");
         }
         Command::Doctor => println!("inference engine loaded successfully"),

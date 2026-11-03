@@ -26,8 +26,9 @@ use magnitude_service_contracts::models::{
     LocalModelsResponse, ModelAssessment, ModelAssessmentDomainSnapshot, ModelAssessmentEntryState,
     ModelAssessmentSubject, ModelAssessments, ModelAssessmentsSnapshot, ModelCandidate,
     ModelCandidates, ModelCapabilities, ModelDownload, ModelDownloadId, ModelDownloads,
-    ModelDownloadsResponse, ModelId, ModelInstance, ModelInstanceId, ModelInstancesInvalidation,
-    ModelInstancesSnapshot, ModelLoadDevice, ModelLoadPlan, ParsedModelId,
+    ModelDownloadsResponse, ModelId, ModelInstance, ModelInstanceThroughput, ModelInstanceId,
+    ModelInstancesInvalidation, ModelInstancesSnapshot, ModelLoadDevice, ModelLoadPlan,
+    ParsedModelId,
     StartModelDownloadRequest, StartModelDownloadResponse,
 };
 use magnitude_service_contracts::{
@@ -362,6 +363,10 @@ pub fn app(state: AppState, serving: magnitude_serving::Serving) -> Router {
             get(model_instances).post(ensure_model_instance),
         )
         .route("/api/v1/instances/{instance_id}", get(model_instance))
+        .route(
+            "/api/v1/instances/{instance_id}/throughput",
+            get(model_instance_throughput),
+        )
         .route("/api/v1/events", get(watch_inference_events))
         .route(
             "/api/v1/instances/{instance_id}/stop",
@@ -448,6 +453,10 @@ pub trait ModelInstanceController: Send + Sync + 'static {
         instance_id: ModelInstanceId,
     ) -> BoxFuture<'_, Result<(), InventoryError>>;
     fn instances(&self) -> BoxFuture<'_, Result<ModelInstancesSnapshot, InventoryError>>;
+    fn throughput(
+        &self,
+        instance_id: ModelInstanceId,
+    ) -> BoxFuture<'_, Result<ModelInstanceThroughput, InventoryError>>;
     fn watch_instances(&self) -> BoxStream<'static, ModelInstancesInvalidation>;
 }
 
@@ -739,6 +748,43 @@ async fn model_instance(
         .find(|instance| instance.id.0 == instance_id)
         .map(Json)
         .ok_or_else(|| ApiError::from_inventory(InventoryError::NotFound(instance_id)))
+}
+
+#[utoipa::path(get, path = "/api/v1/instances/{instance_id}/throughput", operation_id = "getModelInstanceThroughput", tag = "models",
+    params(("instance_id" = String, Path, description = "Model instance ID")),
+    responses(
+        (status = 200, description = "Live engine throughput for the exact instance", body = ModelInstanceThroughput),
+        (status = 404, description = "Model instance not found or not ready", body = ErrorResponse),
+        (status = 503, description = "Throughput observation failed or timed out", body = ErrorResponse)
+    )
+)]
+async fn model_instance_throughput(
+    State(state): State<AppState>,
+    Path(instance_id): Path<String>,
+) -> Result<Json<ModelInstanceThroughput>, ApiError> {
+    let controller = state
+        .model_controller
+        .as_ref()
+        .ok_or_else(|| ApiError::server("model control is not configured"))?;
+    controller
+        .throughput(ModelInstanceId(instance_id))
+        .await
+        .map(Json)
+        .map_err(|error| match error {
+            InventoryError::Upstream(_) => ApiError {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                body: ErrorResponse {
+                    error: ApiErrorBody {
+                        message: "throughput observation unavailable".into(),
+                        r#type: "server_error".into(),
+                        param: None,
+                        code: "throughput_unavailable".into(),
+                        retryable: true,
+                    },
+                },
+            },
+            other => ApiError::from_inventory(other),
+        })
 }
 
 #[utoipa::path(get, path = "/api/v1/events", operation_id = "watchInferenceEvents", tag = "system",
@@ -1873,6 +1919,7 @@ fn open_ai_model(
         ensure_model_instance,
         model_instances,
         model_instance,
+        model_instance_throughput,
         watch_inference_events,
         stop_model_instance,
         magnitude_serving::properties::props,
@@ -1918,6 +1965,7 @@ fn open_ai_model(
         HuggingFaceCredential,
         ModelLoadPlan,
         ModelInstancesSnapshot,
+        ModelInstanceThroughput,
         ModelInstancesInvalidation,
         InferenceResourceInvalidation,
         PropsResponse,
@@ -2693,6 +2741,20 @@ mod tests {
             })
         }
 
+        fn throughput(
+            &self,
+            instance_id: ModelInstanceId,
+        ) -> BoxFuture<'_, Result<ModelInstanceThroughput, InventoryError>> {
+            Box::pin(async move {
+                Ok(ModelInstanceThroughput::Ready {
+                    instance_id,
+                    model_id: "test-model:gguf:f16".parse().unwrap(),
+                    window_ms: 10_000,
+                    tokens_per_second: 40.0,
+                })
+            })
+        }
+
         fn watch_instances(&self) -> BoxStream<'static, ModelInstancesInvalidation> {
             Box::pin(futures_util::stream::empty())
         }
@@ -2717,6 +2779,28 @@ mod tests {
         assert_eq!(body["revision"], 0);
         assert_eq!(body["instances"][0]["id"], "test-instance");
         assert_eq!(body["instances"][0]["lifecycle"]["_tag"], "Ready");
+    }
+
+    #[tokio::test]
+    async fn throughput_returns_ready_snapshot_for_exact_instance() {
+        let response =
+            test_app(AppState::new().with_model_controller(Arc::new(StubModelInstanceController)))
+                .oneshot(
+                    Request::get("/api/v1/instances/test-instance/throughput")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(body["state"], "ready");
+        assert_eq!(body["instanceId"], "test-instance");
+        assert_eq!(body["windowMs"], 10_000);
+        assert_eq!(body["tokensPerSecond"], 40.0);
     }
 
     #[tokio::test]

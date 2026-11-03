@@ -1,4 +1,4 @@
-import { ServingUsageRequest, ServingUsageSnapshot } from "../schemas/serving-usage"
+import { EngineThroughputSnapshot, ServingUsageRequest, ServingUsageSnapshot } from "../schemas/serving-usage"
 import { Rpc } from "@effect/rpc"
 import { replaySafe, atMostOnce } from "../transport/recovery"
 import { Option, Schema } from "effect"
@@ -46,6 +46,11 @@ const ListServableModels = Rpc.make("ListServableModels", {
   payload: Schema.Struct({}),
   success: OpenAiModelsResponse,
   error: ServableModelsUnavailable,
+}).pipe(replaySafe)
+
+const GetEngineThroughput = Rpc.make("GetEngineThroughput", {
+  payload: Schema.Struct({}),
+  success: EngineThroughputSnapshot,
 }).pipe(replaySafe)
 
 const GetCatalog = Rpc.make("GetModelCatalog", {
@@ -273,6 +278,7 @@ const SetModelLocationEnabled = Rpc.make("SetModelLocationEnabled", {
 export const Models = {
   getServingUsage: GetServingUsage,
   listServableModels: ListServableModels,
+  getEngineThroughput: GetEngineThroughput,
   getCatalog: GetCatalog,
   getSlots: GetSlots,
   getLocalEnvironment: GetLocalEnvironment,

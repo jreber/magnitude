@@ -2,17 +2,16 @@ import { Effect, Schedule } from "effect";
 import { Models as Rpcs } from "@magnitudedev/sdk";
 import { Group, Mutation, QueryClient } from "@magnitudedev/effect-query";
 import { type CandidateInspectionUpdate, type SlotId } from "@magnitudedev/sdk";
+import { turnAdmissionScope } from "./configuration";
 import { mutation, query, streamQuery } from "./bind";
 
 const GetServingUsage = query(Rpcs.getServingUsage, client => client.models.getServingUsage, {
   staleTime: 0, refresh: Schedule.spaced("5 seconds"),
 });
 
-const ListServableModels = query(
-  Rpcs.listServableModels,
-  (client) => client.models.listServableModels,
-  { staleTime: "10 seconds" }
-);
+const GetEngineThroughput = query(Rpcs.getEngineThroughput, client => client.models.getEngineThroughput, {
+  staleTime: 0, refresh: Schedule.spaced("2 seconds"),
+});
 
 const GetCatalog = query(
   Rpcs.getCatalog,
@@ -40,6 +39,9 @@ const RefreshCatalog = mutation(
 const slotScope = (slotId: SlotId) =>
   Mutation.MutationScope(`model-slot:${slotId}`);
 
+const slotMutationScope = (slotId: SlotId) =>
+  slotId === "primary" ? turnAdmissionScope : slotScope(slotId);
+
 const synchronizeCatalog = QueryClient.refetch(GetCatalog.match());
 
 const synchronizeSlots = QueryClient.refetch(GetSlots.match());
@@ -48,7 +50,7 @@ const AssignSlot = mutation(
   Rpcs.assignSlot,
   (client) => client.models.assignSlot,
   {
-    scope: ({ slotId }) => slotScope(slotId),
+    scope: ({ slotId }) => slotMutationScope(slotId),
     synchronize: () => synchronizeSlots,
   }
 );
@@ -57,7 +59,7 @@ const ClearSlot = mutation(
   Rpcs.clearSlot,
   (client) => client.models.clearSlot,
   {
-    scope: ({ slotId }) => slotScope(slotId),
+    scope: ({ slotId }) => slotMutationScope(slotId),
     synchronize: () => synchronizeSlots,
   }
 );
@@ -241,7 +243,7 @@ const SetModelLocationEnabled = mutation(
 
 export const Models = Group.make({
   GetServingUsage,
-  ListServableModels,
+  GetEngineThroughput,
   GetCatalog,
   GetSlots,
   GetLocalEnvironment,

@@ -27,11 +27,13 @@ serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.151"
 postcard.workspace = true
 sha2 = "=0.11.0"
+blake3 = "1"
 tokio = { version = "=1.53.0", features = ["rt", "sync", "macros", "time"] }
 seismic.workspace = true
 opentelemetry = "0.33.0"
 opentelemetry_sdk = "0.33.0"
 opentelemetry-otlp = { version = "0.33.0", features = ["http-json", "reqwest"] }
+tracing.workspace = true
 
 # Re-executes itself as a worker process whose stdout carries the protocol,
 # so it runs without the libtest harness (which prints to stdout).

@@ -18,5 +18,6 @@ magnitude-executor = { path = "../executor" }
 magnitude-serving = { path = "../serving" }
 magnitude-state = { path = "../state" }
 serde_json.workspace = true
+sha2 = "=0.11.0"
 tokio = { workspace = true, features = ["rt-multi-thread", "net", "signal"] }
 tracing-subscriber.workspace = true

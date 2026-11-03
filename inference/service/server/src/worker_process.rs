@@ -135,7 +135,6 @@ impl WorkerLauncher {
         command
             .arg(role.subcommand())
             .env("MAGNITUDE_OTEL", "0")
-            .env("RUST_LOG", "error")
             .env_remove("MAGNITUDE_OTEL_ENDPOINT")
             .env_remove("OTEL_EXPORTER_OTLP_ENDPOINT")
             .env_remove("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")

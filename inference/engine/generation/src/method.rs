@@ -123,6 +123,60 @@ impl DraftCheckpoint {
         let open = self.open.as_ref().map_or(0, OpenFeature::host_bytes);
         (pending + open) as u64
     }
+
+    /// The host bytes of the open feature row, or `None` when there is no
+    /// open feature. When the open feature is device-owned, `boundary` must
+    /// be the executor's strong reference to the same row; it is read to
+    /// host so the spill can persist it.
+    pub fn open_feature_bytes_spill(&self, boundary: Option<&FeatureRef>) -> Option<Vec<u8>> {
+        self.open.as_ref().and_then(|open| match open {
+            OpenFeature::Host(rows) => Some(rows.bytes().to_vec()),
+            OpenFeature::Device(_) => boundary
+                .and_then(|b| b.read_to_host().ok())
+                .map(|vals| {
+                    let mut bytes = Vec::with_capacity(vals.len() * 4);
+                    for v in &vals {
+                        bytes.extend_from_slice(&v.to_le_bytes());
+                    }
+                    bytes
+                }),
+        })
+    }
+
+    /// The pending tokens, one per pending feature row.
+    pub fn pending_tokens(&self) -> &[TokenId] {
+        self.pending.as_ref().map_or(&[], |rows| &rows.tokens)
+    }
+
+    /// The host bytes of the pending feature rows, if any.
+    pub fn pending_feature_bytes(&self) -> Option<&[u8]> {
+        self.pending.as_ref().map(|rows| rows.features.bytes())
+    }
+
+    /// Rebuilds a checkpoint from its spilled host bytes: the position, the
+    /// pending token and feature bytes (one feature row per token; pass
+    /// `None` when there are no pending tokens), and the open feature's row
+    /// bytes.
+    pub fn from_spill(
+        position: usize,
+        pending: Option<(Vec<TokenId>, Vec<u8>)>,
+        open: Option<Vec<u8>>,
+    ) -> Result<Self, String> {
+        let pending = pending
+            .map(|(tokens, features)| -> Result<PendingRows, String> {
+                let rows = FeatureRows::new(features.into(), tokens.len())
+                    .map_err(|error| error.to_string())?;
+                Ok(PendingRows { tokens, features: rows })
+            })
+            .transpose()?;
+        let open = open
+            .map(|bytes| -> Result<OpenFeature, String> {
+                let rows = FeatureRows::new(bytes.into(), 1).map_err(|error| error.to_string())?;
+                Ok(OpenFeature::Host(rows))
+            })
+            .transpose()?;
+        Ok(Self { position, pending, open })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

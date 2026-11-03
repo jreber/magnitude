@@ -1088,6 +1088,22 @@ impl Tensor {
     pub fn write_from_host(&mut self, bytes: &[u8]) -> Result<(), TensorError> {
         self.inner.write_from_host(bytes)
     }
+    /// The bytes of leading rows `[start, end)`, read to the host. The range
+    /// is contiguous (one leading-axis slice) and within the leading extent.
+    pub fn read_rows_to_host(&self, start: u64, end: u64) -> Result<Vec<u8>, TensorError> {
+        Ok(self.slice_leading(start, end)?.read_to_host()?)
+    }
+    /// Replace the bytes of leading rows `[start, end)` from `bytes`, whose
+    /// length must be those rows' canonical byte count. The range is
+    /// contiguous (one leading-axis slice) and within the leading extent.
+    pub fn write_rows_from_host(
+        &mut self,
+        start: u64,
+        end: u64,
+        bytes: &[u8],
+    ) -> Result<(), TensorError> {
+        self.slice_leading(start, end)?.write_from_host(bytes)
+    }
     /// Fill all physical bytes of a canonical upload tensor from `reader`
     /// with bounded scratch, rather than materializing a second whole tensor.
     /// On error the tensor is only partly initialized and must not be used.
@@ -4536,4 +4552,76 @@ pub mod dynamic;
 pub mod precision {
     pub use seismic_compiler::numerics::PolicyIdentity;
     pub use seismic_lang::precision::*;
+}
+
+#[cfg(test)]
+mod row_io_tests {
+    use super::*;
+
+    #[test]
+    fn row_io_matches_full_read_and_writes_land_in_original() {
+        let device = Devices::discover(&[])
+            .unwrap()
+            .open_backend(BackendName::Cpu)
+            .unwrap();
+        let (rows, cols, row_bytes): (u64, u64, usize) = (16, 4, 16);
+        let fill: Vec<u8> = (0..(rows * cols * 4) as u32).map(|i| i as u8).collect();
+        let mut tensor =
+            Tensor::from_host(&device, Element::u32(), &[rows, cols], &fill).unwrap();
+        let full = tensor.read_to_host().unwrap();
+        assert_eq!(full, fill);
+        assert_eq!(
+            tensor.read_rows_to_host(3, 7).unwrap(),
+            &full[row_bytes * 3..row_bytes * 7]
+        );
+        let patch = vec![0xaau8; row_bytes * 2];
+        tensor.write_rows_from_host(10, 12, &patch).unwrap();
+        let after = tensor.read_to_host().unwrap();
+        assert_eq!(&after[row_bytes * 10..row_bytes * 12], &patch);
+        for (index, row) in after.chunks_exact(row_bytes).enumerate() {
+            if (10..12).contains(&index) {
+                continue;
+            }
+            assert_eq!(row, &fill[index * row_bytes..(index + 1) * row_bytes]);
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn slabbed_row_io_across_boundary() {
+        let device = Devices::discover(&[])
+            .unwrap()
+            .open_backend(BackendName::Cpu)
+            .unwrap();
+        let row_bytes = 8;
+        let mut slabs = SlabTensor::new(
+            &device,
+            16,
+            48,
+            vec![SlabRegion {
+                element: Element::f32(),
+                row_shape: vec![2],
+            }],
+        )
+        .unwrap();
+        for _ in 0..3 {
+            slabs.add_slab().unwrap();
+        }
+        for (_index, slab) in slabs.slabs() {
+            let mut region = slab.region(0).unwrap().clone();
+            let fill: Vec<u8> = (0..(16 * row_bytes) as u32).map(|i| i as u8).collect();
+            region.write_from_host(&fill).unwrap();
+        }
+        let mut logical = slabs.logical_region(0).unwrap();
+        let full = logical.read_to_host().unwrap();
+        assert_eq!(full.len(), 48 * row_bytes);
+        let within = logical.read_rows_to_host(4, 12).unwrap();
+        assert_eq!(within, &full[row_bytes * 4..row_bytes * 12]);
+        let second_slab = logical.read_rows_to_host(16, 32).unwrap();
+        assert_eq!(second_slab, &full[row_bytes * 16..row_bytes * 32]);
+        assert!(logical.read_rows_to_host(14, 18).is_err());
+        assert!(logical
+            .write_rows_from_host(14, 18, &vec![0u8; row_bytes * 4])
+            .is_err());
+    }
 }

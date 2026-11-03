@@ -55,6 +55,7 @@ pub enum Error {
     HistoryDomains {
         count: usize,
     },
+    NonTokenDomain(usize),
 }
 
 impl std::fmt::Display for Error {
@@ -82,6 +83,9 @@ impl std::fmt::Display for Error {
                     f,
                     "the store has {count} history domains where one is required"
                 )
+            }
+            Self::NonTokenDomain(domain) => {
+                write!(f, "expected Token domain but found domain {domain}")
             }
         }
     }
@@ -156,6 +160,29 @@ pub struct PlaneBuffer {
     pub slab_rows: u32,
     pub base_row: usize,
     pub buffer: Tensor,
+}
+
+/// One exported history region (one plane's entire row set).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ExportedRegion {
+    pub domain: usize,
+    pub region: usize,
+    pub row_bytes: usize,
+    /// The claimed `(start, count)` ranges, in logical order; `bytes`
+    /// holds those rows in the same order.
+    pub ranges: Vec<(usize, usize)>,
+    pub bytes: Vec<u8>,
+}
+
+/// A complete export of a [`StateCheckpoint`]: position, tape depth, per-domain
+/// start offsets, history regions, and bank tensors.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ExportedState {
+    pub position: usize,
+    pub tape: usize,
+    pub starts: Vec<usize>,
+    pub history: Vec<ExportedRegion>,
+    pub bank: Vec<Vec<u8>>,
 }
 
 /// History rows of one store: address-ordered, coalesced free holes, and the
@@ -2759,6 +2786,149 @@ impl StateStore {
         self.banks.acquire()
     }
 
+    /// Rebuild a live state from an [`ExportedState`] produced by
+    /// [`StateCheckpoint::export`]: validate it against this store, claim the
+    /// rows and successor bank it describes, and write the saved bytes into
+    /// them. Claiming takes only free backed rows, never growing the store;
+    /// a short store is [`Error::Capacity`]. The returned state's checkpoint
+    /// re-exports the saved bytes.
+    pub fn import(self: &Rc<Self>, saved: &ExportedState) -> Result<SequenceState, Error> {
+        let domains: Vec<HistoryDomainId> = self.history_domains().collect();
+        let planes = self.history_planes()?;
+        let mut expected: Vec<(usize, usize)> =
+            planes.iter().map(|plane| (plane.domain.0, plane.plane_index)).collect();
+        let mut actual: Vec<(usize, usize)> =
+            saved.history.iter().map(|region| (region.domain, region.region)).collect();
+        expected.sort_unstable();
+        actual.sort_unstable();
+        if actual != expected {
+            return Err(Error::Request(
+                "import: the exported history regions do not match the store's planes".into(),
+            ));
+        }
+        for plane in &planes {
+            let region = saved
+                .history
+                .iter()
+                .find(|region| region.domain == plane.domain.0 && region.region == plane.plane_index)
+                .expect("regions matched the store's planes");
+            if region.row_bytes != plane.row_bytes {
+                return Err(Error::Request(format!(
+                    "import: domain {} plane {} row bytes {} differ from the store's {}",
+                    plane.domain.0, plane.plane_index, region.row_bytes, plane.row_bytes
+                )));
+            }
+        }
+        let arenas = self.recurrent_arenas();
+        if saved.bank.len() != arenas.len() {
+            return Err(Error::Request(format!(
+                "import: {} bank rows exported, the store has {} recurrent arenas",
+                saved.bank.len(),
+                arenas.len()
+            )));
+        }
+        if saved.starts.len() != domains.len() {
+            return Err(Error::Request(
+                "import: the exported starts do not match the store's domain count".into(),
+            ));
+        }
+        for (i, &domain) in domains.iter().enumerate() {
+            let start = saved.starts[i];
+            let requires_zero = matches!(
+                self.history_domain_kind(domain),
+                HistoryDomainKind::Token | HistoryDomainKind::Block { .. } | HistoryDomainKind::Shared { .. }
+            );
+            if requires_zero {
+                if start != 0 {
+                    return Err(Error::Request(format!(
+                        "import: domain {} kind requires start == 0, got {}",
+                        domain.0, start
+                    )));
+                }
+                continue;
+            }
+            match self.history_domain_kind(domain) {
+                HistoryDomainKind::Window { rows } => {
+                    let min_start = saved.position.saturating_sub(rows);
+                    if start < min_start || start >= saved.position {
+                        return Err(Error::Request(format!(
+                            "import: Window domain {} start {} outside [{}, {})",
+                            domain.0, start, min_start, saved.position
+                        )));
+                    }
+                }
+                _ => unreachable!("non-zero kinds already matched"),
+            }
+        }
+        if saved.position > self.context_capacity {
+            return Err(Error::Request(format!(
+                "import: position {} exceeds the context capacity {}",
+                saved.position, self.context_capacity
+            )));
+        }
+        let counts: Vec<usize> = domains
+            .iter()
+            .map(|&domain| {
+                saved
+                    .history
+                    .iter()
+                    .find(|r| r.domain == domain.0)
+                    .map(|r| r.ranges.iter().map(|(_, c)| *c).sum())
+                    .unwrap_or(0)
+            })
+            .collect();
+        let mut claims = self.reserve_rows(None, &counts)?;
+        for claim in &mut claims {
+            claim.set_live(true);
+        }
+        let bank = self.successor_bank()?;
+        for plane in &mut self.history_planes()? {
+            let region = saved
+                .history
+                .iter()
+                .find(|region| region.domain == plane.domain.0 && region.region == plane.plane_index)
+                .expect("regions matched the store's planes");
+            let row_bytes = region.row_bytes;
+            let slab_rows = plane.slab_rows as usize;
+            let mut logical = 0usize;
+            for (start, count) in claims[plane.domain.0].ranges() {
+                let end = start + count;
+                let mut at = start;
+                while at < end {
+                    let slab_end = (at / slab_rows + 1) * slab_rows;
+                    let chunk_end = slab_end.min(end);
+                    let taken = chunk_end - at;
+                    let offset = logical * row_bytes;
+                    plane.buffer.write_rows_from_host(
+                        at as u64,
+                        chunk_end as u64,
+                        &region.bytes[offset..offset + taken * row_bytes],
+                    )?;
+                    logical += taken;
+                    at = chunk_end;
+                }
+            }
+        }
+        for (arena, row) in arenas.iter().zip(&saved.bank) {
+            let mut view = arena.slice_leading(bank.index() as u64, bank.index() as u64 + 1)?;
+            view.write_from_host(row)?;
+        }
+        self.owners.set(self.owners.get() + 1);
+        self.sequences.set(self.sequences.get() + 1);
+        let history_start = saved.starts.iter().copied().min().unwrap_or(0);
+        let state = SequenceState {
+            store: self.clone(),
+            position: saved.position,
+            expected_end: saved.position,
+            history_start,
+            starts: saved.starts.clone(),
+            claims,
+            bank,
+            tape: saved.tape,
+        };
+        Ok(state)
+    }
+
     fn begin_transaction(&self) -> Transaction {
         self.transactions.begin()
     }
@@ -3149,6 +3319,69 @@ impl StateCheckpoint {
             bank: self.bank.clone(),
             tape: self.tape,
         }
+    }
+
+    /// Export all history planes into [`ExportedRegion`]s, chunking each
+    /// `(start, count)` range at slab boundaries.
+    pub fn export_history(&self) -> Result<Vec<ExportedRegion>, Error> {
+        let planes = self.store().history_planes()?;
+        let mut regions = Vec::new();
+        for plane in &planes {
+            let ranges = self.history_ranges(plane.domain);
+            if ranges.is_empty() {
+                continue;
+            }
+            let slab_rows = plane.slab_rows as usize;
+            let mut bytes = Vec::new();
+            for (start, count) in &ranges {
+                let end = start + count;
+                let mut cstart = *start;
+                while cstart < end {
+                    let slab_end = (cstart / slab_rows + 1) * slab_rows;
+                    let cend = slab_end.min(end);
+                    let chunk = plane
+                        .buffer
+                        .read_rows_to_host(cstart as u64, cend as u64)?;
+                    bytes.extend(chunk);
+                    cstart = cend;
+                }
+            }
+            regions.push(ExportedRegion {
+                domain: plane.domain.0,
+                region: plane.plane_index,
+                row_bytes: plane.row_bytes,
+                ranges: ranges.into_iter().collect(),
+                bytes,
+            });
+        }
+        Ok(regions)
+    }
+
+    /// Export one bank row from each recurrent arena.
+    pub fn export_bank(&self) -> Result<Vec<Vec<u8>>, Error> {
+        let arenas = self.store().recurrent_arenas();
+        let bank = self.bank_index();
+        let mut result = Vec::new();
+        for tensor in arenas.iter() {
+            result.push(tensor.read_rows_to_host(bank as u64, bank as u64 + 1)?);
+        }
+        Ok(result)
+    }
+
+    /// Full export of this checkpoint.
+    pub fn export(&self) -> Result<ExportedState, Error> {
+        let domains: Vec<HistoryDomainId> = self.store().history_domains().collect();
+        let starts = domains
+            .iter()
+            .map(|d| self.history_start(*d))
+            .collect();
+        Ok(ExportedState {
+            position: self.position(),
+            tape: self.tape_rows(),
+            starts,
+            history: self.export_history()?,
+            bank: self.export_bank()?,
+        })
     }
 }
 /// Publish `count` rows, one per stored domain in `claims`, whose recurrent
@@ -6041,6 +6274,50 @@ mod tests {
                 run.peak_committed
             );
             assert!(run.released_to <= reserved);
+        }
+    }
+
+    #[test]
+    fn window_domain_checkpoint_round_trips() {
+        let Some(device) = cpu_device() else { return };
+        let component = dense_component(64);
+        let specs = vec![ComponentSpec {
+            shape: vec![64],
+            dtype: DType::F32,
+        }];
+        let banks = BankCapacity {
+            active: 4,
+            in_flight: 1,
+            retained: 1,
+        };
+        let domains = vec![HistoryDomainPlan {
+            layout: HistoryDomainLayout::Window {
+                rows: 4,
+                components: vec![component],
+            },
+            logical_rows: 64,
+        }];
+        let (store, _bindings) =
+            StateStore::new(device, 64, 8, domains, specs, banks).unwrap();
+        let exported = {
+            let mut state = store.create().unwrap();
+            let claims = store.reserve(None, 0, 10).unwrap();
+            let mut following = store.successor_bank().unwrap();
+            install_commit(&mut state, claims, &mut following, 0, 10);
+            assert_eq!(state.position, 10);
+            assert_eq!(state.starts[0], 6, "Window(4) at position 10");
+            state.checkpoint().export().unwrap()
+        };
+        let restored = store.import(&exported).unwrap();
+        let exported2 = restored.checkpoint().export().unwrap();
+        assert_eq!(exported.position, exported2.position);
+        assert_eq!(exported.tape, exported2.tape);
+        assert_eq!(exported.starts, exported2.starts);
+        assert_eq!(exported.history.len(), exported2.history.len());
+        for (a, b) in exported.history.iter().zip(&exported2.history) {
+            assert_eq!(a.domain, b.domain);
+            assert_eq!(a.row_bytes, b.row_bytes);
+            assert_eq!(a.bytes, b.bytes);
         }
     }
 }

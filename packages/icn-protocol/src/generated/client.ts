@@ -91,6 +91,7 @@ export const makeIcnApiClient = (options: GeneratedClientOptions) =>
         getModelAssessments: makeHttpOperation(http, options, Operations.getModelAssessmentsOperation),
         getModelInstance: makeHttpOperation(http, options, Operations.getModelInstanceOperation),
         getModelInstances: makeHttpOperation(http, options, Operations.getModelInstancesOperation),
+        getModelInstanceThroughput: makeHttpOperation(http, options, Operations.getModelInstanceThroughputOperation),
         getModelProperties: makeHttpOperation(http, options, Operations.getModelPropertiesOperation),
         previewModelLoad: makeHttpOperation(http, options, Operations.previewModelLoadOperation),
         stopModelInstance: makeHttpOperation(http, options, Operations.stopModelInstanceOperation),

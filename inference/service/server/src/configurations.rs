@@ -27,7 +27,7 @@ use magnitude_service_models::{
 };
 
 use crate::assessment::assessor::engine_material;
-use crate::assessment::environment::{ServingDevice, serving_policy};
+use crate::assessment::environment::{serving_policy, ServingDevice};
 
 /// Resolved configurations kept for reuse beyond those still held elsewhere. A resolution holds
 /// the model's package metadata, tokenizers and templates, 100 to 250 MB for a 250K-token
@@ -39,8 +39,8 @@ const RETAINED_CONFIGURATIONS: usize = 1;
 pub struct ResolvedConfiguration {
     /// Chat semantics: tokenizer, templates, properties.
     pub host: Arc<HostArtifacts>,
-    /// What a worker loads, on exactly the serving device: its preview and its load open that
-    /// device or fail.
+    /// What a worker loads. Its device request is automatic; a load replaces it with the
+    /// previewed device.
     pub manifest: ExecutionManifest,
     /// The installed packages the configuration reads.
     pub package_ids: Vec<ModelPackageId>,
@@ -84,6 +84,7 @@ impl ResolvedConfigurations {
         let (input, package_ids) = installed_bundle(&configuration.bundle);
         let material = self.models.resolve_bundle(input).await?;
         let paths = engine_material(&material)?;
+        let model_sha256 = Some(material.target_model.model.content_id.0.clone());
         let key = ResolutionKey {
             bundle: servable_model_bundle_key_for_bundle(&configuration.bundle),
             files: std::iter::once(paths.target.clone())
@@ -92,7 +93,9 @@ impl ResolvedConfigurations {
                 .collect(),
         };
         self.cache
-            .resolve(key, || self.resolve_material(material, paths, package_ids))
+            .resolve(key, || {
+                self.resolve_material(material, paths, package_ids, model_sha256)
+            })
             .await
     }
 
@@ -112,12 +115,14 @@ impl ResolvedConfigurations {
         material: ResolvedServableModelBundle,
         paths: ModelPackagePaths,
         package_ids: Vec<ModelPackageId>,
+        model_sha256: Option<String>,
     ) -> Result<Arc<ResolvedConfiguration>, InventoryError> {
         let configuration = engine_configuration(
             paths,
             self.kernel_directory.clone(),
             self.reserves,
             self.serving,
+            model_sha256,
         );
         let resolved = crate::spawn_blocking_traced(move || configuration.resolve())
             .await
@@ -135,13 +140,13 @@ impl ResolvedConfigurations {
 }
 
 /// The engine configuration serving a bundle's material: its components, its declared method
-/// (a separate draft's method is the bundle's, never `Auto`), the standard service limits, on
-/// the serving device.
+/// (a separate draft's method is the bundle's, never `Auto`), the standard service limits.
 fn engine_configuration(
     package: ModelPackagePaths,
     kernel_directory: PathBuf,
     reserves: MemoryReserves,
     serving: ServingDevice,
+    model_sha256: Option<String>,
 ) -> EngineConfiguration {
     EngineConfiguration {
         package: PackageOptions {
@@ -162,6 +167,7 @@ fn engine_configuration(
         device: serving.request(),
         kernel_cache: Some(kernel_directory),
         reserves,
+        model_sha256,
     }
 }
 
@@ -361,6 +367,7 @@ mod tests {
             kernels.clone(),
             MemoryReserves::standard(),
             serving,
+            None,
         )
         .resolve()
         .unwrap();
@@ -382,6 +389,7 @@ mod tests {
                 kernels.clone(),
                 MemoryReserves::standard(),
                 serving,
+                None,
             )
             .resolve() else {
                 panic!("{method:?} resolved over a DSpark draft")
@@ -393,24 +401,6 @@ mod tests {
             assert_eq!(code, "invalid_model_configuration");
             assert!(message.contains("the package's draft is DSpark"), "{message}");
         }
-    }
-
-    /// Every configuration, so every preview and load, is on exactly the serving device.
-    #[test]
-    fn a_configuration_is_on_the_serving_device() {
-        let serving = ServingDevice::of(seismic::ExecutorSelector::HostCpu);
-        let configuration = engine_configuration(
-            ModelPackagePaths {
-                target: PathBuf::from("target.gguf"),
-                projector: None,
-                draft: None,
-                method: ModelMethod::Plain,
-            },
-            std::env::temp_dir(),
-            MemoryReserves::standard(),
-            serving,
-        );
-        assert_eq!(configuration.device, serving.request());
     }
 
     fn key(index: usize) -> ServableModelBundleKey {

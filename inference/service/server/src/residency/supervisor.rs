@@ -21,7 +21,7 @@ use std::time::Duration;
 use futures_util::future::BoxFuture;
 use magnitude_engine::error::{RequestError, UnloadCause};
 use magnitude_engine::worker::EngineClient;
-use magnitude_engine::worker::protocol::MemoryObservation;
+use magnitude_engine::worker::protocol::{MemoryObservation, ThroughputSnapshot};
 use magnitude_executor::platform::{DomainThresholds, Fit, HostDistress, MemoryReserves};
 use magnitude_service_contracts::models::{ModelInstanceId, ModelReleaseReason};
 use seismic::Devices;
@@ -91,6 +91,8 @@ pub trait SupervisedEngine: Send + Sync + 'static {
     fn check(&self) -> Result<(), RequestError>;
     /// The engine heap's current standing and a fresh reading of its memory domains.
     fn observe(&self) -> BoxFuture<'_, Result<MemoryObservation, RequestError>>;
+    /// A live accepted-output token snapshot over the engine's ten-second window.
+    fn throughput(&self) -> BoxFuture<'_, Result<ThroughputSnapshot, RequestError>>;
 }
 
 impl SupervisedEngine for EngineClient {
@@ -100,6 +102,10 @@ impl SupervisedEngine for EngineClient {
 
     fn observe(&self) -> BoxFuture<'_, Result<MemoryObservation, RequestError>> {
         Box::pin(EngineClient::observe(self))
+    }
+
+    fn throughput(&self) -> BoxFuture<'_, Result<ThroughputSnapshot, RequestError>> {
+        Box::pin(EngineClient::throughput(self))
     }
 }
 
@@ -182,6 +188,36 @@ impl MemorySupervisor {
     pub async fn observe_resident(&self) -> Option<MemoryObservation> {
         let engine = Arc::clone(&self.inner.lock().supervised.as_ref()?.engine);
         engine.observe().await.ok()
+    }
+
+    /// A live accepted-output token snapshot for the exact resident instance.
+    /// `None` when no worker is resident for that instance or it stopped before answering.
+    pub async fn throughput_for_instance(
+        &self,
+        instance_id: &ModelInstanceId,
+    ) -> Result<Option<ThroughputSnapshot>, RequestError> {
+        let engine = {
+            let state = self.inner.lock();
+            let supervised = state.supervised.as_ref().filter(|s| &s.instance_id == instance_id)
+                .ok_or_else(|| RequestError::WorkerLost {
+                    reason: "instance not resident".into(),
+                })?;
+            Arc::clone(&supervised.engine)
+        };
+        let result = tokio::time::timeout(Duration::from_secs(2), engine.throughput()).await;
+        let snapshot = match result {
+            Ok(Ok(snapshot)) => snapshot,
+            Ok(Err(error)) => return Err(error),
+            Err(_) => {
+                return Err(RequestError::WorkerLost {
+                    reason: "throughput observation timed out".into(),
+                })
+            }
+        };
+        let still = self.inner.lock().supervised.as_ref().is_some_and(
+            |s| &s.instance_id == instance_id,
+        );
+        Ok(still.then_some(snapshot))
     }
 
     /// Supervise a ready worker until it exits or is released.
@@ -464,6 +500,16 @@ mod tests {
                 Ok(MemoryObservation {
                     census: magnitude_engine::census::AllocationCensus { stores: Vec::new() },
                     stores: Vec::new(),
+                })
+            })
+        }
+
+        fn throughput(&self) -> BoxFuture<'_, Result<ThroughputSnapshot, RequestError>> {
+            Box::pin(async {
+                Ok(ThroughputSnapshot {
+                    window_ms: 10_000,
+                    ready: true,
+                    accepted_tokens: 400,
                 })
             })
         }

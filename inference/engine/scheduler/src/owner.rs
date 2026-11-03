@@ -16,8 +16,8 @@ use super::{
         ServiceLimits, Victim, order_victims,
     },
     prefix_cache::{
-        CachePoint, MIN_BRANCH_GAIN, MIN_PREFIX_HIT, PrefixCache, PrefixCacheCapacity, PrefixPath,
-        PrefixRetention,
+        CachedPrefixKeyInfo, CachePoint, MIN_BRANCH_GAIN, MIN_PREFIX_HIT, PrefixCache,
+        PrefixCacheCapacity, PrefixPath, PrefixRetention,
     },
     protocol::{RequestSnapshot, WorkerReply},
     publication::{
@@ -26,6 +26,7 @@ use super::{
         RequestError, ServiceCapacityError,
     },
     round_driver::{RoundError, lower_round, reconcile_forward},
+    throughput::{ThroughputAccumulator, ThroughputSnapshot},
     worker::Wakes,
 };
 use magnitude_executor::{
@@ -37,13 +38,22 @@ use magnitude_executor::{
 };
 use magnitude_family_contracts::PreparedModelInput;
 use magnitude_generation::{
-    FinishReason, Generation, OutputToken, RoundStart, StartedRound, TimedLaunch,
+    DraftCheckpoint, FinishReason, Generation, MethodCheckpoint, OutputToken, RoundStart,
+    StartedRound, TimedLaunch,
 };
 use magnitude_state::ShrinkPolicy;
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
+    path::PathBuf,
+    cell::RefCell,
+    rc::Rc,
     sync::Arc,
     time::Duration,
+};
+
+use crate::cold_tier::{
+    ColdTier, EntryKey, MethodTag, PointTag, SpilledCheckpoint, decode_spill, encode_spill,
+    entry_key, prefer_disk,
 };
 
 /// Where a newly admitted request stops its prefill to retain branch
@@ -716,6 +726,8 @@ struct Service<F: ProgramFamily> {
     release_owed: bool,
     next_observation: u64,
     wakes: Arc<dyn Wakes>,
+    throughput: ThroughputAccumulator,
+    cold_tier: Option<Rc<RefCell<ColdTier>>>,
 }
 
 pub struct Owner<F: ProgramFamily = NativeFamily> {
@@ -736,6 +748,9 @@ impl<F: ProgramFamily> Owner<F> {
             limits,
             PrefixCacheCapacity::disabled(),
             wakes,
+            None,
+            None,
+            0,
         )
     }
 
@@ -745,22 +760,105 @@ impl<F: ProgramFamily> Owner<F> {
         limits: ServiceLimits,
         capacity: PrefixCacheCapacity,
         wakes: Arc<dyn Wakes>,
+        cold_identity: Option<[u8; 32]>,
+        state_cache: Option<PathBuf>,
+        budget: u64,
     ) -> Result<Self, String> {
+        let identity = cold_identity;
+        let cold_tier = match (identity, state_cache) {
+            (Some(identity), Some(dir)) => {
+                let hex = EntryKey(identity).hex();
+                Some(Rc::new(RefCell::new(
+                    ColdTier::open(dir.join(hex), budget).map_err(|e| e.to_string())?,
+                )))
+            }
+            _ => None,
+        };
+        let mut service = Service {
+            domain,
+            scheduler: Scheduler::new(limits)?,
+            requests: BTreeMap::new(),
+            epoch: AvailabilityEpoch::default(),
+            next_id: 1,
+            now: 0,
+            prefix_cache: PrefixCache::new(capacity),
+            memory_condition: MemoryCondition::Normal,
+            memory_deficits: Vec::new(),
+            release_owed: false,
+            next_observation: 0,
+            wakes,
+            throughput: ThroughputAccumulator::new(),
+            cold_tier,
+        };
+        if let Some(tier) = service.cold_tier.clone() {
+            let identity = identity.unwrap();
+            service.prefix_cache.on_evict(move |info: &CachedPrefixKeyInfo, state: &ResumeState| {
+                let method_str = match info.method {
+                    MethodCheckpoint::Plain => "Plain",
+                    MethodCheckpoint::Mtp(_) => "Mtp",
+                    MethodCheckpoint::DFlash(_) => "DFlash",
+                };
+                let draft: Option<&DraftCheckpoint> = match info.method {
+                    MethodCheckpoint::Mtp(d) | MethodCheckpoint::DFlash(d) => Some(d),
+                    _ => None,
+                };
+                if !info.conditioning.is_empty() {
+                    return;
+                }
+                let started = std::time::Instant::now();
+                let Ok(mut t) = tier.try_borrow_mut() else {
+                    return;
+                };
+                if !t.can_spill() {
+                    return;
+                }
+                let Ok(target) = state.checkpoint().export() else {
+                    tracing::event!(tracing::Level::WARN, skip_unsupported = true, "cold-tier spill skipped");
+                    return;
+                };
+                let Ok(head) = state.head().map(|h| h.export()).transpose() else {
+                    tracing::event!(tracing::Level::WARN, skip_unsupported = true, "cold-tier spill skipped");
+                    return;
+                };
+                let pending = draft.and_then(|d| {
+                    let toks = d.pending_tokens().to_vec();
+                    if toks.is_empty() {
+                        None
+                    } else {
+                        d.pending_feature_bytes().map(|b| (toks, b.to_vec()))
+                    }
+                });
+                let open = draft.and_then(|d| d.open_feature_bytes_spill(state.boundary()));
+                let point = match info.point {
+                    CachePoint::Branch => PointTag::Branch,
+                    CachePoint::PromptBoundary => PointTag::PromptBoundary,
+                    CachePoint::Terminal => PointTag::Terminal,
+                };
+                let key = entry_key(&identity, info.tokens, &[], method_str, info.position);
+                let payload = encode_spill(
+                    key,
+                    info.tokens.to_vec(),
+                    info.position,
+                    SpilledCheckpoint {
+                        method: match method_str {
+                            "DFlash" => MethodTag::DFlash,
+                            _ if draft.is_some() => MethodTag::Mtp,
+                            _ => MethodTag::Plain,
+                        },
+                        point,
+                        target,
+                        head,
+                        pending,
+                        open,
+                    },
+                );
+                let spill_bytes: usize = payload.regions.iter().map(|r| r.bytes.len()).sum();
+                t.spill(payload, method_str);
+                tracing::event!(tracing::Level::INFO, spill_bytes = spill_bytes as u64, spill_ms = started.elapsed().as_millis() as u64, "cold-tier spill");
+            });
+        }
         Ok(Self {
-            service: Service {
-                domain,
-                scheduler: Scheduler::new(limits)?,
-                requests: BTreeMap::new(),
-                epoch: AvailabilityEpoch::default(),
-                next_id: 1,
-                now: 0,
-                prefix_cache: PrefixCache::new(capacity),
-                memory_condition: MemoryCondition::Normal,
-                memory_deficits: Vec::new(),
-                release_owed: false,
-                next_observation: 0,
-                wakes,
-            },
+            service,
             pipeline: Pipeline::Idle(bindings),
         })
     }
@@ -771,6 +869,9 @@ impl<F: ProgramFamily> Owner<F> {
         limits: ServiceLimits,
         plan: &ResourcePlan,
         wakes: Arc<dyn Wakes>,
+        cold_identity: Option<[u8; 32]>,
+        state_cache: Option<PathBuf>,
+        budget: u64,
     ) -> Result<Self, String> {
         Self::with_prefix_cache_capacity(
             domain,
@@ -778,6 +879,9 @@ impl<F: ProgramFamily> Owner<F> {
             limits,
             PrefixCacheCapacity::from_resource_plan(plan),
             wakes,
+            cold_identity,
+            state_cache,
+            budget,
         )
     }
 
@@ -870,6 +974,13 @@ impl<F: ProgramFamily> Owner<F> {
         })
     }
 
+    /// A live accepted-output token snapshot over the owner's ten-second window.
+    pub fn throughput(&self) -> ThroughputSnapshot {
+        self.service
+            .throughput
+            .snapshot(Duration::from_nanos(self.service.now))
+    }
+
     /// Seismic's charge reconciled against every state holder the owner
     /// keeps: resident requests and cached prefixes; submitted work is
     /// counted through its stores' claims.
@@ -919,6 +1030,15 @@ impl<F: ProgramFamily> Owner<F> {
             Pipeline::Idle(_) => None,
         };
         self.service.terminalize_all(error, members);
+    }
+
+    /// Write the conversation's newest checkpoints to the cold tier before the
+    /// owner drops: they are pinned in memory, so eviction never spills them.
+    pub fn spill_on_unload(&mut self) {
+        // ponytail: three entries (terminal, prompt boundary, branch) is what
+        // `conversation_checkpoints` pins; raise if release deadline allows more.
+        const UNLOAD_SPILL_LIMIT: usize = 3;
+        self.service.prefix_cache.evict_all(UNLOAD_SPILL_LIMIT);
     }
 
     /// Run every transition that is possible now. An error is fatal: every
@@ -1336,6 +1456,11 @@ impl<F: ProgramFamily> Service<F> {
         // the controls and events that arrived during the flight.
         let mut submitted = false;
         loop {
+            if let Some(tier) = &self.cold_tier {
+                if let Ok(mut guard) = tier.try_borrow_mut() {
+                    guard.drain_results();
+                }
+            }
             pipeline = match pipeline {
                 Pipeline::InFlight(round, mut active) => {
                     if submitted || !active.flight.completion().is_complete() {
@@ -2074,22 +2199,58 @@ impl<F: ProgramFamily> Service<F> {
         bindings: &mut StateBindings<F>,
     ) -> Result<Residency, Fatal> {
         let fatal = |error: RequestError| (None, error);
-        let hit = if record.prefix_cache {
-            self.prefix_cache
-                .lookup(PrefixPath::of(&generation), generation.resume_bound())
-                .map_err(|error| fatal(invariant("prefix cache")(error)))?
-        } else {
-            None
+        let memory_lookup = |this: &mut Self, generation: &Generation| {
+            if record.prefix_cache {
+                this.prefix_cache
+                    .lookup(PrefixPath::of(generation), generation.resume_bound())
+                    .map_err(|error| fatal(invariant("prefix cache")(error)))
+            } else {
+                Ok(None)
+            }
         };
-        let opened = match hit {
-            Some(hit) => {
+        let mut hit = memory_lookup(self, &generation)?;
+        let mem_depth = hit.map_or(0, |hit| hit.position());
+        // The deeper of memory and disk wins: a shallow memory hit (the shared
+        // system prompt) must not hide a much deeper entry on disk.
+        let disk = self.cold_candidate(&generation);
+        let take_disk = disk.is_some_and(|(_, depth, bytes)| prefer_disk(mem_depth, depth, bytes));
+        let mut restored = None;
+        if let Some(candidate) = disk.filter(|_| take_disk) {
+            restored = self.try_cold_restore(bindings, id, &mut generation, candidate);
+            if restored.is_none() && hit.is_some() {
+                // Reclaiming capacity for the restore may have evicted the hit.
+                hit = memory_lookup(self, &generation)?;
+            }
+        }
+        if self.cold_tier.is_some() {
+            tracing::event!(
+                tracing::Level::INFO,
+                mem_depth,
+                disk_depth = disk.map_or(0, |(_, depth, _)| depth),
+                disk_bytes = disk.map_or(0, |(_, _, bytes)| bytes),
+                resume_bound = generation.resume_bound(),
+                chosen = match (&restored, hit) {
+                    (Some(_), _) => "disk",
+                    (None, Some(_)) => "memory",
+                    (None, None) => "fresh",
+                },
+                "cold-tier decision"
+            );
+        }
+        let mut resumed_from_cold = false;
+        let opened = match (restored, hit) {
+            (Some(encodes), _) => {
+                resumed_from_cold = true;
+                Ok(encodes)
+            }
+            (None, Some(hit)) => {
                 let cached = self
                     .prefix_cache
                     .entry(hit)
                     .map_err(|error| fatal(invariant("prefix cache")(error)))?;
                 self.domain.open_state(bindings, id, Some(cached.state()))
             }
-            None => self
+            (None, None) => self
                 .ensure_open_capacity(bindings)
                 .and_then(|()| self.domain.open_state(bindings, id, None)),
         };
@@ -2108,12 +2269,16 @@ impl<F: ProgramFamily> Service<F> {
                 return Ok(Residency::Resident(generation, Vec::new()));
             }
         };
-        let resumed = match hit {
-            Some(hit) => self
-                .prefix_cache
-                .entry(hit)
-                .and_then(|cached| generation.resume_at(Some((hit.position(), cached.method())))),
-            None => generation.resume_at(None),
+        let resumed = if resumed_from_cold {
+            Ok(())
+        } else {
+            match hit {
+                Some(hit) => self
+                    .prefix_cache
+                    .entry(hit)
+                    .and_then(|cached| generation.resume_at(Some((hit.position(), cached.method())))),
+                None => generation.resume_at(None),
+            }
         };
         if let Err(error) = resumed {
             return match self.domain.release_state(&[id]) {
@@ -2128,6 +2293,167 @@ impl<F: ProgramFamily> Service<F> {
         }
         record.prefix_source = hit.map(|hit| hit.id());
         Ok(Residency::Resident(generation, encodes))
+    }
+
+    /// Open a RAM-missed request from the SSD cold tier: the deepest disk
+    /// entry under the request's path, when its read time beats the prefill
+    /// it replaces. On success the request is resident and resumed at the
+    /// restored position and its prefix re-retained in the RAM cache; on any
+    /// failure it falls back to a fresh open. Never panics.
+    /// The deepest disk entry this request could resume from, below its
+    /// resume bound (`resume_at` rejects the row it samples from) and of its
+    /// method.
+    fn cold_candidate(&self, generation: &Generation) -> Option<(EntryKey, usize, u64)> {
+        let tier = self.cold_tier.as_ref()?;
+        let path: Vec<_> = generation
+            .prompt()
+            .iter()
+            .chain(generation.generated().iter())
+            .copied()
+            .collect();
+        let method = match generation.method_choice() {
+            magnitude_generation::MethodChoice::Plain => "Plain",
+            magnitude_generation::MethodChoice::Mtp { .. } => "Mtp",
+            magnitude_generation::MethodChoice::DFlash { .. } => "DFlash",
+        };
+        tier.try_borrow()
+            .ok()?
+            .lookup_deepest(&path, generation.resume_bound(), Some(method))
+    }
+
+    fn try_cold_restore(
+        &mut self,
+        bindings: &mut StateBindings<F>,
+        id: RequestId,
+        generation: &mut Generation,
+        (key, position, bytes): (EntryKey, usize, u64),
+    ) -> Option<Vec<Operation>> {
+        let tier = self.cold_tier.clone()?;
+        let restore_started = std::time::Instant::now();
+        let payload = match tier.try_borrow_mut().ok()?.load(&key) {
+            Ok(payload) => payload,
+            Err(error) => {
+                // `load` already evicted the key and deleted its file.
+                tracing::warn!(%error, "cold-tier entry failed to load; dropped");
+                return None;
+            }
+        };
+        let spilled = match decode_spill(&payload) {
+            Ok(spilled) => spilled,
+            Err(error) => {
+                if let Ok(mut guard) = tier.try_borrow_mut() {
+                    guard.remove(&key);
+                }
+                tracing::warn!(position, %error, "cold-tier entry failed to decode; dropped");
+                return None;
+            }
+        };
+        let position = spilled.target.position;
+        let method = match spilled.method {
+            MethodTag::Plain => MethodCheckpoint::Plain,
+            MethodTag::Mtp | MethodTag::DFlash => {
+                // A draft checkpoint's `position` excludes its pending and open rows
+                // (`target_rows` adds them back), unlike the target's exported position.
+                let carried = spilled.pending.as_ref().map_or(0, |(tokens, _)| tokens.len())
+                    + usize::from(spilled.open.is_some());
+                match DraftCheckpoint::from_spill(position.saturating_sub(carried), spilled.pending, spilled.open) {
+                Ok(draft) => {
+                    if spilled.method == MethodTag::DFlash {
+                        MethodCheckpoint::DFlash(draft)
+                    } else {
+                        MethodCheckpoint::Mtp(draft)
+                    }
+                }
+                Err(error) => {
+                    if let Ok(mut guard) = tier.try_borrow_mut() {
+                        guard.remove(&key);
+                    }
+                    tracing::warn!(position, %error, "cold-tier draft checkpoint failed to rebuild; dropped");
+                    return None;
+                }
+                }
+            }
+        };
+        let point = match spilled.point {
+            PointTag::Branch => CachePoint::Branch,
+            PointTag::PromptBoundary => CachePoint::PromptBoundary,
+            PointTag::Terminal => CachePoint::Terminal,
+        };
+        let restored = match self
+            .domain
+            .restore_state(bindings, id, &spilled.target, spilled.head.as_ref())
+        {
+            Ok(encodes) => encodes,
+            Err(error)
+                if matches!(
+                    &error,
+                    DomainError::Capacity(_)
+                        | DomainError::State(magnitude_state::Error::BanksExhausted { .. })
+                ) =>
+            {
+                if self.ensure_open_capacity(bindings).is_err() {
+                    tracing::warn!(position, "cold-tier restore out of capacity after reclaim");
+                    return None;
+                }
+                // A fresh open fits after the reclaim above, but the restore
+                // needs far more rows than a fresh open does; reclaim until
+                // the restore itself fits.
+                let mut attempt = self
+                    .domain
+                    .restore_state(bindings, id, &spilled.target, spilled.head.as_ref());
+                while matches!(
+                    &attempt,
+                    Err(DomainError::Capacity(_))
+                        | Err(DomainError::State(magnitude_state::Error::BanksExhausted { .. }))
+                ) {
+                    if !self.prefix_cache.evict_one(&self.held_entries(None)) {
+                        break;
+                    }
+                    if self
+                        .domain
+                        .shrink_state(bindings, ShrinkPolicy::Reclaim)
+                        .is_err()
+                    {
+                        break;
+                    }
+                    attempt = self
+                        .domain
+                        .restore_state(bindings, id, &spilled.target, spilled.head.as_ref());
+                }
+                match attempt {
+                    Ok(encodes) => encodes,
+                    Err(error) => {
+                        tracing::warn!(position, %error, "cold-tier restore retry failed; fresh open");
+                        return None;
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::warn!(position, %error, "cold-tier restore failed; fresh open");
+                return None;
+            }
+        };
+        if let Err(error) = generation.resume_at(Some((position, &method))) {
+            let _ = self.domain.release_state(&[id]);
+            tracing::warn!(position, %error, "cold-tier restore rejected on resume; fresh open");
+            return None;
+        }
+        // Re-insert the restored prefix into the RAM cache at its persisted
+        // point; a miss here only means the prefix stays on disk.
+        if let Ok(state) = self.domain.resume_state(id) {
+            let _ = self
+                .prefix_cache
+                .retain(PrefixPath::of(generation), position, point, state, method);
+        }
+        tracing::event!(
+            tracing::Level::INFO,
+            restore_hit = true,
+            position,
+            bytes,
+            restore_ms = restore_started.elapsed().as_millis() as u64,
+            "cold-tier restore"
+        );
+        Some(restored)
     }
 
     fn ensure_open_capacity(&mut self, bindings: &mut StateBindings<F>) -> Result<(), DomainError> {
@@ -2585,8 +2911,12 @@ impl<F: ProgramFamily> Service<F> {
             let state = match state {
                 Membership::Started(mut started) if !ended(started.generation()) => {
                     started.timed(TimedLaunch::Target, item.launch_duration(), sequences, rows);
+                    let before = started.generation().generated().len();
                     match reconcile_forward(started, &mut self.domain, request, item) {
                         Ok((generation, effects)) => {
+                            let delta = generation.generated().len() - before;
+                            self.throughput
+                                .append(Duration::from_nanos(self.now), u64::try_from(delta).unwrap_or(0));
                             followups.extend(effects.operations);
                             Membership::Generation(generation)
                         }

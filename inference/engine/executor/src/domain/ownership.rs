@@ -113,6 +113,78 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         Ok(encodes)
     }
 
+    /// Import cold-tier-exported state and open it as resident state: claim
+    /// the saved rows in this domain's stores, then open the request at the
+    /// imported position with the first `position` tokens of its admitted input.
+    pub fn restore_state(
+        &mut self,
+        bindings: &mut StateBindings<F>,
+        request: RequestId,
+        target: &ExportedState,
+        head: Option<&ExportedState>,
+    ) -> Result<Vec<Operation>, DomainError> {
+        if self.head_store.is_some() != head.is_some() {
+            return Err(DomainError::invariant(
+                "restore state head does not match the domain head arena",
+            ));
+        }
+        let requirements = self.open_requirements();
+        let target_demands: Vec<RowDemand> = self
+            .target_store
+            .history_domains()
+            .map(|domain| RowDemand {
+                domain,
+                rows: target.position,
+            })
+            .collect();
+        self.grant_state_growth(
+            bindings,
+            false,
+            &target_demands,
+            requirements.target_banks(),
+        )?;
+        if let Some(head) = head {
+            let head_demands: Vec<RowDemand> = self
+                .head_store
+                .as_ref()
+                .expect("checked above")
+                .history_domains()
+                .map(|domain| RowDemand {
+                    domain,
+                    rows: head.position,
+                })
+                .collect();
+            self.grant_state_growth(bindings, true, &head_demands, requirements.head_banks())?;
+        }
+        let imported_target = self.target_store.import(target)?;
+        let imported_head = self
+            .head_store
+            .as_ref()
+            .zip(head)
+            .map(|(store, saved)| store.import(saved))
+            .transpose()?;
+        let installed = self
+            .input
+            .get(&request)
+            .ok_or_else(|| DomainError::invariant("request has no installed input"))?;
+        let position = imported_target.position();
+        let input_tokens = installed.input.tokens();
+        if input_tokens.len() < position {
+            return Err(DomainError::invariant(
+                "restore position exceeds the admitted input tokens",
+            ));
+        }
+        let copied_tokens = input_tokens[..position].to_vec();
+        let resume = ResumeState {
+            target: imported_target.checkpoint(),
+            head: imported_head.as_ref().map(|s| s.checkpoint()),
+            features: BTreeMap::new(),
+            boundary: None,
+            tokens: copied_tokens.into(),
+        };
+        self.open_state(bindings, request, Some(&resume))
+    }
+
     fn fresh_state(
         &mut self,
         bindings: &mut StateBindings<F>,
