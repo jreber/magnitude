@@ -20,6 +20,7 @@ magnitude-state = { path = "../state" }
 seismic.workspace = true
 seismic-threads = { workspace = true, features = ["tokio"] }
 serde_json.workspace = true
+sha2 = "=0.11.0"
 tokio = { workspace = true, features = ["rt-multi-thread", "net", "signal"] }
 
 [lints]

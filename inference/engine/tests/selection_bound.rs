@@ -60,6 +60,7 @@ fn plain_owner(limits: ServiceLimits) -> (Host, usize, std::sync::Arc<ByteBpeTok
         device: DeviceRequest::Automatic,
         kernel_cache: std::env::var_os("MAGNITUDE_TEST_KERNEL_CACHE").map(PathBuf::from),
         release: ReleaseRate::of_machine(None),
+        model_sha256: None,
     }
     .resolve()
     .unwrap();
@@ -74,6 +75,9 @@ fn plain_owner(limits: ServiceLimits) -> (Host, usize, std::sync::Arc<ByteBpeTok
             limits,
             PrefixCacheCapacity::disabled(),
             wakes,
+            None,
+            None,
+            0,
         )
     });
     (host, vocabulary, tokenizer)
@@ -222,6 +226,7 @@ fn plain_domain(bound: usize, exported: usize) -> (Box<ExecutorDomain>, StateBin
         device: DeviceRequest::Automatic,
         kernel_cache: std::env::var_os("MAGNITUDE_TEST_KERNEL_CACHE").map(PathBuf::from),
         release: ReleaseRate::of_machine(None),
+        model_sha256: None,
     }
     .resolve()
     .unwrap();

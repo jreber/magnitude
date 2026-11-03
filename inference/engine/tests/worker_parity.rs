@@ -91,6 +91,7 @@ fn configuration(arguments: &Arguments) -> EngineConfiguration {
         device: arguments.device,
         kernel_cache: arguments.cache_dir.clone(),
         release: ReleaseRate::of_machine(None),
+        model_sha256: None,
     }
 }
 

@@ -29,7 +29,7 @@ use magnitude_service_models::{
 };
 
 use crate::assessment::assessor::engine_material;
-use crate::assessment::environment::{ServingDevice, serving_policy};
+use crate::assessment::environment::{serving_policy, ServingDevice};
 
 /// Resolved configurations kept for reuse beyond those still held elsewhere. A resolution holds
 /// the model's package metadata, tokenizers and templates, 100 to 250 MB for a 250K-token
@@ -54,8 +54,8 @@ pub struct LoadBounds {
 pub struct ResolvedConfiguration {
     /// Chat semantics: tokenizer, templates, properties.
     pub host: Arc<HostArtifacts>,
-    /// What a worker loads, on exactly the serving device: its preview and its load open that
-    /// device or fail.
+    /// What a worker loads. Its device request is automatic; a load replaces it with the
+    /// previewed device.
     pub manifest: ExecutionManifest,
     /// The installed packages the configuration reads.
     pub package_ids: Vec<ModelPackageId>,
@@ -120,6 +120,7 @@ impl ResolvedConfigurations {
             let material = self.models.resolve_bundle(input).await?;
             let paths = engine_material(&material)?;
             let context_tokens = configuration.profile.context_length;
+            let model_sha256 = Some(material.target_model.model.content_id.0.clone());
             let key = ResolutionKey {
                 bundle: servable_model_bundle_key_for_bundle(&configuration.bundle),
                 context_tokens,
@@ -133,7 +134,7 @@ impl ResolvedConfigurations {
             };
             let configuration = self
                 .cache
-                .resolve(key, || self.resolve_material(paths, package_ids, context_tokens))
+                .resolve(key, || self.resolve_material(paths, package_ids, context_tokens, model_sha256))
                 .await?;
             Ok(HeldConfiguration { configuration, _material: material })
         })
@@ -144,6 +145,7 @@ impl ResolvedConfigurations {
         paths: ModelPackagePaths,
         package_ids: Vec<ModelPackageId>,
         context_tokens: u32,
+        model_sha256: Option<String>,
     ) -> Result<Arc<ResolvedConfiguration>, InventoryError> {
         let configuration = engine_configuration(
             paths,
@@ -152,6 +154,7 @@ impl ResolvedConfigurations {
             self.serving,
             self.bounds,
             context_tokens,
+            model_sha256,
         );
         let resolved = magnitude_service_utils::blocking::run(move || configuration.resolve())
             .await
@@ -175,6 +178,7 @@ fn engine_configuration(
     serving: ServingDevice,
     bounds: LoadBounds,
     served: u32,
+    model_sha256: Option<String>,
 ) -> EngineConfiguration {
     EngineConfiguration {
         package: PackageOptions {
@@ -198,6 +202,7 @@ fn engine_configuration(
         device: serving.request(),
         kernel_cache: Some(kernel_directory),
         release,
+        model_sha256,
     }
 }
 
@@ -371,6 +376,7 @@ mod tests {
             serving,
             LoadBounds::default(),
             0,
+            None,
         )
         .resolve()
         .unwrap();
@@ -394,6 +400,7 @@ mod tests {
                 serving,
                 LoadBounds::default(),
                 0,
+                None,
             )
             .resolve() else {
                 panic!("{method:?} resolved over a DSpark draft")
@@ -423,6 +430,7 @@ mod tests {
             serving,
             LoadBounds::default(),
             0,
+            None,
         );
         assert_eq!(configuration.device, serving.request());
     }

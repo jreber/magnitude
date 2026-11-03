@@ -143,3 +143,28 @@ fn a_closed_worker_refuses_commands_with_its_cause() {
         Err(DispatchError::Stopped(Stopped("closed")))
     ));
 }
+
+#[test]
+fn throughput_command_reaches_the_owner_and_returns_a_snapshot() {
+    fn throughput_reply() -> WorkerReply {
+        WorkerReply::Throughput(magnitude_scheduler::ThroughputSnapshot {
+            window_ms: 10_000,
+            ready: true,
+            accepted_tokens: 400,
+        })
+    }
+    let (mut worker, _, _events) = replying(throughput_reply, 1);
+    let client = worker.client();
+    let reply = client
+        .dispatch(WorkerCommand::Throughput)
+        .unwrap()
+        .wait()
+        .unwrap();
+    assert!(matches!(
+        reply,
+        WorkerReply::Throughput(s) if s.window_ms == 10_000 && s.ready && s.accepted_tokens == 400
+    ));
+    worker.close();
+}
+
+

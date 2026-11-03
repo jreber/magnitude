@@ -33,6 +33,23 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+fn sha256_file(path: &std::path::Path) -> Option<String> {
+    use sha2::Digest;
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut hasher = sha2::Sha256::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = std::io::Read::read(&mut file, &mut buf).ok()?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    let digest = hasher.finalize();
+    let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+    Some(hex)
+}
+
 struct Options {
     target: PathBuf,
     projector: ProjectorSelection,
@@ -355,6 +372,7 @@ fn run() -> Result<(), String> {
         None => None,
     };
     let release = ReleaseRate::of_machine(options.kernel_cache.as_deref().zip(topology.as_deref()));
+    let model_sha256 = sha256_file(&options.target);
     let mut resolved = EngineConfiguration {
         package: PackageOptions::single(options.target, options.projector, options.draft),
         model: ModelPolicy {
@@ -374,6 +392,7 @@ fn run() -> Result<(), String> {
         device: options.device,
         kernel_cache: options.kernel_cache,
         release,
+        model_sha256,
     }
     .resolve()
     .map_err(|error| error.to_string())?;

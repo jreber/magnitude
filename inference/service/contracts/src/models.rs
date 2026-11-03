@@ -39,7 +39,8 @@ pub use schema::{
     ModelFamily, ModelFamilyStatus, ModelFile, ModelFileId, ModelFileRelationship, ModelFileRole,
     ModelFingerprint, ModelId, ModelInstallation, ModelInstallationOwnership, ModelInstance,
     ModelInstanceAllocation, ModelInstanceFailure, ModelInstanceId, ModelInstanceLifecycle,
-    ModelInstanceMemoryDomain, ModelInstancesInvalidation, ModelInstancesSnapshot, ModelLoadDevice,
+    ModelInstanceMemoryDomain, ModelInstanceThroughput, ModelInstancesInvalidation, ModelInstancesSnapshot,
+    ModelLoadDevice,
     ModelLoadPlan, ModelLoadStage, ModelMetadata, ModelPackage, ModelPackageId,
     ModelPackageInstallationOrigin, ModelPackageOperand, ModelPackageProperties,
     ModelPackageSource, ModelParameterization, ModelPerformance, ModelPlacement,
@@ -384,6 +385,27 @@ mod schema {
     #[serde(rename_all = "camelCase", deny_unknown_fields)]
     pub struct ModelInstancesInvalidation {
         pub revision: u64,
+    }
+
+    /// An instance's live engine throughput: accepted output across its
+    /// concurrent requests over the window, once the window has filled.
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    #[serde(tag = "state", rename_all = "kebab-case", deny_unknown_fields)]
+    pub enum ModelInstanceThroughput {
+        #[serde(rename_all = "camelCase")]
+        WarmingUp {
+            instance_id: ModelInstanceId,
+            model_id: ModelId,
+            window_ms: u64,
+        },
+        #[serde(rename_all = "camelCase")]
+        Ready {
+            instance_id: ModelInstanceId,
+            model_id: ModelId,
+            window_ms: u64,
+            tokens_per_second: f64,
+        },
     }
 
     #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]

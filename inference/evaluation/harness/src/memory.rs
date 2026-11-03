@@ -408,6 +408,7 @@ fn configured(
         device,
         kernel_cache,
         release,
+        model_sha256: None,
     }
     .resolve()
     .map_err(|error| error.to_string())

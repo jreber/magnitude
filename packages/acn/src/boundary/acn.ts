@@ -2,6 +2,9 @@ import { ChatService } from "../chat/service";
 import { ChatModelDefaultsStore } from "../chat/model-defaults";
 import { ChatInference } from "../chat/inference";
 import { ServingUsage } from "../serving-usage";
+import { readEngineThroughput } from "../engine-throughput";
+import { IcnClient } from "@magnitudedev/icn";
+import { IcnInstances } from "@magnitudedev/icn/instances";
 import {
   AcnRpcGroup, Configuration,
   Models,
@@ -190,6 +193,12 @@ export const AcnBoundaryLive = AcnRpcGroup.toLayer(Effect.gen(function* () {
         observeRpcDefects("GetRecommendations", recommendations.get(developerCountry)),
 
       GetServingUsage: request => servingUsage.read(request),
+      GetEngineThroughput: () =>
+        Effect.gen(function* () {
+          const client = yield* IcnClient
+          const instances = yield* IcnInstances
+          return yield* readEngineThroughput(client, instances)
+        }),
       ListServableModels: () => observeRpcDefects("ListServableModels", inference.models),
 
       GetModelStorage: () => observeRpcDefects("GetModelStorage", serverSettings.modelStorage),

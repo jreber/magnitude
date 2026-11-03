@@ -32,6 +32,7 @@ fn model() -> ResolvedEngineConfiguration {
         device: DeviceRequest::Backend(BackendName::Cpu),
         kernel_cache: None,
         release: ReleaseRate::of_machine(None),
+        model_sha256: None,
     }
     .resolve()
     .unwrap()

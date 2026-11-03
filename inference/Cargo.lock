@@ -2254,6 +2254,7 @@ dependencies = [
 name = "magnitude-engine"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "flate2",
  "libc",
  "magnitude-artifacts",
@@ -2307,6 +2308,7 @@ dependencies = [
  "seismic",
  "seismic-threads",
  "serde_json",
+ "sha2 0.11.0",
  "tokio",
 ]
 
@@ -2580,6 +2582,8 @@ dependencies = [
 name = "magnitude-scheduler"
 version = "0.1.0"
 dependencies = [
+ "blake3",
+ "libc",
  "magnitude-executor",
  "magnitude-family-contracts",
  "magnitude-generation",

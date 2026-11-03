@@ -9,6 +9,7 @@ use crate::prefix_cache::PrefixRetention;
 use crate::publication::PublicationReceiver;
 use crate::serving::ServingCensus;
 use crate::owner::{AdmissionError, Status};
+use crate::throughput::ThroughputSnapshot;
 use magnitude_executor::platform::DomainReading;
 use magnitude_executor::{RequestId, StoreAllocation};
 use magnitude_family_contracts::PreparedModelInput;
@@ -44,6 +45,8 @@ pub enum WorkerCommand {
     /// The measurement job stored new records: price the experts again
     /// from what is stored.
     Reprice,
+    /// A live accepted-output token snapshot over the owner's ten-second window.
+    Throughput,
 }
 
 /// The answer to a measurement room's claim.
@@ -173,6 +176,7 @@ pub enum WorkerReply {
     },
     /// A measurement room's claim is held; its answer follows.
     MeasurementRoom(RoomGrant),
+    Throughput(ThroughputSnapshot),
     Acknowledged,
 }
 

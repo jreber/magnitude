@@ -128,6 +128,7 @@ pub fn configuration(
         device: options.device,
         kernel_cache: options.cache_dir.clone(),
         release,
+        model_sha256: None,
     }
     .resolve()
     .map_err(|error| error.to_string())?;

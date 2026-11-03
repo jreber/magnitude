@@ -32,6 +32,7 @@
     "getLocalModelsConfiguration",
     "getModelAssessments",
     "getModelInstance",
+    "getModelInstanceThroughput",
     "getModelInstances",
     "getModelProperties",
     "health",

@@ -185,7 +185,8 @@ const makeProcess = (dataDir: string, modelStore: string, localModels: LocalMode
       }),
       host: "127.0.0.1",
       startupTimeout: Duration.seconds(150),
-      gracefulShutdownTimeout: Duration.millis(500),
+      // Long enough for the worker to spill its newest KV checkpoints to disk (RELEASE_EXIT).
+      gracefulShutdownTimeout: Duration.seconds(12),
       forceShutdownTimeout: Duration.millis(500),
       outputLimitBytes: 256 * 1024,
       logFile: Option.some(join(dataDir, "logs", "inference.log")),

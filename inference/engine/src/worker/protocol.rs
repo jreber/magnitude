@@ -135,6 +135,8 @@ pub enum HostMessage {
     /// The measurement job stored new records: price the experts again
     /// from what is stored.
     Reprice,
+    /// A live accepted-output token snapshot over the owner's ten-second window.
+    Throughput,
     Shutdown,
 }
 
@@ -207,6 +209,14 @@ pub struct RequestProgress {
 pub struct ExecutionTimings {
     pub prompt_ns: u64,
     pub predicted_ns: u64,
+}
+
+/// A live accepted-output token snapshot over the owner's ten-second window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ThroughputSnapshot {
+    pub window_ms: u64,
+    pub ready: bool,
+    pub accepted_tokens: u64,
 }
 
 /// A loaded worker's observation of its memory (integration spec §5.4,
@@ -307,6 +317,9 @@ pub enum WorkerMessage {
     /// cannot answer it. A claim the host released is answered by no
     /// message, as is one the model's end released (`Unloaded` follows).
     MeasurementRoom { claim: RoomClaimId, room: Result<RoomAnswer, RequestError> },
+    Throughput {
+        snapshot: Result<ThroughputSnapshot, RequestError>,
+    },
     /// The model stopped serving. Every open request has already received
     /// its terminal outcome; the worker exits after this message.
     Unloaded { cause: UnloadCause },
@@ -416,5 +429,47 @@ mod tests {
         assert_eq!(round_trip(&refusal), refusal);
         let modalities = InputModalities { image: true };
         assert_eq!(round_trip(&modalities), modalities);
+    }
+
+    #[test]
+    fn throughput_snapshot_round_trips_through_the_worker_encoding() {
+        let ready = ThroughputSnapshot {
+            window_ms: 10_000,
+            ready: true,
+            accepted_tokens: 400,
+        };
+        let WorkerMessage::Throughput {
+            snapshot: Ok(decoded),
+        } = round_trip(&WorkerMessage::Throughput {
+            snapshot: Ok(ready),
+        })
+        else {
+            panic!("throughput reply changed shape")
+        };
+        assert_eq!(decoded, ready);
+        let warming = ThroughputSnapshot {
+            window_ms: 10_000,
+            ready: false,
+            accepted_tokens: 50,
+        };
+        let WorkerMessage::Throughput {
+            snapshot: Ok(decoded),
+        } = round_trip(&WorkerMessage::Throughput {
+            snapshot: Ok(warming),
+        })
+        else {
+            panic!("warming-up throughput reply changed shape")
+        };
+        assert_eq!(decoded, warming);
+        let failed = RequestError::WorkerLost { reason: "gone".into() };
+        let WorkerMessage::Throughput {
+            snapshot: Err(decoded),
+        } = round_trip(&WorkerMessage::Throughput {
+            snapshot: Err(failed.clone()),
+        })
+        else {
+            panic!("throughput failure changed shape")
+        };
+        assert_eq!(decoded, failed);
     }
 }

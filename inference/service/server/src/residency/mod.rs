@@ -301,6 +301,8 @@ enum ResidencyCommand<R> {
         result: Result<PreparedResidency<R>, ModelOperationFailure>,
     },
     Notification(ResidencyNotification),
+    /// End the actor after releasing the resident worker gracefully.
+    Shutdown { reply: tokio::sync::oneshot::Sender<()> },
 }
 
 /// Sends payload-free notifications to the actor, whatever its resident type.
@@ -445,6 +447,14 @@ impl<R: Send + 'static> ResidencyClient<R> {
             .send(ResidencyCommand::Stop { instance_id, reply })
             .map_err(|_| owner_stopped())?;
         response.await.map_err(|_| owner_stopped())?
+    }
+
+    /// Release the resident worker (letting it spill its KV checkpoints) and stop the actor.
+    pub async fn shutdown(&self) {
+        let (reply, response) = tokio::sync::oneshot::channel();
+        if self.commands.send(ResidencyCommand::Shutdown { reply }).is_ok() {
+            let _ = response.await;
+        }
     }
 
     pub async fn snapshot(&self) -> Result<ModelInstancesSnapshot, InventoryError> {
@@ -739,6 +749,11 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
             tokio::select! {
                 biased;
                 command = inbox.commands.recv() => match command {
+                    Some(ResidencyCommand::Shutdown { reply }) => {
+                        self.shutdown();
+                        let _ = reply.send(());
+                        return;
+                    }
                     Some(command) => self.handle(command),
                     None => break,
                 },
@@ -765,6 +780,7 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
 
     fn handle(&mut self, command: ResidencyCommand<D::Resident>) {
         match command {
+            ResidencyCommand::Shutdown { .. } => unreachable!("run handles shutdown"),
             ResidencyCommand::Acquire(waiter) => self.acquire(waiter),
             ResidencyCommand::AcquisitionCancelled => {
                 if let ResidencyState::Loading(loading) = &mut self.state {
@@ -1751,10 +1767,18 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
                     worker.end("service_shutdown", "the inference service stopped");
                 }
             }
-            ResidencyState::Ready(ready) => ready
-                .resources
-                .worker
-                .end("service_shutdown", "the inference service stopped"),
+            ResidencyState::Ready(ready) => {
+                // Let the worker spill its newest KV checkpoints to disk before the kill.
+                let worker = &ready.resources.worker;
+                worker.shutdown();
+                let deadline = std::time::Instant::now() + controller::RELEASE_EXIT;
+                while std::time::Instant::now() < deadline
+                    && !matches!(worker.try_wait(), Ok(Some(_)))
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                worker.end("service_shutdown", "the inference service stopped")
+            }
             ResidencyState::Releasing(ReleasingResidency {
                 operation: ReleaseOperation::Draining { resources },
                 ..
