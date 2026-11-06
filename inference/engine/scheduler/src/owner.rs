@@ -3476,6 +3476,7 @@ impl<F: ProgramFamily> Service<F> {
             tracing::warn!(position, %error, "cold-tier restore rejected on resume; dropped");
             return Ok(false);
         }
+        generation.note_cold_restore();
         if let Ok(state) = self.domain.resume_state(id) {
             let _ = self
                 .prefix_cache

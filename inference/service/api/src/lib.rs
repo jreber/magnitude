@@ -2980,6 +2980,7 @@ mod tests {
         );
         for field in [
             "cache_n",
+            "cold_n",
             "prompt_n",
             "prompt_ms",
             "prompt_per_token_ms",

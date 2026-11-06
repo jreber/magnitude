@@ -197,6 +197,7 @@ struct Turn {
     prompt: Vec<TokenId>,
     output: Vec<TokenId>,
     cached: usize,
+    cold: usize,
 }
 
 /// Admit `prompts` together with the prefix cache and run them all to their
@@ -254,6 +255,7 @@ fn run_with_cache_points(
             Turn {
                 prompt,
                 cached: stream.usage().cached_tokens,
+                cold: stream.usage().cold_tokens,
                 output: stream.output,
             }
         })
@@ -1212,6 +1214,7 @@ fn cold_tier_spill_restore() {
         path_a.len(),
         "A' resumes at A's spilled position"
     );
+    assert_eq!(second.cold, path_a.len(), "A' is attributed to the cold tier");
 
     let _ = std::fs::remove_dir_all(&dir);
 }

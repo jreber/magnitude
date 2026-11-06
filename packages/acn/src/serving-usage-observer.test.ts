@@ -2,7 +2,7 @@ import { expect, it } from "vitest"
 import { Effect, Option } from "effect"
 import { makeUsageFetch, makeUsageObservation, makeUsageWebSocket } from "./serving-usage-observer"
 import type { ServingUsage, ServingUsageRecord } from "./serving-usage"
-const timings = { cache_n: 40, prompt_n: 60, predicted_n: 20, predicted_ms: 1000, time_to_first_token_ms: 150, parser_ms: 0, prompt_ms: 20, predicted_per_second: 20, predicted_per_token_ms: 50, prompt_per_second: 3000, prompt_per_token_ms: 1, sampler_ms: 0 }
+const timings = { cache_n: 40, cold_n: 25, prompt_n: 60, predicted_n: 20, predicted_ms: 1000, time_to_first_token_ms: 150, parser_ms: 0, prompt_ms: 20, predicted_per_second: 20, predicted_per_token_ms: 50, prompt_per_second: 3000, prompt_per_token_ms: 1, sampler_ms: 0 }
 const chat = { model: "magnitude-local/model-a", usage: { prompt_tokens: 100, completion_tokens: 20, total_tokens: 120, prompt_tokens_details: { cached_tokens: 40 } }, timings }
 const responsesUsage = { input_tokens: 100, input_tokens_details: { cached_tokens: 40 }, output_tokens: 20, output_tokens_details: { reasoning_tokens: 0 }, total_tokens: 120 }
 const sink = () => {
@@ -14,7 +14,7 @@ it("uses terminal timings without a separate usage block and records once", () =
   const observation = makeUsageObservation({ streaming: true, startedAt: 0, now: () => 1500 })
   observation.push({ model: "model-a", choices: [{ delta: { content: "hello" }, finish_reason: null }], timings })
   observation.push({ model: "model-a", choices: [{ delta: {}, finish_reason: "stop" }], timings })
-  expect(Option.getOrThrow(observation.finish())).toMatchObject({ input: 100, cached: 40, output: 20, generationMs: 1000, firstTokenMs: 150, complete: true })
+  expect(Option.getOrThrow(observation.finish())).toMatchObject({ input: 100, cached: 40, cold: 25, output: 20, generationMs: 1000, firstTokenMs: 150, complete: true })
   expect(observation.finish()).toEqual(Option.none())
 })
 it("does not mistake intermediate timing for terminal evidence", () => {

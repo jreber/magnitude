@@ -22,6 +22,7 @@ export const makeUsageObservation = (options: {
   let model = ServingModelId.make("unknown")
   let input: number | null = null
   let cached: number | null = null
+  let cold: number | null = null
   let output: number | null = null
   let generationMs: number | null = null
   let firstTokenMs: number | null = null
@@ -67,7 +68,7 @@ export const makeUsageObservation = (options: {
     const timings = Schema.decodeUnknownOption(Native.Timings)(frame.timings)
     if (Option.isSome(timings) && (chatTerminal || Option.isSome(chat) || !options.streaming)) {
       const t = timings.value
-      input = t.prompt_n + t.cache_n; cached = t.cache_n; output = t.predicted_n
+      input = t.prompt_n + t.cache_n; cached = t.cache_n; cold = t.cold_n; output = t.predicted_n
       generationMs = Number.isFinite(t.predicted_ms) && t.predicted_ms > 0 ? t.predicted_ms : null
       firstTokenMs = Number.isFinite(t.time_to_first_token_ms) && t.time_to_first_token_ms >= 0 ? t.time_to_first_token_ms : null
       complete = true
@@ -85,7 +86,7 @@ export const makeUsageObservation = (options: {
         const elapsed = (terminalAt ?? now()) - firstOutputAt
         if (complete && output !== null && elapsed > 0) generationMs ??= elapsed
       }
-      return Option.some({ id: ServingUsageRecord.fields.id.make(id), model, completedAt: Date.now(), input, cached, output, generationMs, firstTokenMs, complete })
+      return Option.some({ id: ServingUsageRecord.fields.id.make(id), model, completedAt: Date.now(), input, cached, cold, output, generationMs, firstTokenMs, complete })
     },
   }
 }

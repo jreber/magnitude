@@ -531,6 +531,8 @@ mod schema {
     #[serde(deny_unknown_fields)]
     pub struct Timings {
         pub cache_n: u64,
+        /// The part of `cache_n` restored from the SSD cold tier.
+        pub cold_n: u64,
         pub prompt_n: u64,
         pub prompt_ms: f64,
         pub time_to_first_token_ms: f64,
@@ -649,6 +651,7 @@ pub(crate) fn timing_values(snapshot: &TimingSnapshot) -> Timings {
         throughput(snapshot.generated_tokens.saturating_sub(1), timings.decode_ms);
     Timings {
         cache_n: snapshot.cached_prompt_tokens,
+        cold_n: snapshot.cold_prompt_tokens,
         prompt_n,
         prompt_ms: timings.prompt_ms,
         time_to_first_token_ms: timings.time_to_first_token_ms,
@@ -1872,6 +1875,7 @@ mod tests {
                         usage: TokenUsage {
                             input_tokens: 3,
                             cached_input_tokens: 0,
+                            cold_input_tokens: 0,
                             output_tokens: 1,
                             reasoning_output_tokens: 0,
                         },

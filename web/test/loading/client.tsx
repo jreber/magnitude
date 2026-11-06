@@ -79,7 +79,7 @@ export function setPhase(value:string) {
  registry.set(sources.networkAccess,{result:settingsResult(remoteViewer
   ?{enabled:true,bind:Option.none(),requireApiKey:true,apiKey:Option.some("mag-fixture-key-0000000000000000"),interfaces:[{name:"en0",address:"192.168.1.20",kind:"lan"}],port:10100,reachableAddresses:["192.168.1.20"],pending:false,warning:Option.none()}
   :{enabled:false,bind:Option.none(),requireApiKey:true,apiKey:Option.none(),interfaces:[],port:10100,reachableAddresses:[],pending:false,warning:Option.none()})})
- registry.set(usage,{result:result({_tag:'Available',dailyActivity:Array.from({length:368},(_,index)=>({date:new Date(Date.UTC(2025,8,14+index)).toISOString().slice(0,10),totalTokens:index%5===0?0:Math.round((Math.sin(index*7)+1)*50000)})),requests:2,inputTokens:100,cachedInputTokens:40,outputTokens:20,totalTokens:120,cachedInputRequests:2,tokensPerSecond:80,timeToFirstTokenMs:125,incompleteRequests:0,recordingFailures:0,speedSamples:2,latencySamples:2,models:[],since:null})})
+ registry.set(usage,{result:result({_tag:'Available',dailyActivity:Array.from({length:368},(_,index)=>({date:new Date(Date.UTC(2025,8,14+index)).toISOString().slice(0,10),totalTokens:index%5===0?0:Math.round((Math.sin(index*7)+1)*50000)})),requests:2,inputTokens:100,cachedInputTokens:40,outputTokens:20,totalTokens:120,cachedInputRequests:2,coldSampleRequests:2,coldRestoredRequests:1,tokensPerSecond:80,timeToFirstTokenMs:125,incompleteRequests:0,recordingFailures:0,speedSamples:2,latencySamples:2,models:[],since:null})})
  for (const listener of listeners) listener()
 }
 setPhase(phase)

@@ -217,6 +217,7 @@ export const text = (content: string) => chunk({ choices: [{ index: 0, delta: { 
 export const thought = (reasoning: string) => chunk({ choices: [{ index: 0, delta: { reasoning_content: reasoning } }] })
 export const timings = {
   cache_n: 12,
+  cold_n: 0,
   draft_n: 8,
   draft_n_accepted: 6,
   parser_ms: 1,

@@ -70,6 +70,8 @@ interface Observed {
 interface Report {
   readonly usage: ResponseUsage
   readonly timings: ResponseTimings
+  /** Prompt tokens restored from the SSD cold tier. */
+  readonly coldTokens: number
 }
 
 const phaseOf = (progress: Native.ChatCompletionProgress): ResponsePhase => {
@@ -123,6 +125,7 @@ const reportOf = (timings: Native.Timings): Report => ({
     parserMs: timings.parser_ms,
     timeToFirstTokenMs: timings.time_to_first_token_ms,
   },
+  coldTokens: timings.cold_n,
 })
 
 /** The report as a response's end and its metrics hold it: both or neither. */
@@ -307,6 +310,7 @@ export const Generation = ChatEngine.Worker.define({
             completedAt: DateTime.toEpochMillis(ended),
             input: Option.getOrNull(metrics.inputTokens),
             cached: Option.getOrNull(metrics.cachedTokens),
+            cold: Option.getOrNull(Option.map(observed.report, (report) => report.coldTokens)),
             output: Option.getOrNull(metrics.outputTokens),
             generationMs: Option.getOrNull(metrics.generationMs),
             firstTokenMs: Option.getOrNull(Option.map(observed.firstOutput, (first) => elapsed(begun.mono, first))),
