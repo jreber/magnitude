@@ -88,6 +88,7 @@ fn completion(script: &Script) -> Completion {
         usage: TokenUsage {
             input_tokens: 11,
             cached_input_tokens: script.cached_input_tokens,
+            cold_input_tokens: 0,
             output_tokens: 7,
             reasoning_output_tokens: 1,
         },
@@ -409,6 +410,7 @@ fn stream_json(body: &str) -> Vec<Value> {
 fn snapshot(generated_tokens: u64, decode_ms: f64) -> TimingSnapshot {
     TimingSnapshot {
         cached_prompt_tokens: 0,
+        cold_prompt_tokens: 0,
         prompt_tokens: 11,
         generated_tokens,
         timings: GenerationTimings {
@@ -1720,6 +1722,7 @@ async fn streams_cumulative_timings_on_group_terminal_deltas() {
         fields,
         BTreeSet::from([
             "cache_n",
+            "cold_n",
             "parser_ms",
             "predicted_ms",
             "predicted_n",

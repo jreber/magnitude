@@ -74,6 +74,8 @@ pub enum Termination {
 pub struct TokenUsage {
     pub input_tokens: u64,
     pub cached_input_tokens: u64,
+    /// The part of `cached_input_tokens` restored from the SSD cold tier.
+    pub cold_input_tokens: u64,
     pub output_tokens: u64,
     pub reasoning_output_tokens: u64,
 }
@@ -97,6 +99,7 @@ pub struct GenerationTimings {
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct TimingSnapshot {
     pub cached_prompt_tokens: u64,
+    pub cold_prompt_tokens: u64,
     pub prompt_tokens: u64,
     pub generated_tokens: u64,
     pub timings: GenerationTimings,
@@ -113,6 +116,7 @@ impl Completion {
     pub fn snapshot(&self) -> TimingSnapshot {
         TimingSnapshot {
             cached_prompt_tokens: self.usage.cached_input_tokens,
+            cold_prompt_tokens: self.usage.cold_input_tokens,
             prompt_tokens: self.usage.input_tokens,
             generated_tokens: self.usage.output_tokens,
             timings: self.timings,

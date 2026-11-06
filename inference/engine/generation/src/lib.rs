@@ -85,6 +85,8 @@ pub struct DetailedUsage {
     pub prompt_tokens: usize,
     pub completion_tokens: usize,
     pub cached_tokens: usize,
+    /// The part of `cached_tokens` restored from the SSD cold tier.
+    pub cold_tokens: usize,
     pub draft_n: usize,
     pub draft_n_accepted: usize,
 }
@@ -290,6 +292,7 @@ pub struct Generation {
     method_factory: Arc<dyn Method>,
     method: Box<dyn MethodState>,
     cached_tokens: usize,
+    cold_tokens: usize,
     draft_stats: DraftStats,
 }
 
@@ -373,6 +376,7 @@ impl Generation {
             method_factory,
             method,
             cached_tokens: 0,
+            cold_tokens: 0,
             draft_stats: DraftStats::default(),
         })
     }
@@ -414,6 +418,7 @@ impl Generation {
             prompt_tokens: self.prompt.len(),
             completion_tokens: self.generated.len(),
             cached_tokens: self.cached_tokens,
+            cold_tokens: self.cold_tokens,
             draft_n: self.draft_stats.proposed,
             draft_n_accepted: self.draft_stats.accepted,
         }
@@ -1195,6 +1200,12 @@ impl Generation {
     /// first token, the last accepted row after that).
     pub fn resume_bound(&self) -> usize {
         self.prompt.len().max(self.accepted_position)
+    }
+
+    /// Records that the prefix this generation resumed from came off the SSD
+    /// cold tier rather than memory.
+    pub fn note_cold_restore(&mut self) {
+        self.cold_tokens = self.resident_position;
     }
 
     /// Become resident on numerical state the executor has just installed:

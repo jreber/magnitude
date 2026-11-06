@@ -572,6 +572,7 @@ mod tests {
                 prompt_tokens: 1,
                 completion_tokens: 2,
                 cached_tokens: 0,
+                cold_tokens: 0,
                 draft_n: 0,
                 draft_n_accepted: 0,
             },

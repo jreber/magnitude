@@ -12318,6 +12318,7 @@
         "type": "object",
         "required": [
           "cache_n",
+          "cold_n",
           "prompt_n",
           "prompt_ms",
           "time_to_first_token_ms",
@@ -12334,6 +12335,12 @@
           "cache_n": {
             "type": "integer",
             "format": "int64",
+            "minimum": 0
+          },
+          "cold_n": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The part of `cache_n` restored from the SSD cold tier.",
             "minimum": 0
           },
           "prompt_n": {
