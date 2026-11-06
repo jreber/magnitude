@@ -7,7 +7,7 @@ import { Result, useAtomValue } from "@effect-atom/atom-react"
 import { Option } from "effect"
 import { ServingModelId, type ServingUsageSnapshot } from "@magnitudedev/sdk"
 import { useAgentClient, useLocalModels, formatLocalModelDisplayName } from "@magnitudedev/client-common"
-import { GaugeIcon, TimerIcon, ArrowDownIcon, ArrowUpIcon, StackIcon, InfoIcon, ArrowsLeftRightIcon } from "@phosphor-icons/react"
+import { GaugeIcon, TimerIcon, ArrowDownIcon, ArrowUpIcon, StackIcon, InfoIcon, ArrowsLeftRightIcon, HardDrivesIcon } from "@phosphor-icons/react"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "./ui/select"
 
 import { ActionTooltip } from "./ui/tooltip"
@@ -83,6 +83,7 @@ export function UsageFigures({ usage }: { usage: Extract<ServingUsageSnapshot, {
       <div className="min-w-0"><p className="flex items-center gap-2 text-sm text-slate-500"><ArrowsLeftRightIcon className="size-4" />Requests</p><p className="mt-4 text-2xl tabular-nums" data-usage="requests">{usage ? number(usage.requests) : <SkeletonLine className="h-8 text-2xl" width="100px" />}</p></div>
       <div className="min-w-0"><p className="flex items-center gap-2 text-sm text-slate-500"><GaugeIcon className="size-4" />Per-request speed</p><p className="mt-4 text-2xl tabular-nums" data-usage="speed">{!usage ? <SkeletonLine className="h-8 text-2xl" width="160px" /> : usage.tokensPerSecond === null ? "—" : `${decimal(usage.tokensPerSecond)} tokens/s`}</p></div>
       <div className="min-w-0"><p className="flex items-center gap-2 text-sm text-slate-500"><TimerIcon className="size-4" />Time to first token</p><p className="mt-4 text-2xl tabular-nums" data-usage="ttft">{!usage ? <SkeletonLine className="h-8 text-2xl" width="120px" /> : usage.timeToFirstTokenMs === null ? "—" : usage.timeToFirstTokenMs < 1000 ? `${decimal(usage.timeToFirstTokenMs)} ms` : `${decimal(usage.timeToFirstTokenMs / 1000)} s`}</p></div>
+      <div className="min-w-0"><p className="flex items-center gap-2 text-sm text-slate-500"><HardDrivesIcon className="size-4" />Requests resumed from SSD</p><p className="mt-4 text-2xl tabular-nums" data-usage="cold">{!usage ? <SkeletonLine className="h-8 text-2xl" width="100px" /> : usage.coldSampleRequests === 0 ? "—" : `${decimal(usage.coldRestoredRequests / usage.coldSampleRequests * 100)}%`}</p>{usage && usage.coldSampleRequests > 0 && <p className="mt-1 text-xs text-slate-500">{number(usage.coldRestoredRequests)} of {number(usage.coldSampleRequests)} requests loaded their cached prompt prefix from the SSD cold tier instead of RAM or recomputing it</p>}</div>
     </div>
   </>
 }

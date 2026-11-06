@@ -381,6 +381,7 @@ async fn finish(
             usage: TokenUsage {
                 input_tokens: usage.prompt_tokens as u64,
                 cached_input_tokens: usage.cached_tokens as u64,
+                cold_input_tokens: usage.cold_tokens as u64,
                 output_tokens: usage.completion_tokens as u64,
                 reasoning_output_tokens,
             },
@@ -441,6 +442,7 @@ impl Clock {
         let first = self.first_output.unwrap_or(now);
         TimingSnapshot {
             cached_prompt_tokens: 0,
+            cold_prompt_tokens: 0,
             prompt_tokens: self.prompt_tokens,
             generated_tokens: self.generated,
             timings: GenerationTimings {

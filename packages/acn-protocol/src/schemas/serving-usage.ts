@@ -22,6 +22,8 @@ export const ServingUsageSnapshot = Schema.Union(
     outputTokens: Schema.NonNegativeInt,
     totalTokens: Schema.NonNegativeInt,
     cachedInputRequests: Schema.NonNegativeInt,
+    coldSampleRequests: Schema.NonNegativeInt,
+    coldRestoredRequests: Schema.NonNegativeInt,
     tokensPerSecond: Schema.NullOr(Schema.Number),
     timeToFirstTokenMs: Schema.NullOr(Schema.Number),
     speedSamples: Schema.NonNegativeInt,

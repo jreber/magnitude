@@ -211,6 +211,7 @@ describe("ICN local provider", () => {
         },
         timings: {
           cache_n: 0,
+          cold_n: 0,
           prompt_n: 1,
           prompt_ms: 3,
           time_to_first_token_ms: 6,

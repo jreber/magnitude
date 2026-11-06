@@ -2438,6 +2438,7 @@ impl<F: ProgramFamily> Service<F> {
             tracing::warn!(position, %error, "cold-tier restore rejected on resume; fresh open");
             return None;
         }
+        generation.note_cold_restore();
         // Re-insert the restored prefix into the RAM cache at its persisted
         // point; a miss here only means the prefix stays on disk.
         if let Ok(state) = self.domain.resume_state(id) {

@@ -1,7 +1,7 @@
 {
   "generator": "@magnitudedev/openapi-effect",
   "generatorVersion": "0.0.1",
-  "protocolHash": "b94c4ba7f40812e7cb09c7b00a250dea2b59fe1c71e615e440eeaaf4dbfd08ac",
+  "protocolHash": "6040968f5f317b1bcd60bafe69cd4404586cf6be07c2b523413724a9816c6e9c",
   "configHash": "35eaa09ad05c284228c67845b4e6f4db4aa545ca4a74ee0d812d04c6af53ee75",
   "files": [
     "api.ts",

@@ -12,7 +12,7 @@ afterEach(() => { vi.useRealTimers(); roots.splice(0).forEach(root => rmSync(roo
 const root = () => { const value = mkdtempSync(join(tmpdir(), "magnitude-usage-test-")); roots.push(value); return value }
 const layer = (root: string) => ServingUsageLive.pipe(Layer.provide(Layer.mergeAll(BunFileSystem.layer, BunPath.layer, Layer.succeed(GlobalStorage, makeGlobalStorage({ root })))))
 const query: ServingUsageRequest = { period: "AllTime", timeZone: "America/Los_Angeles", model: Option.none() }
-const record = (id: string, overrides: Partial<ServingUsageRecord> = {}): ServingUsageRecord => ({ id: ServingUsageRecord.fields.id.make(id), model: ServingModelId.make("model-a"), completedAt: Date.now(), input: 100, cached: 40, output: 20, generationMs: 1000, firstTokenMs: 200, complete: true, ...overrides })
+const record = (id: string, overrides: Partial<ServingUsageRecord> = {}): ServingUsageRecord => ({ id: ServingUsageRecord.fields.id.make(id), model: ServingModelId.make("model-a"), completedAt: Date.now(), input: 100, cached: 40, cold: null, output: 20, generationMs: 1000, firstTokenMs: 200, complete: true, ...overrides })
 it("persists once across restarts and filters models without adding cached input twice", async () => {
   const directory = root()
   await Effect.runPromise(Effect.gen(function* () {
@@ -98,4 +98,17 @@ it("handles fractional-offset midnight and the repeated hour at fall DST", async
   vi.restoreAllMocks()
   expect(values[0]).toMatchObject({ dailyActivity: expect.arrayContaining([{ date: "2026-11-01", totalTokens: 480 }]) })
   expect(values[1]).toMatchObject({ dailyActivity: expect.arrayContaining([{ date: "2026-11-01", totalTokens: 360 }, { date: "2026-11-02", totalTokens: 120 }]) })
+})
+it("reports cold-tier hit rate under the model filter, ignoring unknown rows", async () => {
+  const b = ServingModelId.make("model-b")
+  const values = await Effect.runPromise(Effect.gen(function* () {
+    const store = yield* ServingUsage
+    yield* store.record(record("hit", { cold: 50 }))
+    yield* store.record(record("miss", { cold: 0 }))
+    yield* store.record(record("unknown"))
+    yield* store.record(record("other", { model: b, cold: 9 }))
+    return [yield* store.read(query), yield* store.read({ ...query, model: Option.some(ServingModelId.make("model-a")) })]
+  }).pipe(Effect.provide(layer(root()))))
+  expect(values[0]).toMatchObject({ coldSampleRequests: 3, coldRestoredRequests: 2 })
+  expect(values[1]).toMatchObject({ coldSampleRequests: 2, coldRestoredRequests: 1 })
 })

@@ -11,6 +11,8 @@ export const ServingUsageRecord = Schema.Struct({
   completedAt: Schema.Number,
   input: Schema.NullOr(Count),
   cached: Schema.NullOr(Count),
+  /** Prompt tokens restored from the SSD cold tier; null when the path cannot say. */
+  cold: Schema.NullOr(Count),
   output: Schema.NullOr(Count),
   generationMs: Schema.NullOr(Schema.Number.pipe(Schema.positive())),
   firstTokenMs: Schema.NullOr(Schema.Number.pipe(Schema.nonNegative())),
@@ -50,6 +52,7 @@ export const ServingUsageLive = Layer.scoped(ServingUsage, Effect.gen(function* 
           CREATE INDEX IF NOT EXISTS usage_date ON usage(completed_at);
           CREATE INDEX IF NOT EXISTS usage_model_date ON usage(model, completed_at);
           CREATE TABLE IF NOT EXISTS metadata (id INTEGER PRIMARY KEY CHECK(id = 1), since REAL NOT NULL);`)
+        if (!db.query("PRAGMA table_info(usage)").all().some((c: any) => c.name === "cold")) db.exec("ALTER TABLE usage ADD COLUMN cold INTEGER")
         db.query("INSERT OR IGNORE INTO metadata VALUES (1, ?)").run(Date.now())
         database = db
         return db
@@ -59,9 +62,9 @@ export const ServingUsageLive = Layer.scoped(ServingUsage, Effect.gen(function* 
   const record = (value: ServingUsageRecord) => lock.withPermits(1)(Effect.gen(function* () {
     const db = yield* open
     const record = yield* Schema.decodeUnknown(ServingUsageRecord)(value).pipe(Effect.mapError(() => new ServingUsageFailed({ message: "Invalid usage evidence." })))
-    yield* operation(() => db.query("INSERT OR IGNORE INTO usage VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)").run(
+    yield* operation(() => db.query("INSERT OR IGNORE INTO usage (id, model, completed_at, input, cached, output, generation_ms, first_token_ms, complete, cold) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").run(
       record.id, record.model, record.completedAt, record.input, record.cached, record.output,
-      record.generationMs, record.firstTokenMs, Number(record.complete),
+      record.generationMs, record.firstTokenMs, Number(record.complete), record.cold,
     ))
   })).pipe(Effect.catchAll(error => Effect.sync(() => { recordingFailures++ }).pipe(Effect.zipRight(Effect.logError(error.message)))))
   const read = (request: ServingUsageRequest) => lock.withPermits(1)(Effect.gen(function* () {
@@ -77,6 +80,7 @@ export const ServingUsageLive = Layer.scoped(ServingUsage, Effect.gen(function* 
         COALESCE(SUM(output), 0) AS outputTokens,
         COALESCE(SUM(COALESCE(input, 0) + COALESCE(output, 0)), 0) AS totalTokens,
         COUNT(cached) AS cachedInputRequests,
+        COUNT(cold) AS coldSampleRequests, COALESCE(SUM(cold > 0), 0) AS coldRestoredRequests,
         SUM(CASE WHEN generation_ms > 0 THEN output END) * 1000.0 / SUM(generation_ms) AS tokensPerSecond,
         AVG(first_token_ms) AS timeToFirstTokenMs, COUNT(generation_ms) AS speedSamples,
         COUNT(first_token_ms) AS latencySamples
