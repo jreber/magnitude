@@ -9,6 +9,12 @@ const GetServingUsage = query(Rpcs.getServingUsage, client => client.models.getS
   staleTime: 0, refresh: Schedule.spaced("5 seconds"),
 });
 
+const ListServableModels = query(
+  Rpcs.listServableModels,
+  (client) => client.models.listServableModels,
+  { staleTime: "10 seconds" }
+);
+
 const GetEngineThroughput = query(Rpcs.getEngineThroughput, client => client.models.getEngineThroughput, {
   staleTime: 0, refresh: Schedule.spaced("2 seconds"),
 });
@@ -243,6 +249,7 @@ const SetModelLocationEnabled = mutation(
 
 export const Models = Group.make({
   GetServingUsage,
+  ListServableModels,
   GetEngineThroughput,
   GetCatalog,
   GetSlots,
