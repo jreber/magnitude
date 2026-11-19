@@ -10,11 +10,12 @@ use std::sync::{Arc, Mutex, Weak};
 use futures_util::future::BoxFuture;
 
 use magnitude_engine::assessment::ModelPackagePaths;
-use magnitude_engine::composition::EngineConfiguration;
+use magnitude_engine::composition::{EngineConfiguration, scoring_configuration};
 use magnitude_engine::error::ResolveError;
 use magnitude_engine::host::HostArtifacts;
 use magnitude_engine::options::{
-    ExecutionManifest, ModelMethod, ModelPolicy, PackageOptions, ProjectorSelection, standard_service_limits,
+    ExecutionManifest, ModelMethod, ModelPolicy, PackageOptions, ProjectorSelection, Serve,
+    standard_service_limits,
 };
 use magnitude_executor::ExecutionPath;
 use magnitude_executor::platform::ReleaseRate;
@@ -114,6 +115,7 @@ impl ResolvedConfigurations {
     pub fn resolve<'a>(
         &'a self,
         configuration: &'a ModelServingConfiguration,
+        serve: Serve,
     ) -> BoxFuture<'a, Result<HeldConfiguration, InventoryError>> {
         Box::pin(async move {
             let (input, package_ids) = (installed_bundle(&configuration.bundle), configuration.bundle.package_ids());
@@ -123,6 +125,7 @@ impl ResolvedConfigurations {
             let model_sha256 = Some(material.target_model.model.content_id.0.clone());
             let key = ResolutionKey {
                 bundle: servable_model_bundle_key_for_bundle(&configuration.bundle),
+                serve,
                 context_tokens,
                 files: paths
                     .target_shards
@@ -134,7 +137,7 @@ impl ResolvedConfigurations {
             };
             let configuration = self
                 .cache
-                .resolve(key, || self.resolve_material(paths, package_ids, context_tokens, model_sha256))
+                .resolve(key, || self.resolve_material(paths, package_ids, context_tokens, model_sha256, serve))
                 .await?;
             Ok(HeldConfiguration { configuration, _material: material })
         })
@@ -146,6 +149,7 @@ impl ResolvedConfigurations {
         package_ids: Vec<ModelPackageId>,
         context_tokens: u32,
         model_sha256: Option<String>,
+        serve: Serve,
     ) -> Result<Arc<ResolvedConfiguration>, InventoryError> {
         let configuration = engine_configuration(
             paths,
@@ -155,6 +159,7 @@ impl ResolvedConfigurations {
             self.bounds,
             context_tokens,
             model_sha256,
+            serve,
         );
         let resolved = magnitude_service_utils::blocking::run(move || configuration.resolve())
             .await
@@ -170,7 +175,9 @@ impl ResolvedConfigurations {
 /// The engine configuration serving a bundle's material: its components, its declared method
 /// (a separate draft's method is the bundle's, never `Auto`), the standard service limits, on
 /// the serving device, at `served` tokens of context, the profile's (the tier assessment serves
-/// it at; 0, a package not read yet, the artifact's), unless the bounds fix every load's.
+/// it at; 0, a package not read yet, the artifact's), unless the bounds fix every load's. A scoring
+/// load is the engine's derivation of that serving configuration: the one place a purpose
+/// changes what a worker loads.
 fn engine_configuration(
     package: ModelPackagePaths,
     kernel_directory: PathBuf,
@@ -179,8 +186,9 @@ fn engine_configuration(
     bounds: LoadBounds,
     served: u32,
     model_sha256: Option<String>,
+    serve: Serve,
 ) -> EngineConfiguration {
-    EngineConfiguration {
+    let serving = EngineConfiguration {
         package: PackageOptions {
             target_shards: package.target_shards,
             projector: match package.projector {
@@ -203,6 +211,11 @@ fn engine_configuration(
         kernel_cache: Some(kernel_directory),
         release,
         model_sha256,
+        serve: Serve::Generation,
+    };
+    match serve {
+        Serve::Generation => serving,
+        Serve::Scoring => scoring_configuration(serving),
     }
 }
 
@@ -246,10 +259,12 @@ pub fn resolve_failure(error: ResolveError) -> InventoryError {
     }
 }
 
-/// A resolution's identity: the bundle, and the files its material is read from.
+/// A resolution's identity: the bundle, what it is loaded for, and the files its material is
+/// read from.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct ResolutionKey {
     bundle: ServableModelBundleKey,
+    serve: Serve,
     context_tokens: u32,
     files: Vec<PathBuf>,
 }
@@ -361,6 +376,38 @@ mod tests {
         }
     }
 
+    /// A scoring purpose derives the scoring load from the serving configuration; generation is
+    /// the serving configuration itself.
+    #[test]
+    fn a_scoring_purpose_resolves_to_the_scoring_configuration() {
+        let paths = || ModelPackagePaths {
+            target_shards: vec![PathBuf::from("/test/target.gguf")],
+            projector: None,
+            draft: Some(PathBuf::from("/test/draft.gguf")),
+            method: ModelMethod::DSpark,
+        };
+        let configuration = |serve| {
+            engine_configuration(
+                paths(),
+                std::env::temp_dir(),
+                ReleaseRate::of_machine(None),
+                ServingDevice::of(seismic::ExecutorSelector::HostCpu),
+                LoadBounds::default(),
+                0,
+                None,
+                serve,
+            )
+        };
+        let generation = configuration(Serve::Generation);
+        assert_eq!(generation.serve, Serve::Generation);
+        assert!(generation.package.draft.is_some());
+        let scoring = configuration(Serve::Scoring);
+        assert!(scoring.package.projector == ProjectorSelection::Disabled);
+        assert_eq!(scoring.serve, Serve::Scoring);
+        assert!(scoring.package.draft.is_none());
+        assert_eq!(scoring.model.method, ModelMethod::Plain);
+    }
+
     /// A speculative bundle serves its declared separate draft; a declared
     /// method the draft does not implement refuses the bundle instead of
     /// serving its target plain.
@@ -377,6 +424,7 @@ mod tests {
             LoadBounds::default(),
             0,
             None,
+            Serve::Generation,
         )
         .resolve()
         .unwrap();
@@ -401,6 +449,7 @@ mod tests {
                 LoadBounds::default(),
                 0,
                 None,
+                Serve::Generation,
             )
             .resolve() else {
                 panic!("{method:?} resolved over a DSpark draft")
@@ -431,6 +480,7 @@ mod tests {
             LoadBounds::default(),
             0,
             None,
+            Serve::Generation,
         );
         assert_eq!(configuration.device, serving.request());
     }
@@ -451,6 +501,34 @@ mod tests {
             })
             .await
             .unwrap()
+    }
+
+    /// A resolution is of a bundle for a purpose: two keys that differ only in `serve` never serve
+    /// one for the other, whether the first is held or merely recent.
+    #[tokio::test]
+    async fn resolutions_that_differ_only_in_purpose_are_never_shared() {
+        let key = |serve| ResolutionKey {
+            bundle: ServableModelBundleKey("bundle".to_owned()),
+            serve,
+            context_tokens: 0,
+            files: vec![PathBuf::from("/test/model.gguf")],
+        };
+        let cache = ResolutionCache::<String, ResolutionKey>::new(RETAINED_CONFIGURATIONS);
+        let resolve = |serve, value: &'static str| {
+            let cache = &cache;
+            async move {
+                cache
+                    .resolve(key(serve), || async move { Ok::<_, ()>(Arc::new(value.to_owned())) })
+                    .await
+                    .unwrap()
+            }
+        };
+        let generation = resolve(Serve::Generation, "generation").await;
+        let scoring = resolve(Serve::Scoring, "scoring").await;
+        assert_eq!(*generation, "generation");
+        assert_eq!(*scoring, "scoring");
+        assert_eq!(*resolve(Serve::Generation, "other").await, "generation", "held, found again");
+        assert_eq!(*resolve(Serve::Scoring, "other").await, "scoring", "held, found again");
     }
 
     /// However many models are previewed, loaded or counted against, only the most recent

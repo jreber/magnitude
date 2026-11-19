@@ -2540,6 +2540,7 @@ mod tests {
             crate::options::standard_service_limits(),
             ExecutionPath::Native,
             platform::DeviceRequest::Backend(BackendName::Cpu),
+            crate::options::Serve::Generation,
             Some(cache.path().to_owned()),
             Some(cache.path().to_owned()),
             platform::ReleaseRate::of_machine(None),

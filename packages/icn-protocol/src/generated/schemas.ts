@@ -926,12 +926,55 @@ export const ColdExperts = S.Union(
 export type ColdExperts = S.Schema.Type<typeof ColdExperts>
 export type ColdExpertsEncoded = S.Schema.Encoded<typeof ColdExperts>
 
+export const CompletionChoice = S.Struct({
+  finish_reason: S.String,
+  index: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  logprobs: S.optionalWith(JsonValue, { exact: true, as: "Option" }),
+  prompt_logprobs: S.Array(
+    S.Union(
+      S.extend(
+        S.Struct({}),
+        S.Record({
+          key: S.String,
+          value: S.suspend((): S.Schema<PromptLogprob, PromptLogprobEncoded> => PromptLogprob),
+        }),
+      ),
+      S.Null,
+    ),
+  ),
+  text: S.String,
+})
+export type CompletionChoice = S.Schema.Type<typeof CompletionChoice>
+export type CompletionChoiceEncoded = S.Schema.Encoded<typeof CompletionChoice>
+
 export const CompletionFunctionCall = S.Struct({
   arguments: S.String,
   name: S.String,
 })
 export type CompletionFunctionCall = S.Schema.Type<typeof CompletionFunctionCall>
 export type CompletionFunctionCallEncoded = S.Schema.Encoded<typeof CompletionFunctionCall>
+
+export const CompletionRequest = S.Struct({
+  echo: S.optionalWith(S.Boolean, { exact: true, as: "Option" }),
+  max_tokens: S.optionalWith(S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)), { exact: true, as: "Option" }),
+  model: S.String,
+  prompt: S.String,
+  prompt_logprobs: S.optionalWith(S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)), { exact: true, as: "Option" }),
+  temperature: S.optionalWith(S.Number, { exact: true, as: "Option" }),
+})
+export type CompletionRequest = S.Schema.Type<typeof CompletionRequest>
+export type CompletionRequestEncoded = S.Schema.Encoded<typeof CompletionRequest>
+
+export const CompletionResponse = S.Struct({
+  choices: S.Array(S.suspend((): S.Schema<CompletionChoice, CompletionChoiceEncoded> => CompletionChoice)),
+  created: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  id: S.String,
+  model: S.String,
+  object: S.String,
+  usage: S.suspend((): S.Schema<CompletionUsage, CompletionUsageEncoded> => CompletionUsage),
+})
+export type CompletionResponse = S.Schema.Type<typeof CompletionResponse>
+export type CompletionResponseEncoded = S.Schema.Encoded<typeof CompletionResponse>
 
 export const CompletionToolCall = S.Struct({
   function: S.suspend((): S.Schema<CompletionFunctionCall, CompletionFunctionCallEncoded> => CompletionFunctionCall),
@@ -940,6 +983,14 @@ export const CompletionToolCall = S.Struct({
 })
 export type CompletionToolCall = S.Schema.Type<typeof CompletionToolCall>
 export type CompletionToolCallEncoded = S.Schema.Encoded<typeof CompletionToolCall>
+
+export const CompletionUsage = S.Struct({
+  completion_tokens: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  prompt_tokens: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  total_tokens: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+})
+export type CompletionUsage = S.Schema.Type<typeof CompletionUsage>
+export type CompletionUsageEncoded = S.Schema.Encoded<typeof CompletionUsage>
 
 export const Content = S.Union(
   S.String,
@@ -3195,6 +3246,14 @@ export const PromptGroupPlaces = S.Struct({
 export type PromptGroupPlaces = S.Schema.Type<typeof PromptGroupPlaces>
 export type PromptGroupPlacesEncoded = S.Schema.Encoded<typeof PromptGroupPlaces>
 
+export const PromptLogprob = S.Struct({
+  decoded_token: S.String,
+  logprob: S.Number,
+  rank: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+})
+export type PromptLogprob = S.Schema.Type<typeof PromptLogprob>
+export type PromptLogprobEncoded = S.Schema.Encoded<typeof PromptLogprob>
+
 export const PromptTokensDetails = S.Struct({
   cached_tokens: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
 })
@@ -4022,6 +4081,31 @@ export const Timings = S.Struct({
 })
 export type Timings = S.Schema.Type<typeof Timings>
 export type TimingsEncoded = S.Schema.Encoded<typeof Timings>
+
+export const TokenizeRequest = S.Struct({
+  add_generation_prompt: S.optionalWith(S.Boolean, { exact: true, as: "Option" }),
+  add_special_tokens: S.optionalWith(S.Boolean, { exact: true, as: "Option" }),
+  chat_template_kwargs: S.optionalWith(
+    S.extend(S.Struct({}), S.Record({ key: S.String, value: S.suspend((): S.Schema<Value, ValueEncoded> => Value) })),
+    { exact: true, as: "Option" },
+  ),
+  messages: S.optionalWith(
+    S.Array(S.suspend((): S.Schema<ChatMessageRequest, ChatMessageRequestEncoded> => ChatMessageRequest)),
+    { exact: true, as: "Option" },
+  ),
+  model: S.String,
+  prompt: S.optionalWith(S.String, { exact: true, as: "Option" }),
+})
+export type TokenizeRequest = S.Schema.Type<typeof TokenizeRequest>
+export type TokenizeRequestEncoded = S.Schema.Encoded<typeof TokenizeRequest>
+
+export const TokenizeResponse = S.Struct({
+  count: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  max_model_len: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  tokens: S.Array(S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0))),
+})
+export type TokenizeResponse = S.Schema.Type<typeof TokenizeResponse>
+export type TokenizeResponseEncoded = S.Schema.Encoded<typeof TokenizeResponse>
 
 export const Tool = S.Struct({
   cache_control: S.optionalWith(JsonValue, { exact: true, as: "Option" }),

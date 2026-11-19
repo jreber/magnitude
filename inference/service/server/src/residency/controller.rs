@@ -11,6 +11,7 @@
 //! the worker opened.
 
 use magnitude_serving::source::{ModelLoadDetails, KernelTuningWork, KernelTuningOperation};
+use magnitude_engine::options::Serve;
 use magnitude_engine::worker::protocol::TuningOperation;
 use std::cell::RefCell;
 use std::sync::Arc;
@@ -41,7 +42,7 @@ use magnitude_service_models::{
 };
 use seismic::{BackendName, Devices, ExecutorSelector};
 
-use super::optimization::{self, PreparationJobs};
+use super::optimization::{self, PreparationJobs, PreparationKey};
 use super::supervisor::MemorySupervisor;
 use super::worker::{EngineWorker, SpawnedWorker};
 use super::{
@@ -88,6 +89,10 @@ pub struct ResidencyEnvironment {
     pub catalog: Arc<Devices>,
     /// [`MODEL_IDLE_TIMEOUT`] in the service.
     pub idle_timeout: std::time::Duration,
+    /// [`LINGER`](super::LINGER) in the service.
+    pub linger: std::time::Duration,
+    /// [`MAX_WAIT`](super::MAX_WAIT) in the service.
+    pub max_wait: std::time::Duration,
     pub launcher: WorkerLauncher,
     /// Shared by every load and optimization for its lifetime, against the measurement job.
     pub device: DeviceLock,
@@ -156,8 +161,8 @@ impl ModelInstances {
     /// A model still being assessed waits for its verdict, since nothing else bounds the context
     /// it would serve. A model whose assessment failed, or a service without an assessment pool,
     /// serves the full context, guarded only by the engine's own resource plan.
-    async fn serving_target(&self, model_id: &str) -> Result<ResolvedResidencyTarget, InventoryError> {
-        let target = self.target(model_id)?;
+    async fn serving_target(&self, model_id: &str, purpose: Serve) -> Result<ResolvedResidencyTarget, InventoryError> {
+        let target = self.target(model_id, purpose)?;
         let Some(assessments) = self.assessments.get() else {
             return Ok(target);
         };
@@ -173,6 +178,7 @@ impl ModelInstances {
                             profile,
                             ..target.configuration
                         },
+                        target.purpose,
                     ));
                 }
                 ServedProfile::Refused(refusal) => return Err(refusal),
@@ -197,7 +203,10 @@ impl ModelInstances {
     /// the device.
     fn requested(&self, target: &ResolvedResidencyTarget) -> optimization::LoadRequest {
         self.preparations
-            .request(servable_model_bundle_key_for_bundle(&target.configuration.bundle))
+            .request(PreparationKey::new(
+                servable_model_bundle_key_for_bundle(&target.configuration.bundle),
+                target.purpose,
+            ))
     }
 
     /// A fresh memory observation from the resident worker, when one is resident.
@@ -208,11 +217,11 @@ impl ModelInstances {
     /// What loading `model_id` now would use: the engine's preview on this service's catalog.
     pub fn preview_load(&self, model_id: String) -> BoxFuture<'_, Result<ModelLoadPlan, InventoryError>> {
         Box::pin(async move {
-            let target = self.serving_target(&model_id).await?;
+            let target = self.serving_target(&model_id, Serve::Generation).await?;
             let resolved = self
                 .environment
                 .configurations
-                .resolve(&target.configuration)
+                .resolve(&target.configuration, target.purpose)
                 .await?;
             let preview = preview(&self.environment.catalog, &resolved.configuration)
                 .await
@@ -224,7 +233,7 @@ impl ModelInstances {
     /// Make `model_id` resident without leasing it.
     pub fn ensure_resident(&self, model_id: String) -> BoxFuture<'_, Result<ModelInstance, InventoryError>> {
         Box::pin(async move {
-            let target = self.serving_target(&model_id).await?;
+            let target = self.serving_target(&model_id, Serve::Generation).await?;
             let _request = self.requested(&target);
             match self
                 .residency
@@ -243,7 +252,26 @@ impl ModelInstances {
         model_id: &str,
         progress: Option<LoadingObserver>,
     ) -> Result<ResidencyLease<ResidentEngine>, InventoryError> {
-        let target = self.serving_target(model_id).await?;
+        self.acquire_leased(self.serving_target(model_id, Serve::Generation).await?, progress)
+            .await
+    }
+
+    /// Lease `model_id`'s scoring load, loading it if needed: the same model loaded for
+    /// teacher-forced scoring, which is a different instance from the one that generates.
+    pub async fn acquire_for_scoring(
+        &self,
+        model_id: &str,
+        progress: Option<LoadingObserver>,
+    ) -> Result<ResidencyLease<ResidentEngine>, InventoryError> {
+        self.acquire_leased(self.serving_target(model_id, Serve::Scoring).await?, progress)
+            .await
+    }
+
+    async fn acquire_leased(
+        &self,
+        target: ResolvedResidencyTarget,
+        progress: Option<LoadingObserver>,
+    ) -> Result<ResidencyLease<ResidentEngine>, InventoryError> {
         let _request = self.requested(&target);
         match self
             .residency
@@ -346,24 +374,28 @@ impl ModelInstances {
 
     /// The model's host chat semantics, for operations that never lease or load (§8.5).
     pub async fn host(&self, model_id: &str) -> Result<Arc<HostArtifacts>, InventoryError> {
-        let target = self.target(model_id)?;
+        let target = self.target(model_id, Serve::Generation)?;
         Ok(Arc::clone(
             &self
                 .environment
                 .configurations
-                .resolve(&target.configuration)
+                .resolve(&target.configuration, target.purpose)
                 .await?
                 .host,
         ))
     }
 
-    fn target(&self, model_id: &str) -> Result<ResolvedResidencyTarget, InventoryError> {
+    fn target(
+        &self,
+        model_id: &str,
+        purpose: Serve,
+    ) -> Result<ResolvedResidencyTarget, InventoryError> {
         let model_id = model_id
             .parse::<ModelId>()
             .map_err(|error| InventoryError::InvalidId(error.to_string()))?;
         let model_id = self.environment.model_variants.canonical_model_id(model_id)?;
         let configuration = self.environment.model_variants.serving_configuration(&model_id)?;
-        Ok(residency_target(model_id, configuration))
+        Ok(residency_target(model_id, configuration, purpose))
     }
 }
 
@@ -563,20 +595,29 @@ fn memory_size(bytes: u64) -> String {
     }
 }
 
-/// Instance equality: the serving configuration fingerprint (bundle identity and serving
-/// profile). The engine policy is the service's single serving policy.
+/// Instance equality: the serving configuration fingerprint (bundle identity, serving profile
+/// and purpose). The engine policy is the service's single serving policy; a scoring purpose
+/// derives the scoring load from it when the target resolves.
 fn residency_target(
     model_id: ModelId,
     configuration: ModelServingConfiguration,
+    purpose: Serve,
 ) -> ResolvedResidencyTarget {
+    // The models crate does not depend on the engine, so it takes the purpose as a byte.
+    let purpose_tag = match purpose {
+        Serve::Generation => 0,
+        Serve::Scoring => 1,
+    };
     let configuration_key = serving_configuration_fingerprint(
         &servable_model_bundle_key_for_bundle(&configuration.bundle),
         &configuration.profile,
+        purpose_tag,
     );
     ResolvedResidencyTarget {
         model_id,
         configuration,
         configuration_key,
+        purpose,
     }
 }
 
@@ -844,11 +885,12 @@ impl EngineResidency {
         &'a self,
         instance_id: &'a ModelInstanceId,
         configuration: ModelServingConfiguration,
+        purpose: Serve,
         sequence: LoadSequence,
     ) -> BoxFuture<'a, Result<PreparedResidency<ResidentEngine>, ModelOperationFailure>> {
         Box::pin(async move {
             let environment = &self.environment;
-            let resolved = Arc::new(environment.configurations.resolve(&configuration).await?);
+            let resolved = Arc::new(environment.configurations.resolve(&configuration, purpose).await?);
             // The preview stands unless the load waits for the device or for memory below, which
             // change the room its plan settles into.
             let mut previewed = Some(
@@ -918,7 +960,7 @@ impl EngineResidency {
             // The bundle's catalog optimization, if one waits, shows this Prepare and ends once it
             // has prepared the bundle.
             let preparation = self.preparations.load(
-                servable_model_bundle_key_for_bundle(&configuration.bundle),
+                PreparationKey::new(servable_model_bundle_key_for_bundle(&configuration.bundle), purpose),
                 plan.device.clone(),
             );
             let loaded = magnitude_service_utils::blocking::run(move || {
@@ -1060,7 +1102,7 @@ impl ModelResidencyDriver for EngineResidency {
     ) -> Result<tokio::task::JoinHandle<()>, InventoryError> {
         let driver = self.clone();
         Ok(tokio::spawn(async move {
-            let result = std::panic::AssertUnwindSafe(driver.load(&instance_id, target.configuration, sequence))
+            let result = std::panic::AssertUnwindSafe(driver.load(&instance_id, target.configuration, target.purpose, sequence))
                 .catch_unwind()
                 .await
                 .unwrap_or_else(|_| {
@@ -1162,6 +1204,14 @@ impl ModelResidencyDriver for EngineResidency {
         self.environment.idle_timeout
     }
 
+    fn linger(&self) -> std::time::Duration {
+        self.environment.linger
+    }
+
+    fn max_wait(&self) -> std::time::Duration {
+        self.environment.max_wait
+    }
+
     fn demand_ended(&self) {
         self.demand.lock().expect("device demand").take();
     }
@@ -1220,6 +1270,41 @@ impl From<ModelOperationFailure> for InventoryError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_residency_target_carries_its_purpose_in_its_key() {
+        use magnitude_service_contracts::models::{
+            ModelPackage, ModelPackageProperties, ModelPackageSource, ServableModelBundle,
+            ServingProfile,
+        };
+        let configuration = ModelServingConfiguration {
+            bundle: ServableModelBundle::Standalone {
+                package: ModelPackage {
+                    id: ModelPackageId("package:test".to_owned()),
+                    source: ModelPackageSource::Local { path: "/test/test.gguf".into() },
+                    files: Vec::new(),
+                    relationships: Vec::new(),
+                    properties: ModelPackageProperties {
+                        format: "gguf".to_owned(),
+                        quantization: "f16".to_owned(),
+                        quantization_name: "F16".to_owned(),
+                        architecture: "test".to_owned(),
+                        maximum_context_length: Some(8_192),
+                        intrinsic_model_id: Some(MODEL.to_owned()),
+                        intrinsic_quality_id: None,
+                    },
+                },
+            },
+            profile: ServingProfile { context_length: 8_192 },
+        };
+        let model_id: ModelId = format!("{MODEL}").parse().expect("model id");
+        let generation = residency_target(model_id.clone(), configuration.clone(), Serve::Generation);
+        let scoring = residency_target(model_id, configuration, Serve::Scoring);
+        assert_eq!(generation.purpose, Serve::Generation);
+        assert_eq!(scoring.purpose, Serve::Scoring);
+        assert_ne!(generation.configuration_key, scoring.configuration_key);
+        assert!(generation != scoring);
+    }
 
     const MODEL: &str = "qwen3.5-4b:gguf:q4";
 

@@ -7,13 +7,16 @@ use std::sync::Arc;
 
 use futures_util::future::BoxFuture;
 use magnitude_engine::chat::SessionLimits;
+use magnitude_engine::inputs::TokenId;
 use magnitude_engine::invocation::{Invocation, ReleaseGuard};
+use magnitude_engine::worker::ScoreOutcome;
 use magnitude_service_contracts::InventoryError;
 use magnitude_service_contracts::models::ModelLoadStage;
 use magnitude_serving::engine::{EngineHost, EngineInvocation};
 use magnitude_serving::{
     HostChat, LoadProgress, ModelInvocation, ModelLoadProgress,
-    ModelLoadStage as ProtocolLoadStage, ModelUnavailable, ServedModels, ServingError,
+    ModelLoadStage as ProtocolLoadStage, ModelUnavailable, PositionScore, PromptScore,
+    ServedModels, ServingError, TopScore,
 };
 
 use crate::residency::LoadingObserver;
@@ -74,6 +77,52 @@ impl ServedModels for ServiceModels {
             let host = self.instances.host(&model).await.map_err(unavailable)?;
             Ok(Arc::new(EngineHost::new(host)) as Arc<dyn HostChat>)
         })
+    }
+
+    fn score(
+        &self,
+        model: &str,
+        tokens: Vec<u32>,
+        top: bool,
+        next: bool,
+    ) -> BoxFuture<'_, Result<PromptScore, ServingError>> {
+        let model = model.to_owned();
+        Box::pin(async move {
+            // The scoring load is a different instance from the generating one. The lease is
+            // held until the score returns, then dropped with this future's scope.
+            let lease = self
+                .instances
+                .acquire_for_scoring(&model, None)
+                .await
+                .map_err(unavailable)?;
+            let tokens = tokens.into_iter().map(TokenId).collect();
+            lease
+                .resident()
+                .client
+                .score(tokens, top, next)
+                .await
+                .map(protocol_score)
+                .map_err(ServingError::Request)
+        })
+    }
+}
+
+/// A worker's score in the protocols' token ids: the same values, position for position.
+fn protocol_score(outcome: ScoreOutcome) -> PromptScore {
+    PromptScore {
+        positions: outcome
+            .positions
+            .into_iter()
+            .map(|position| PositionScore {
+                logprob: position.logprob,
+                rank: position.rank,
+                top: position.top.map(|top| TopScore {
+                    token: top.token.0,
+                    logprob: top.logprob,
+                }),
+            })
+            .collect(),
+        next: outcome.next.map(|token| token.0),
     }
 }
 

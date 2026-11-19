@@ -6,7 +6,8 @@
 use crate::error::{ArtifactError, LoadError, ResolveError, UnsupportedModel};
 use crate::host::HostArtifacts;
 use crate::options::{
-    cache_identity, ExecutionManifest, InputModalities, ModelPolicy, PackageOptions, ReadyInfo,
+    cache_identity, ExecutionManifest, InputModalities, ModelMethod, ModelPolicy, PackageOptions,
+    ProjectorSelection, ReadyInfo, Serve, SCORING_SEQUENCES, SCORING_WIDTH,
 };
 use crate::execution::LoadAttempt;
 use crate::preview::{now, priced};
@@ -54,6 +55,9 @@ pub struct EngineConfiguration {
     /// content-derived identity, which changes exactly when its content does.
     /// `None` names no model, so no disk-cached state is keyed to one.
     pub model_sha256: Option<String>,
+    /// What the load serves, carried into its manifest
+    /// ([`scoring_configuration`] makes a scoring load).
+    pub serve: Serve,
 }
 
 /// The two authorities produced by host resolution: host artifacts (chat
@@ -100,6 +104,7 @@ impl EngineConfiguration {
             self.service,
             self.path,
             self.device,
+            self.serve,
             self.kernel_cache,
             Some(host.package().store().to_path_buf()),
             self.release,
@@ -144,6 +149,47 @@ impl EngineConfiguration {
             }
         }
         Ok(ResolvedEngineConfiguration { host: Arc::new(host), manifest })
+    }
+}
+
+/// The fewest rows a logits-exporting load exports: a prefill chunk's, as
+/// `magnitude-harness logits` sets it.
+const EXPORTED_LOGITS_ROWS: usize = 512;
+
+/// The engine configuration of a scoring load of `base`: target only, plain method, no lookahead, the
+/// base's KV codec and context, logits exported for max(S·W, 512) rows, S conversations.
+///
+/// The KV codec and the numerical profile stay the base's, so scores see the
+/// arithmetic the base's samples were drawn with. A step of S walks W rows
+/// wide is one decode allowance: it selects a token at each of its rows. The
+/// exported rows must fit a launch: planning refuses a load whose launch
+/// rows, the larger of its allowances, are fewer (`LogitsRows`). The S
+/// conversations are the scoring owner's bound: a load's state grows per
+/// request, and its launch slots are its launch rows.
+pub fn scoring_configuration(base: EngineConfiguration) -> EngineConfiguration {
+    let step = SCORING_SEQUENCES * SCORING_WIDTH;
+    EngineConfiguration {
+        package: PackageOptions {
+            target_shards: base.package.target_shards,
+            projector: ProjectorSelection::Disabled,
+            draft: None,
+        },
+        // The KV codec, the numerical profile and the weight bound stay the
+        // base's.
+        model: ModelPolicy {
+            draft_policy: None,
+            method: ModelMethod::Plain,
+            mtp_proposals: None,
+            lookahead: false,
+            exported_logits_rows: step.max(EXPORTED_LOGITS_ROWS),
+            ..base.model
+        },
+        service: ServiceLimits {
+            decode_tokens: step,
+            ..base.service
+        },
+        serve: Serve::Scoring,
+        ..base
     }
 }
 
@@ -418,4 +464,112 @@ pub fn start_in_process(
     load_in_process(&manifest, attempt, worker, |update| {
         (progress.borrow_mut())(update)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::options::{standard_service_limits, DraftPolicy, ResolvedMethod};
+    use crate::planning::{resource_limits, ExecutionPlanningError};
+    use magnitude_state::KvCodec;
+
+    /// A generation load's configuration with every option a scoring load
+    /// must override set the other way.
+    fn generation_configuration() -> EngineConfiguration {
+        EngineConfiguration {
+            package: PackageOptions {
+                target_shards: vec![PathBuf::from("/models/target.gguf")],
+                projector: ProjectorSelection::Explicit(PathBuf::from("/models/projector.gguf")),
+                draft: Some(PathBuf::from("/models/draft.gguf")),
+            },
+            model: ModelPolicy {
+                draft_policy: Some(DraftPolicy::Adaptive),
+                method: ModelMethod::DFlash,
+                mtp_proposals: Some(4),
+                kv_codec: Some(KvCodec::RotatedK4V4),
+                lookahead: true,
+                exported_logits_rows: 0,
+                ..ModelPolicy::default()
+            },
+            context_tokens: Some(8192),
+            service: standard_service_limits(),
+            path: ExecutionPath::Native,
+            device: DeviceRequest::Automatic,
+            kernel_cache: Some(PathBuf::from("/cache/kernels")),
+            release: ReleaseRate::of_machine(None),
+            model_sha256: Some("e3b0c442".into()),
+            serve: Serve::Generation,
+        }
+    }
+
+    /// The resource limits a load of `configuration` plans on `backend`.
+    fn limits(
+        configuration: &EngineConfiguration,
+        backend: seismic::BackendName,
+    ) -> Result<magnitude_executor::ResourceLimits, ExecutionPlanningError> {
+        let definition = crate::options::tests::definition(true);
+        let model = configuration.model.resolve(&definition).unwrap();
+        assert_eq!(model.method, ResolvedMethod::Plain);
+        resource_limits(&configuration.service, &model, 0, backend)
+    }
+
+    #[test]
+    fn a_scoring_load_is_the_plain_target_exporting_every_row_it_walks() {
+        let base = generation_configuration();
+        let scoring = scoring_configuration(base.clone());
+        assert_eq!(scoring.serve, Serve::Scoring);
+        assert_eq!(scoring.package.target_shards, base.package.target_shards);
+        assert_eq!(scoring.package.projector, ProjectorSelection::Disabled);
+        assert_eq!(scoring.package.draft, None);
+        assert_eq!(scoring.model.method, ModelMethod::Plain);
+        assert_eq!(scoring.model.draft_policy, None);
+        assert_eq!(scoring.model.mtp_proposals, None);
+        assert!(!scoring.model.lookahead);
+        assert_eq!(scoring.model.kv_codec, base.model.kv_codec);
+        assert_eq!(scoring.context_tokens, base.context_tokens);
+        assert_eq!(scoring.model.exported_logits_rows, 512);
+        // The manifest admits the service limits, and the load's plan
+        // selects and exports every row of a step of S walks W rows wide.
+        scoring.service.validate().unwrap();
+        let limits = limits(&scoring, seismic::BackendName::Metal).unwrap();
+        let step = SCORING_SEQUENCES * SCORING_WIDTH;
+        assert!(limits.max_launch_rows >= step);
+        assert!(limits.max_launch_slots >= SCORING_SEQUENCES);
+        assert!(limits.max_selected_rows >= step);
+        assert_eq!(limits.exported_logits_rows, 512);
+        assert!(limits.exported_logits_rows <= limits.max_launch_rows);
+        assert!(!limits.lookahead);
+    }
+
+    /// The exported rows are max(S·W, 512) whatever the base's prefill
+    /// allowance; a base whose launches cannot carry them is refused.
+    #[test]
+    fn a_scoring_load_exports_its_rows_within_the_bases_launch() {
+        let wide = scoring_configuration(EngineConfiguration {
+            service: ServiceLimits {
+                prefill_tokens: 1024,
+                ..standard_service_limits()
+            },
+            ..generation_configuration()
+        });
+        assert_eq!(wide.model.exported_logits_rows, 512);
+        let planned = limits(&wide, seismic::BackendName::Cuda).unwrap();
+        assert_eq!(planned.exported_logits_rows, 512);
+        assert_eq!(planned.max_launch_rows, 1024);
+        let narrow = scoring_configuration(EngineConfiguration {
+            service: ServiceLimits {
+                prefill_tokens: 128,
+                ..standard_service_limits()
+            },
+            ..generation_configuration()
+        });
+        assert_eq!(narrow.model.exported_logits_rows, 512);
+        assert_eq!(
+            limits(&narrow, seismic::BackendName::Metal),
+            Err(ExecutionPlanningError::LogitsRows {
+                required: 512,
+                admitted: SCORING_SEQUENCES * SCORING_WIDTH,
+            })
+        );
+    }
 }

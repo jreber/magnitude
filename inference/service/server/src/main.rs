@@ -41,6 +41,7 @@ use magnitude_service_server::residency::controller::{
     MODEL_IDLE_TIMEOUT, ModelInstances, ResidencyEnvironment,
 };
 use magnitude_service_server::residency::worker::run_inference_worker;
+use magnitude_service_server::residency::{LINGER, MAX_WAIT};
 use magnitude_service_server::serving::ServiceModels;
 use magnitude_service_server::worker_process::{self, WorkerLauncher};
 use tower_http::trace::{DefaultOnResponse, TraceLayer};
@@ -271,6 +272,8 @@ async fn run(command: Command) -> anyhow::Result<()> {
                 )),
                 catalog: catalog.clone(),
                 idle_timeout: MODEL_IDLE_TIMEOUT,
+                linger: LINGER,
+                max_wait: MAX_WAIT,
                 launcher: worker_launcher,
                 device,
                 instance_id_namespace: instance_id.clone(),

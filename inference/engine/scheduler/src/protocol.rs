@@ -1,17 +1,20 @@
 //! Closed, device-free command vocabulary of the thread-confined execution
 //! owner inside a numerical worker.
 //!
-//! Concrete executor types, device leases, and caller-provided closures cannot
-//! be represented here. The engine's worker session is the only dispatcher;
-//! the host/worker IPC protocol is defined above this crate.
+//! Concrete executor types and device leases cannot be represented here; the
+//! one closure is `ScoreRequest::done`, a device-free completion callback.
+//! The engine's worker session is the only dispatcher; the host/worker IPC
+//! protocol is defined above this crate.
 
 use crate::prefix_cache::PrefixRetention;
 use crate::publication::PublicationReceiver;
 use crate::serving::ServingCensus;
 use crate::owner::{AdmissionError, Status};
+use crate::publication::RequestError;
 use crate::throughput::ThroughputSnapshot;
 use magnitude_executor::platform::DomainReading;
-use magnitude_executor::{RequestId, StoreAllocation};
+use crate::scoring::ScoreOutcome;
+use magnitude_executor::{RequestId, StoreAllocation, TokenId};
 use magnitude_family_contracts::PreparedModelInput;
 use magnitude_generation::GenerationSeed;
 use serde::{Deserialize, Serialize};
@@ -28,8 +31,40 @@ pub struct AdmitRequest {
     pub output_capacity: usize,
 }
 
+/// Teacher-forced scoring of `tokens`: the model's log-probability of each
+/// token given those before it, with no sampling.
+pub struct ScoreRequest {
+    pub tokens: Vec<TokenId>,
+    /// Report each position's most likely token as well.
+    pub top: bool,
+    /// Report the most likely token after the last one.
+    pub next: bool,
+    /// Reports the outcome, from the execution thread. Exactly one of two
+    /// things happens: the owner acknowledges the command and calls `done`
+    /// exactly once, or the command fails (the owner returns `Err`, execution
+    /// has stopped, or the command is never dispatched) and `done` is dropped
+    /// uncalled, so the dispatcher reports the failure.
+    pub done: Box<dyn FnOnce(Result<ScoreOutcome, RequestError>) + Send>,
+}
+
+impl std::fmt::Debug for ScoreRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ScoreRequest")
+            .field("tokens", &self.tokens.len())
+            .field("top", &self.top)
+            .field("next", &self.next)
+            .finish_non_exhaustive()
+    }
+}
+
 pub enum WorkerCommand {
     Admit(AdmitRequest),
+    /// Score a token sequence. Either the owner answers
+    /// `Ok(WorkerReply::Acknowledged)` and calls `ScoreRequest::done` exactly
+    /// once, or the command fails (`Err`, execution stopped, or never
+    /// dispatched) and `done` is dropped uncalled.
+    Score(ScoreRequest),
     Stop { request: RequestId },
     Status { request: RequestId },
     /// The memory heap's classified holdings and standing.
@@ -103,6 +138,14 @@ impl RoomGrant {
     }
 
     /// The grant of a claim no owner holds: released at once.
+    /// A grant answered at once with `decided`, the owner's answer where
+    /// nothing is left to wait for.
+    pub fn decided(decided: Result<(), RoomRefusal>) -> Self {
+        let (granter, grant) = Self::new();
+        granter.answer(decided);
+        grant
+    }
+
     pub fn released() -> Self {
         Self::new().1
     }
@@ -187,6 +230,20 @@ mod tests {
     use super::*;
 
     fn assert_send<T: Send>() {}
+
+    #[test]
+    fn score_request_debug_elides_the_callback() {
+        let request = ScoreRequest {
+            tokens: vec![TokenId(1), TokenId(2)],
+            top: true,
+            next: false,
+            done: Box::new(|_| {}),
+        };
+        assert_eq!(
+            format!("{request:?}"),
+            "ScoreRequest { tokens: 2, top: true, next: false, .. }"
+        );
+    }
 
     #[test]
     fn protocol_is_device_free_and_sendable() {

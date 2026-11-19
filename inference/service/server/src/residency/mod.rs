@@ -11,6 +11,8 @@ pub mod worker;
 
 use std::sync::Arc;
 
+use std::time::Duration;
+use magnitude_engine::options::Serve;
 use magnitude_serving::source::ModelLoadDetails;
 
 use magnitude_service_contracts::InventoryError;
@@ -25,11 +27,24 @@ use magnitude_service_contracts::models::{
 /// The failure code of a load that fits the machine but could not be given its memory.
 pub const MEMORY_SHORTAGE_FAILURE_CODE: &str = "memory_shortage";
 
+/// How long a ready instance must hold no lease and grant none before an inference request for
+/// another configuration replaces it. To be set from a measured load time.
+pub const LINGER: Duration = Duration::from_secs(30);
+
+/// The longest an inference request for another configuration waits while the ready instance
+/// stays in use; then the instance is released as soon as its leases drain. To be set from a
+/// measured load time, which it must exceed many times over.
+pub const MAX_WAIT: Duration = Duration::from_secs(600);
+
 /// Observes model loading: its stage and completed fraction in `[0, 1]`.
 pub type LoadingObserver = Arc<dyn Fn(ModelLoadStage, f32, Option<ModelLoadDetails>) + Send + Sync>;
 
 pub enum ResidencyAcquisition {
+    /// Demand from a request to serve: a lease. For another configuration it lets the ready
+    /// instance keep serving for up to [`LINGER`] of quiet or [`MAX_WAIT`].
     Inference { progress: Option<LoadingObserver> },
+    /// An explicit load: the instance, no lease. For another configuration it begins the ready
+    /// instance's replacement at once, as an explicit stop begins its release.
     Warm,
 }
 
@@ -82,12 +97,31 @@ struct AcquisitionWaiter<R> {
     reply: tokio::sync::oneshot::Sender<Result<ResidencyGrant<R>, InventoryError>>,
 }
 
+/// A request waiting for an instance other than the current one, and since when.
+struct QueuedWaiter<R> {
+    waiter: AcquisitionWaiter<R>,
+    since: tokio::time::Instant,
+}
+
+impl<R> QueuedWaiter<R> {
+    /// The latest the ready instance keeps serving for this request: an inference request waits
+    /// up to `max_wait`; an explicit load waits for nothing.
+    fn release_by(&self, max_wait: Duration) -> tokio::time::Instant {
+        match self.waiter.purpose {
+            ResidencyAcquisition::Inference { .. } => self.since + max_wait,
+            ResidencyAcquisition::Warm => self.since,
+        }
+    }
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub struct ResolvedResidencyTarget {
     pub model_id: ModelId,
     pub configuration: ModelServingConfiguration,
     /// The serving configuration fingerprint: instance equality.
     pub configuration_key: String,
+    /// What the instance is loaded for; the key names it.
+    pub purpose: Serve,
 }
 
 /// The process that holds a resident model.
@@ -147,6 +181,7 @@ struct LoadingResidency<R> {
     instance: ModelInstance,
     configuration: ModelServingConfiguration,
     configuration_key: String,
+    purpose: Serve,
     operation: tokio::task::JoinHandle<()>,
     gate: LoadGate,
     worker: Option<Arc<dyn ResidencyWorker>>,
@@ -156,8 +191,26 @@ struct LoadingResidency<R> {
 struct ReadyResidency<R> {
     instance: ModelInstance,
     configuration_key: String,
+    purpose: Serve,
     resources: ResidentResources<R>,
-    idle_deadline: Option<tokio::time::Instant>,
+    /// The later of the last grant and the last lease release.
+    last_activity: tokio::time::Instant,
+}
+
+impl<R> ReadyResidency<R> {
+    /// A grant or a lease release: the instance is in use now.
+    fn record_activity(&mut self) {
+        self.last_activity = tokio::time::Instant::now();
+    }
+
+    /// Since when the instance has held no lease and granted none; None while a lease is held.
+    /// Its idle release and the release for a waiting replacement both count from here.
+    fn quiet_since(&self) -> Option<tokio::time::Instant> {
+        self.resources
+            .leases
+            .is_empty()
+            .then_some(self.last_activity)
+    }
 }
 
 struct ResidentResources<R> {
@@ -655,12 +708,16 @@ pub trait ModelResidencyDriver: Clone + Send + Sync + 'static {
     fn resident_idle(&self, resident: Option<(&ModelInstanceId, &Self::Resident)>);
     /// The idle ready instance was leased for a request, which ends its idleness.
     fn resident_leased(&self);
+    /// [`LINGER`] in the service.
+    fn linger(&self) -> Duration;
+    /// [`MAX_WAIT`] in the service.
+    fn max_wait(&self) -> Duration;
 }
 
 pub struct ModelResidency<D: ModelResidencyDriver> {
     controller: D,
     state: ResidencyState<D::Resident>,
-    queue: std::collections::VecDeque<AcquisitionWaiter<D::Resident>>,
+    queue: std::collections::VecDeque<QueuedWaiter<D::Resident>>,
     terminals: std::collections::BTreeMap<ModelInstanceId, TerminalInstance>,
     revision: u64,
     next_lease_token: u64,
@@ -701,12 +758,9 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
     /// Serve the actor until its client and every load completion are gone.
     pub async fn run(mut self, mut inbox: ResidencyInbox<D::Resident>) {
         loop {
-            let idle_deadline = match &self.state {
-                ResidencyState::Ready(ready) => ready.idle_deadline,
-                _ => None,
-            };
-            let idle = async move {
-                match idle_deadline {
+            let deadline = self.release_deadline();
+            let due = async move {
+                match deadline {
                     Some(deadline) => tokio::time::sleep_until(deadline).await,
                     None => std::future::pending().await,
                 }
@@ -722,9 +776,9 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
                     Some(command) => self.handle(command),
                     None => break,
                 },
-                () = idle => {}
+                () = due => {}
             }
-            self.idle_expired();
+            self.release_if_due();
             self.publish_idle();
             self.publish_demand();
         }
@@ -883,13 +937,9 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
                 self.grant_ready(waiter);
             }
             ResidencyState::Vacant => self.start_loading(waiter),
-            ResidencyState::Loading(_) | ResidencyState::Releasing(_) => {
-                self.enqueue(waiter);
-            }
-            ResidencyState::Ready(_) => {
-                self.enqueue(waiter);
-                self.begin_ready_release(ModelReleaseReason::Replacement, Vec::new());
-            }
+            // Any other request waits its turn. A ready instance keeps serving its own
+            // configuration until the replacement deadline releases it.
+            _ => self.enqueue(waiter),
         }
     }
 
@@ -904,7 +954,12 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
             },
             None,
         );
-        self.queue.push_back(waiter);
+        // Requests that gave up leave the queue as others join it.
+        self.queue.retain(|queued| !queued.waiter.reply.is_closed());
+        self.queue.push_back(QueuedWaiter {
+            waiter,
+            since: tokio::time::Instant::now(),
+        });
     }
 
     fn release_packages(
@@ -968,6 +1023,7 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
             instance,
             configuration: first.target.configuration.clone(),
             configuration_key: first.target.configuration_key.clone(),
+            purpose: first.target.purpose,
             operation,
             gate,
             worker: None,
@@ -980,18 +1036,19 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
                 model_id: loading.instance.model_id.clone(),
                 configuration: loading.configuration.clone(),
                 configuration_key: loading.configuration_key.clone(),
+                purpose: loading.purpose,
             },
             _ => unreachable!(),
         };
         let mut retained = std::collections::VecDeque::new();
-        while let Some(waiter) = self.queue.pop_front() {
-            if waiter.target == target {
+        while let Some(queued) = self.queue.pop_front() {
+            if queued.waiter.target == target {
                 if let ResidencyState::Loading(loading) = &mut self.state {
-                    Self::notify_progress(&waiter, &loading.instance.lifecycle, loading.details.as_ref());
-                    loading.waiters.push(waiter);
+                    Self::notify_progress(&queued.waiter, &loading.instance.lifecycle, loading.details.as_ref());
+                    loading.waiters.push(queued.waiter);
                 }
             } else {
-                retained.push_back(waiter);
+                retained.push_back(queued);
             }
         }
         self.queue = retained;
@@ -1003,19 +1060,24 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
         else {
             unreachable!("ready grant requires Ready residency")
         };
-        match waiter.purpose {
-            ResidencyAcquisition::Inference { .. } => {
-                let lease = self.make_lease(&mut ready);
-                let _ = waiter.reply.send(Ok(ResidencyGrant::Lease(lease)));
-            }
-            ResidencyAcquisition::Warm => {
-                let _ = waiter
-                    .reply
-                    .send(Ok(ResidencyGrant::Ready(ready.instance.clone())));
-            }
-        }
+        self.grant(&mut ready, waiter);
         self.state = ResidencyState::Ready(ready);
-        self.refresh_idle_deadline();
+    }
+
+    /// Hand `waiter` the ready instance: a lease for inference, the instance for a warm request.
+    fn grant(
+        &mut self,
+        ready: &mut ReadyResidency<D::Resident>,
+        waiter: AcquisitionWaiter<D::Resident>,
+    ) {
+        let grant = match waiter.purpose {
+            ResidencyAcquisition::Inference { .. } => ResidencyGrant::Lease(self.make_lease(ready)),
+            ResidencyAcquisition::Warm => {
+                ready.record_activity();
+                ResidencyGrant::Ready(ready.instance.clone())
+            }
+        };
+        let _ = waiter.reply.send(Ok(grant));
     }
 
     fn make_lease(
@@ -1030,7 +1092,7 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
             self.controller.resident_leased();
         }
         ready.resources.leases.insert(token);
-        ready.idle_deadline = None;
+        ready.record_activity();
         ResidencyLease {
             instance_id: ready.instance.id.clone(),
             resident: ready.resources.resident.clone(),
@@ -1112,6 +1174,12 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
         if let Some(worker) = &worker {
             worker.end("model_instance_stopped", "model instance was stopped");
         }
+        tracing::info!(
+            model.id = %loading.instance.model_id,
+            model.instance.id = %loading.instance.id.0,
+            residency.purpose = ?loading.purpose,
+            "model release begins: the load is stopped"
+        );
         let notifier = self.controller.client().notifier();
         let instance_id = loading.instance.id.clone();
         let operation = loading.operation;
@@ -1252,26 +1320,17 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
                 let mut ready = ReadyResidency {
                     instance,
                     configuration_key: loading.configuration_key,
+                    purpose: loading.purpose,
                     resources: ResidentResources {
                         package_ids: prepared.package_ids,
                         worker: prepared.worker,
                         resident: prepared.resident,
                         leases: std::collections::BTreeSet::new(),
                     },
-                    idle_deadline: None,
+                    last_activity: tokio::time::Instant::now(),
                 };
                 for waiter in loading.waiters.drain(..) {
-                    match waiter.purpose {
-                        ResidencyAcquisition::Inference { .. } => {
-                            let lease = self.make_lease(&mut ready);
-                            let _ = waiter.reply.send(Ok(ResidencyGrant::Lease(lease)));
-                        }
-                        ResidencyAcquisition::Warm => {
-                            let _ = waiter
-                                .reply
-                                .send(Ok(ResidencyGrant::Ready(ready.instance.clone())));
-                        }
-                    }
+                    self.grant(&mut ready, waiter);
                 }
                 self.controller.supervise_worker(
                     instance_id,
@@ -1280,12 +1339,6 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
                 );
                 self.state = ResidencyState::Ready(ready);
                 self.publish_current();
-                self.queue.retain(|waiter| !waiter.reply.is_closed());
-                if self.queue.is_empty() {
-                    self.refresh_idle_deadline();
-                } else {
-                    self.begin_ready_release(ModelReleaseReason::Replacement, Vec::new());
-                }
             }
             Err(failure) => {
                 for waiter in loading.waiters.drain(..) {
@@ -1310,6 +1363,13 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
             self.state = state;
             return;
         };
+        tracing::info!(
+            model.id = %ready.instance.model_id,
+            model.instance.id = %ready.instance.id.0,
+            residency.purpose = ?ready.purpose,
+            residency.release.reason = ?reason,
+            "model release begins"
+        );
         let stopping = ModelInstance {
             id: ready.instance.id.clone(),
             model_id: ready.instance.model_id.clone(),
@@ -1351,11 +1411,10 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
     }
 
     fn lease_released(&mut self, instance_id: ModelInstanceId, token: u64) {
-        let mut refresh_idle_deadline = false;
         match &mut self.state {
             ResidencyState::Ready(ready) if ready.instance.id == instance_id => {
                 if ready.resources.leases.remove(&token) {
-                    refresh_idle_deadline = ready.resources.leases.is_empty();
+                    ready.record_activity();
                 }
             }
             ResidencyState::Releasing(ReleasingResidency {
@@ -1372,9 +1431,6 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
                 }
             }
             _ => {}
-        }
-        if refresh_idle_deadline {
-            self.refresh_idle_deadline();
         }
     }
 
@@ -1426,8 +1482,11 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
                 for reply in releasing.stop_replies.drain(..) {
                     let _ = reply.send(Err(Self::inventory_failure(&failure)));
                 }
-                for waiter in self.queue.drain(..) {
-                    let _ = waiter.reply.send(Err(Self::inventory_failure(&failure)));
+                for queued in self.queue.drain(..) {
+                    let _ = queued
+                        .waiter
+                        .reply
+                        .send(Err(Self::inventory_failure(&failure)));
                 }
                 releasing.operation = ReleaseOperation::RetirementFailed { worker, failure };
                 self.publish_current();
@@ -1500,28 +1559,59 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
         }
     }
 
-    fn idle_expired(&mut self) {
-        let now = tokio::time::Instant::now();
-        if matches!(
-            &self.state,
-            ResidencyState::Ready(ready)
-                if ready.resources.leases.is_empty()
-                    && ready.idle_deadline.is_some_and(|deadline| deadline <= now)
-        ) {
-            self.begin_ready_release(ModelReleaseReason::IdleTimeout, Vec::new());
-        }
+    /// When the ready instance is next released unless something changes first: for a waiting
+    /// replacement, or after its idle timeout.
+    fn release_deadline(&self) -> Option<tokio::time::Instant> {
+        self.replacement_deadline()
+            .into_iter()
+            .chain(self.idle_deadline())
+            .min()
     }
 
-    fn refresh_idle_deadline(&mut self) {
-        let timeout = self.controller.idle_timeout();
-        let ResidencyState::Ready(ready) = &mut self.state else {
+    /// The idle release: the idle timeout after the ready instance went quiet.
+    fn idle_deadline(&self) -> Option<tokio::time::Instant> {
+        let ResidencyState::Ready(ready) = &self.state else {
+            return None;
+        };
+        Some(ready.quiet_since()? + self.controller.idle_timeout())
+    }
+
+    /// The release for the requests queued for another configuration: once the ready instance
+    /// has been quiet for the linger, or once one of them has waited as long as it lets the
+    /// instance keep serving ([`QueuedWaiter::release_by`]), whichever comes first. A request
+    /// that gave up does not count.
+    fn replacement_deadline(&self) -> Option<tokio::time::Instant> {
+        let ResidencyState::Ready(ready) = &self.state else {
+            return None;
+        };
+        let waited = self
+            .queue
+            .iter()
+            .filter(|queued| !queued.waiter.reply.is_closed())
+            .map(|queued| queued.release_by(self.controller.max_wait()))
+            .min()?;
+        Some(match ready.quiet_since() {
+            Some(quiet) => waited.min(quiet + self.controller.linger()),
+            None => waited,
+        })
+    }
+
+    /// Begin the ready instance's release once a deadline has passed. A replacement release
+    /// before the instance is quiet (at the maximum wait, or for an explicit load) drains the
+    /// leases still held, and requests for the instance queue meanwhile.
+    fn release_if_due(&mut self) {
+        let now = tokio::time::Instant::now();
+        let reason = if self
+            .replacement_deadline()
+            .is_some_and(|deadline| deadline <= now)
+        {
+            ModelReleaseReason::Replacement
+        } else if self.idle_deadline().is_some_and(|deadline| deadline <= now) {
+            ModelReleaseReason::IdleTimeout
+        } else {
             return;
         };
-        ready.idle_deadline = ready
-            .resources
-            .leases
-            .is_empty()
-            .then(|| tokio::time::Instant::now() + timeout);
+        self.begin_ready_release(reason, Vec::new());
     }
 
     fn finish_stopped(&mut self, instance_id: ModelInstanceId) {
@@ -1595,11 +1685,11 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
         if !matches!(self.state, ResidencyState::Vacant) {
             return;
         }
-        while let Some(waiter) = self.queue.pop_front() {
-            if waiter.reply.is_closed() {
+        while let Some(queued) = self.queue.pop_front() {
+            if queued.waiter.reply.is_closed() {
                 continue;
             }
-            self.start_loading(waiter);
+            self.start_loading(queued.waiter);
             break;
         }
     }
@@ -1611,6 +1701,7 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
                 model.id = %loading.instance.model_id,
                 model.instance.id = %loading.instance.id.0,
                 residency.state = "loading",
+                residency.purpose = ?loading.purpose,
                 residency.revision = self.revision,
                 "model residency transitioned"
             ),
@@ -1881,13 +1972,33 @@ mod tests {
         loads: tokio::sync::mpsc::UnboundedSender<(ModelInstanceId, String)>,
         auto_ready: bool,
         workers: Arc<Mutex<Vec<Arc<TestResidencyWorker>>>>,
-        idle_timeout: std::time::Duration,
+        timings: TestTimings,
         /// Every idleness published, in order.
         idles: Arc<Mutex<Vec<Published>>>,
         /// Each load's sequence, held by its load's task until the task ends or is aborted.
         sequences: Arc<Mutex<Vec<std::sync::Weak<LoadSequence>>>>,
         /// How many times residency's demand for the device ended.
         demand_ends: Arc<AtomicUsize>,
+    }
+
+    /// The durations a test residency runs with.
+    #[derive(Clone, Copy)]
+    struct TestTimings {
+        idle_timeout: Duration,
+        linger: Duration,
+        max_wait: Duration,
+    }
+
+    impl TestTimings {
+        /// A test that does not set the replacement wait gets none: a request for another
+        /// configuration starts the resident's release at once, the release those tests exercise.
+        fn with_idle_timeout(idle_timeout: Duration) -> Self {
+            Self {
+                idle_timeout,
+                linger: Duration::ZERO,
+                max_wait: Duration::ZERO,
+            }
+        }
     }
 
     #[derive(Default)]
@@ -2035,7 +2146,15 @@ mod tests {
         }
 
         fn idle_timeout(&self) -> std::time::Duration {
-            self.idle_timeout
+            self.timings.idle_timeout
+        }
+
+        fn linger(&self) -> Duration {
+            self.timings.linger
+        }
+
+        fn max_wait(&self) -> Duration {
+            self.timings.max_wait
         }
 
         fn demand_ended(&self) {
@@ -2074,6 +2193,38 @@ mod tests {
         Arc<Mutex<Vec<Arc<TestResidencyWorker>>>>,
         tokio::task::JoinHandle<()>,
     ) {
+        test_residency_with_timings(auto_ready, TestTimings::with_idle_timeout(idle_timeout))
+    }
+
+    /// Loads that become ready, the service's idle timeout, and the given replacement wait.
+    fn test_residency_with_replacement_wait(
+        linger: Duration,
+        max_wait: Duration,
+    ) -> (
+        ResidencyClient<TestResident>,
+        tokio::sync::mpsc::UnboundedReceiver<(ModelInstanceId, String)>,
+        Arc<Mutex<Vec<Arc<TestResidencyWorker>>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        test_residency_with_timings(
+            true,
+            TestTimings {
+                idle_timeout: controller::MODEL_IDLE_TIMEOUT,
+                linger,
+                max_wait,
+            },
+        )
+    }
+
+    fn test_residency_with_timings(
+        auto_ready: bool,
+        timings: TestTimings,
+    ) -> (
+        ResidencyClient<TestResident>,
+        tokio::sync::mpsc::UnboundedReceiver<(ModelInstanceId, String)>,
+        Arc<Mutex<Vec<Arc<TestResidencyWorker>>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
         let (client, inbox) = ResidencyClient::channel();
         let (loads, load_events) = tokio::sync::mpsc::unbounded_channel();
         let workers = Arc::new(Mutex::new(Vec::new()));
@@ -2083,7 +2234,7 @@ mod tests {
             loads,
             auto_ready,
             workers: Arc::clone(&workers),
-            idle_timeout,
+            timings,
             idles: Arc::default(),
             sequences: Arc::default(),
             demand_ends: Arc::default(),
@@ -2105,7 +2256,7 @@ mod tests {
             loads,
             auto_ready: true,
             workers: Arc::default(),
-            idle_timeout: std::time::Duration::from_secs(600),
+            timings: TestTimings::with_idle_timeout(Duration::from_secs(600)),
             idles: Arc::clone(&idles),
             sequences: Arc::default(),
             demand_ends: Arc::default(),
@@ -2151,7 +2302,7 @@ mod tests {
             loads,
             auto_ready: true,
             workers: Arc::default(),
-            idle_timeout: std::time::Duration::from_secs(600),
+            timings: TestTimings::with_idle_timeout(Duration::from_secs(600)),
             idles: Arc::default(),
             sequences: Arc::default(),
             demand_ends: Arc::clone(&demand_ends),
@@ -2250,6 +2401,7 @@ mod tests {
                 .expect("valid test model ID"),
             configuration: test_configuration(model_id),
             configuration_key: configuration_key.to_owned(),
+            purpose: Serve::Generation,
         }
     }
 
@@ -2551,7 +2703,7 @@ mod tests {
                 loads,
                 auto_ready: false,
                 workers: Arc::default(),
-                idle_timeout: std::time::Duration::from_secs(600),
+                timings: TestTimings::with_idle_timeout(Duration::from_secs(600)),
                 idles: Arc::default(),
                 sequences: Arc::clone(&sequences),
                 demand_ends: Arc::default(),
@@ -2889,6 +3041,389 @@ mod tests {
             }
             error => panic!("unexpected stopped-instance result: {error:?}"),
         }
+    }
+
+    /// An inference lease on the test target of `model_id`, granted without waiting.
+    async fn test_lease(
+        client: &ResidencyClient<TestResident>,
+        model_id: &str,
+    ) -> ResidencyLease<TestResident> {
+        let grant = tokio::time::timeout(
+            Duration::from_secs(1),
+            client.acquire(
+                test_target(model_id),
+                ResidencyAcquisition::Inference { progress: None },
+            ),
+        )
+        .await
+        .expect("a request for the resident configuration is granted without waiting")
+        .expect("inference acquisition");
+        match grant {
+            ResidencyGrant::Lease(lease) => lease,
+            ResidencyGrant::Ready(_) => panic!("inference acquisition returned warm result"),
+        }
+    }
+
+    /// Demand from a request to serve, the demand the replacement wait is for.
+    fn inference() -> ResidencyAcquisition {
+        ResidencyAcquisition::Inference { progress: None }
+    }
+
+    /// A request for the test target of `model_id` in its own task, received by the actor when
+    /// this returns.
+    async fn queued_request(
+        client: &ResidencyClient<TestResident>,
+        model_id: &'static str,
+        purpose: ResidencyAcquisition,
+    ) -> tokio::task::JoinHandle<Result<ResidencyGrant<TestResident>, InventoryError>> {
+        let request = tokio::spawn({
+            let client = client.clone();
+            async move { client.acquire(test_target(model_id), purpose).await }
+        });
+        tokio::task::yield_now().await;
+        client.snapshot().await.expect("snapshot");
+        tokio::task::yield_now().await;
+        request
+    }
+
+    async fn current_lifecycle(client: &ResidencyClient<TestResident>) -> ModelInstanceLifecycle {
+        client
+            .snapshot()
+            .await
+            .unwrap()
+            .instances
+            .last()
+            .expect("current instance")
+            .lifecycle
+            .clone()
+    }
+
+    async fn lifecycle_of(
+        client: &ResidencyClient<TestResident>,
+        instance_id: &ModelInstanceId,
+    ) -> ModelInstanceLifecycle {
+        client
+            .snapshot()
+            .await
+            .unwrap()
+            .instances
+            .into_iter()
+            .find(|instance| instance.id == *instance_id)
+            .expect("instance in the snapshot")
+            .lifecycle
+    }
+
+    /// An inference request for another configuration waits while the resident one is in use:
+    /// requests for the resident keep being granted, and the replacement starts once the resident
+    /// has held no lease and granted none for LINGER, counted from its last lease release.
+    #[tokio::test(start_paused = true)]
+    async fn a_replacement_waits_while_the_resident_configuration_is_used() {
+        let (client, mut loads, workers, actor) =
+            test_residency_with_replacement_wait(LINGER, MAX_WAIT);
+        drop(test_lease(&client, "model-a").await);
+        let _ = loads.recv().await.expect("resident load");
+        let replacement = queued_request(&client, "model-b", inference()).await;
+
+        // A request for the resident every LINGER / 3, each holding its lease half that time,
+        // for twice LINGER.
+        let interval = LINGER / 3;
+        for _ in 0..6 {
+            tokio::time::advance(interval / 2).await;
+            let lease = test_lease(&client, "model-a").await;
+            tokio::time::advance(interval / 2).await;
+            drop(lease);
+            assert!(matches!(
+                current_lifecycle(&client).await,
+                ModelInstanceLifecycle::Ready { .. }
+            ));
+            assert!(
+                loads.try_recv().is_err(),
+                "the replacement loaded while the resident was in use"
+            );
+        }
+        let quiet = tokio::time::Instant::now();
+
+        tokio::time::advance(LINGER - Duration::from_secs(1)).await;
+        assert!(matches!(
+            current_lifecycle(&client).await,
+            ModelInstanceLifecycle::Ready { .. }
+        ));
+        assert!(
+            loads.try_recv().is_err(),
+            "the replacement loaded before the resident was quiet for LINGER"
+        );
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let (_, model_id) = loads.recv().await.expect("replacement load");
+        assert_eq!(model_id, "model-b:gguf:test");
+        assert_eq!(tokio::time::Instant::now(), quiet + LINGER);
+        assert!(matches!(
+            replacement.await.expect("replacement task"),
+            Ok(ResidencyGrant::Lease(_))
+        ));
+        assert_eq!(
+            workers.lock().expect("test worker lock")[0]
+                .shutdown
+                .load(Ordering::Acquire),
+            1,
+            "the resident was released gracefully"
+        );
+        actor.abort();
+    }
+
+    /// With nothing using the resident, an inference request for another configuration replaces
+    /// it LINGER after the resident's last grant: the wait counts from the resident's last use,
+    /// not from the request.
+    #[tokio::test(start_paused = true)]
+    async fn a_replacement_happens_after_linger_of_quiet() {
+        let (client, mut loads, workers, actor) =
+            test_residency_with_replacement_wait(LINGER, MAX_WAIT);
+        let ResidencyGrant::Ready(resident) = client
+            .acquire(test_target("model-a"), ResidencyAcquisition::Warm)
+            .await
+            .expect("warm acquisition")
+        else {
+            panic!("warm acquisition returned a lease")
+        };
+        let _ = loads.recv().await.expect("resident load");
+        let granted = tokio::time::Instant::now();
+
+        tokio::time::advance(LINGER / 2).await;
+        let replacement = queued_request(&client, "model-b", inference()).await;
+        tokio::time::advance(LINGER / 2 - Duration::from_secs(1)).await;
+        assert!(matches!(
+            current_lifecycle(&client).await,
+            ModelInstanceLifecycle::Ready { .. }
+        ));
+        assert!(
+            loads.try_recv().is_err(),
+            "the replacement loaded before the resident was quiet for LINGER"
+        );
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let (_, model_id) = loads.recv().await.expect("replacement load");
+        assert_eq!(model_id, "model-b:gguf:test");
+        assert_eq!(tokio::time::Instant::now(), granted + LINGER);
+        assert!(matches!(
+            replacement.await.expect("replacement task"),
+            Ok(ResidencyGrant::Lease(_))
+        ));
+        assert_eq!(
+            lifecycle_of(&client, &resident.id).await,
+            ModelInstanceLifecycle::Stopped {
+                reason: ModelReleaseReason::Replacement
+            }
+        );
+        assert_eq!(
+            workers.lock().expect("test worker lock")[0]
+                .shutdown
+                .load(Ordering::Acquire),
+            1,
+            "the resident was released gracefully"
+        );
+        actor.abort();
+    }
+
+    /// Under constant use the resident is never quiet, so an inference request for another
+    /// configuration waits MAX_WAIT. Then the release begins: new requests for the resident
+    /// queue, and the replacement loads once the last lease drains.
+    #[tokio::test(start_paused = true)]
+    async fn a_replacement_happens_at_max_wait_under_constant_use() {
+        let (client, mut loads, _, actor) = test_residency_with_replacement_wait(LINGER, MAX_WAIT);
+        let mut held = test_lease(&client, "model-a").await;
+        let _ = loads.recv().await.expect("resident load");
+        let replacement = queued_request(&client, "model-b", inference()).await;
+        let queued = tokio::time::Instant::now();
+
+        // A new lease every LINGER / 3, granted before the one it succeeds is released.
+        let interval = LINGER / 3;
+        while tokio::time::Instant::now() + interval < queued + MAX_WAIT {
+            tokio::time::advance(interval).await;
+            let next = test_lease(&client, "model-a").await;
+            drop(std::mem::replace(&mut held, next));
+            assert!(matches!(
+                current_lifecycle(&client).await,
+                ModelInstanceLifecycle::Ready { .. }
+            ));
+            assert!(
+                loads.try_recv().is_err(),
+                "the replacement loaded while the resident was in use"
+            );
+        }
+        tokio::time::advance(
+            queued + MAX_WAIT - tokio::time::Instant::now() - Duration::from_secs(1),
+        )
+        .await;
+        assert!(matches!(
+            current_lifecycle(&client).await,
+            ModelInstanceLifecycle::Ready { .. }
+        ));
+        tokio::time::advance(Duration::from_secs(1)).await;
+        // The actor takes the deadline before the next command.
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        assert!(matches!(
+            current_lifecycle(&client).await,
+            ModelInstanceLifecycle::Stopping {
+                reason: ModelReleaseReason::Replacement,
+                ..
+            }
+        ));
+
+        let late = queued_request(
+            &client,
+            "model-a",
+            ResidencyAcquisition::Inference { progress: None },
+        )
+        .await;
+        assert!(
+            !late.is_finished(),
+            "a request for the released configuration was granted"
+        );
+        assert!(
+            loads.try_recv().is_err(),
+            "the replacement loaded before the last lease drained"
+        );
+
+        drop(held);
+        let (_, model_id) = loads.recv().await.expect("replacement load");
+        assert_eq!(model_id, "model-b:gguf:test");
+        assert_eq!(tokio::time::Instant::now(), queued + MAX_WAIT);
+        assert!(matches!(
+            replacement.await.expect("replacement task"),
+            Ok(ResidencyGrant::Lease(_))
+        ));
+        client.snapshot().await.expect("snapshot");
+        tokio::task::yield_now().await;
+        assert!(
+            !late.is_finished(),
+            "the late request for the released configuration waits behind the replacement"
+        );
+        actor.abort();
+    }
+
+    /// An explicit stop releases the resident at once, however recently it was used and whatever
+    /// waits for it; the queued request loads right after.
+    #[tokio::test(start_paused = true)]
+    async fn a_stop_does_not_wait() {
+        let (client, mut loads, workers, actor) =
+            test_residency_with_replacement_wait(LINGER, MAX_WAIT);
+        let held = test_lease(&client, "model-a").await;
+        let (resident_id, _) = loads.recv().await.expect("resident load");
+        let replacement = queued_request(&client, "model-b", inference()).await;
+        let stopped = tokio::time::Instant::now();
+
+        client.stop(resident_id.clone()).await.expect("ready stop");
+        assert_eq!(
+            lifecycle_of(&client, &resident_id).await,
+            ModelInstanceLifecycle::Stopped {
+                reason: ModelReleaseReason::UserStop
+            }
+        );
+        assert_eq!(
+            workers.lock().expect("test worker lock")[0]
+                .interrupted
+                .load(Ordering::Acquire),
+            1,
+            "the stop interrupted the resident's execution"
+        );
+        let (_, model_id) = loads.recv().await.expect("replacement load");
+        assert_eq!(model_id, "model-b:gguf:test");
+        assert_eq!(tokio::time::Instant::now(), stopped);
+        assert!(matches!(
+            replacement.await.expect("replacement task"),
+            Ok(ResidencyGrant::Lease(_))
+        ));
+        drop(held);
+        actor.abort();
+    }
+
+    /// An explicit load of another configuration begins the resident's replacement at once, as
+    /// a stop begins its release, even while the resident is in use: it waits neither LINGER nor
+    /// MAX_WAIT. The release drains the lease still held, and the load starts when it drops.
+    #[tokio::test(start_paused = true)]
+    async fn an_explicit_load_does_not_wait() {
+        let (client, mut loads, workers, actor) =
+            test_residency_with_replacement_wait(LINGER, MAX_WAIT);
+        let held = test_lease(&client, "model-a").await;
+        let (resident_id, _) = loads.recv().await.expect("resident load");
+        let requested = tokio::time::Instant::now();
+        let replacement = queued_request(&client, "model-b", ResidencyAcquisition::Warm).await;
+
+        assert!(matches!(
+            lifecycle_of(&client, &resident_id).await,
+            ModelInstanceLifecycle::Stopping {
+                reason: ModelReleaseReason::Replacement,
+                ..
+            }
+        ));
+        assert!(
+            loads.try_recv().is_err(),
+            "the replacement loaded before the held lease drained"
+        );
+
+        drop(held);
+        let (_, model_id) = loads.recv().await.expect("replacement load");
+        assert_eq!(model_id, "model-b:gguf:test");
+        assert_eq!(tokio::time::Instant::now(), requested);
+        assert!(matches!(
+            replacement.await.expect("replacement task"),
+            Ok(ResidencyGrant::Ready(_))
+        ));
+        assert_eq!(
+            lifecycle_of(&client, &resident_id).await,
+            ModelInstanceLifecycle::Stopped {
+                reason: ModelReleaseReason::Replacement
+            }
+        );
+        let resident = Arc::clone(&workers.lock().expect("test worker lock")[0]);
+        assert_eq!(
+            (
+                resident.shutdown.load(Ordering::Acquire),
+                resident.interrupted.load(Ordering::Acquire)
+            ),
+            (1, 0),
+            "the resident was released gracefully"
+        );
+        actor.abort();
+    }
+
+    /// A resident quiet for longer than LINGER is replaced at once: the inference request does
+    /// not wait.
+    #[tokio::test(start_paused = true)]
+    async fn an_idle_resident_is_replaced_without_waiting() {
+        let (client, mut loads, _, actor) = test_residency_with_replacement_wait(LINGER, MAX_WAIT);
+        let ResidencyGrant::Ready(resident) = client
+            .acquire(test_target("model-a"), ResidencyAcquisition::Warm)
+            .await
+            .expect("warm acquisition")
+        else {
+            panic!("warm acquisition returned a lease")
+        };
+        let _ = loads.recv().await.expect("resident load");
+
+        tokio::time::advance(LINGER + Duration::from_secs(1)).await;
+        let requested = tokio::time::Instant::now();
+        let replacement = tokio::spawn({
+            let client = client.clone();
+            async move {
+                client
+                    .acquire(test_target("model-b"), inference())
+                    .await
+            }
+        });
+        let (_, model_id) = loads.recv().await.expect("replacement load");
+        assert_eq!(model_id, "model-b:gguf:test");
+        assert_eq!(tokio::time::Instant::now(), requested);
+        assert!(matches!(
+            replacement.await.expect("replacement task"),
+            Ok(ResidencyGrant::Lease(_))
+        ));
+        assert_eq!(
+            lifecycle_of(&client, &resident.id).await,
+            ModelInstanceLifecycle::Stopped {
+                reason: ModelReleaseReason::Replacement
+            }
+        );
+        actor.abort();
     }
 
 }

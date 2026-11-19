@@ -284,6 +284,41 @@ export const createAnthropicMessage = HttpApiEndpoint.post("createAnthropicMessa
     { status: 503 },
   )
 
+export const createCompletion = HttpApiEndpoint.post("createCompletion", "/v1/completions")
+  .setPayload(
+    S.suspend((): S.Schema<Schemas.CompletionRequest, Schemas.CompletionRequestEncoded> => Schemas.CompletionRequest),
+  )
+  .addSuccess(
+    S.suspend(
+      (): S.Schema<Schemas.CompletionResponse, Schemas.CompletionResponseEncoded> => Schemas.CompletionResponse,
+    ),
+    { status: 200 },
+  )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+    { status: 400 },
+  )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+    { status: 404 },
+  )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+    { status: 409 },
+  )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+    { status: 422 },
+  )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+    { status: 500 },
+  )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+    { status: 503 },
+  )
+
 export const ensureModelInstance = HttpApiEndpoint.post("ensureModelInstance", "/api/v1/instances")
   .setPayload(
     S.suspend(
@@ -866,6 +901,35 @@ export const stopModelInstance = HttpApiEndpoint.post("stopModelInstance", "/api
     { status: 500 },
   )
 
+export const tokenize = HttpApiEndpoint.post("tokenize", "/tokenize")
+  .setPayload(
+    S.suspend((): S.Schema<Schemas.TokenizeRequest, Schemas.TokenizeRequestEncoded> => Schemas.TokenizeRequest),
+  )
+  .addSuccess(
+    S.suspend((): S.Schema<Schemas.TokenizeResponse, Schemas.TokenizeResponseEncoded> => Schemas.TokenizeResponse),
+    { status: 200 },
+  )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+    { status: 400 },
+  )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+    { status: 404 },
+  )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+    { status: 409 },
+  )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+    { status: 422 },
+  )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+    { status: 500 },
+  )
+
 export const AnthropicGroup = HttpApiGroup.make("anthropic")
   .add(countAnthropicMessageTokens)
   .add(createAnthropicMessage)
@@ -883,7 +947,7 @@ export const CatalogGroup = HttpApiGroup.make("catalog")
   .add(listCatalogModels)
   .add(removeCatalogModelInstallation)
 
-export const ChatGroup = HttpApiGroup.make("chat").add(applyChatTemplate)
+export const ChatGroup = HttpApiGroup.make("chat").add(applyChatTemplate).add(createCompletion).add(tokenize)
 
 export const DownloadsGroup = HttpApiGroup.make("downloads")
   .add(acknowledgeModelDownloadFailure)

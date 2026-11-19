@@ -13,6 +13,7 @@ pub mod protocol;
 pub mod publication;
 pub mod round_driver;
 pub mod serving;
+pub mod scoring;
 pub mod throughput;
 pub mod worker;
 pub use magnitude_executor::workload;

@@ -42,6 +42,7 @@ use magnitude_service_server::hardware::HardwareInventory;
 use magnitude_service_server::model_store::{ServedStore, ServedVolumes, open_served_store};
 use magnitude_service_server::residency::controller::{ModelInstances, ResidencyEnvironment};
 use magnitude_service_server::residency::worker::run_inference_worker;
+use magnitude_service_server::residency::{LINGER, MAX_WAIT};
 use magnitude_service_server::serving::ServiceModels;
 use magnitude_service_server::worker_process::{WorkerLauncher, install_parent_watchdog};
 use tower::ServiceExt as _;
@@ -99,6 +100,8 @@ impl Served {
             configurations: self.configurations.clone(),
             catalog: self.catalog.clone(),
             idle_timeout,
+            linger: LINGER,
+            max_wait: MAX_WAIT,
             launcher: WorkerLauncher::current().expect("harness executable"),
             device: DeviceLock::default(),
             instance_id_namespace: namespace.to_owned(),

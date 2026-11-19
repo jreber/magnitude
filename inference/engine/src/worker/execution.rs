@@ -8,7 +8,7 @@ use magnitude_executor::ProgramFamily;
 use magnitude_generation::Method;
 use magnitude_scheduler::{
     owner::{AdmissionError, Owner, Ran},
-    protocol::{AdmitRequest, RoomGrant, WorkerCommand, WorkerReply},
+    protocol::{AdmitRequest, RoomGrant, ScoreRequest, WorkerCommand, WorkerReply},
     publication::{ModelUnloadCause, RequestError},
     worker::{Driven, Event, Reread},
 };
@@ -125,6 +125,15 @@ fn unloaded(cause: &UnloadCause) -> AdmissionError {
     }
 }
 
+/// The generation owner does not score: it answers the request's callback
+/// with the refusal and acknowledges the command.
+fn refuse_scoring(request: ScoreRequest) -> WorkerReply {
+    (request.done)(Err(RequestError::Input(
+        "this load serves generation, not scoring".into(),
+    )));
+    WorkerReply::Acknowledged
+}
+
 impl<F: ProgramFamily> Driven for ExecutionOwner<F> {
     type Stopped = UnloadCause;
 
@@ -149,6 +158,7 @@ impl<F: ProgramFamily> Driven for ExecutionOwner<F> {
                     Ok(WorkerReply::AdmissionRefused(unloaded(cause)))
                 }
             },
+            WorkerCommand::Score(request) => Ok(refuse_scoring(request)),
             WorkerCommand::Stop { request } => {
                 if let Execution::Serving(owner) | Execution::Draining(owner, _) =
                     &mut self.execution
@@ -412,5 +422,29 @@ mod tests {
         assert!(measures.experts.is_none(), "a load without a bank prices no experts");
         domain.measure_load(measures, &mut bindings).unwrap();
         assert_eq!(fixtures::group_places_opened((domain, bindings)), 3, "the group holds its chunks' places");
+    }
+
+    use magnitude_executor::TokenId;
+    use std::sync::mpsc;
+
+    #[test]
+    fn the_generation_owner_refuses_scoring_and_acknowledges() {
+        let (sender, receiver) = mpsc::channel();
+        let reply = refuse_scoring(ScoreRequest {
+            tokens: vec![TokenId(1)],
+            top: false,
+            next: false,
+            done: Box::new(move |outcome| sender.send(outcome).unwrap()),
+        });
+        assert!(matches!(reply, WorkerReply::Acknowledged));
+        let error = receiver.try_recv().unwrap().unwrap_err();
+        assert_eq!(
+            error,
+            RequestError::Input("this load serves generation, not scoring".into())
+        );
+        assert!(matches!(
+            crate::error::RequestError::from(error),
+            crate::error::RequestError::InvalidRequest { .. }
+        ));
     }
 }

@@ -1,6 +1,7 @@
 //! Candidate inspection, drafter enumeration, candidate assessment and bundles against a local
 //! stub of the Hugging Face Hub serving synthetic GGUF headers, assessed on the CPU backend.
 
+use magnitude_engine::options::Serve;
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
@@ -4038,7 +4039,7 @@ impl LiveFixture {
                 .expect("serving configuration");
             let resolved = self
                 .configurations
-                .resolve(&configuration)
+                .resolve(&configuration, Serve::Generation)
                 .await
                 .expect("the model resolves for loading");
             magnitude_artifacts::Package::open_manifest(&resolved.manifest.package)

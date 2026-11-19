@@ -16,7 +16,7 @@ use magnitude_engine::composition::{EngineConfiguration, start_in_process};
 use magnitude_engine::invocation::{InvocationSource, SingleEngine};
 use magnitude_engine::options::{
     DraftPolicy, ExecutionManifest, ModelMethod, ModelPolicy, PackageOptions, ProjectorSelection,
-    standard_service_limits,
+    standard_service_limits, Serve,
 };
 use magnitude_engine::telemetry::{DEFAULT_TRACES_ENDPOINT, Telemetry, log_to_stderr};
 use magnitude_engine::worker::transport::stdio_worker_transport;
@@ -25,7 +25,8 @@ use magnitude_executor::platform::{DeviceRequest, ReleaseRate};
 use magnitude_executor::{ExecutionPath, WeightBound, TuningSettings};
 use magnitude_serving::engine::{EngineHost, EngineInvocation};
 use magnitude_serving::{
-    HostChat, LoadProgress, ModelInvocation, ServedModels, Serving, ServingError,
+    HostChat, LoadProgress, ModelInvocation, ModelUnavailable, PromptScore, ServedModels, Serving,
+    ServingError,
 };
 use magnitude_state::KvCodec;
 use serde_json::json;
@@ -265,6 +266,20 @@ impl ServedModels for Standalone {
             Ok(Arc::new(EngineHost::new(invocation.host)) as Arc<dyn HostChat>)
         })
     }
+
+    fn score(
+        &self,
+        _model: &str,
+        _tokens: Vec<u32>,
+        _top: bool,
+        _next: bool,
+    ) -> BoxFuture<'_, Result<PromptScore, ServingError>> {
+        Box::pin(async {
+            Err(ServingError::Model(ModelUnavailable::Unsupported(
+                "the standalone engine does not score; serve scoring through the service".to_owned(),
+            )))
+        })
+    }
 }
 
 /// What `/health` and `/v1/models` report.
@@ -392,6 +407,7 @@ fn run() -> Result<(), String> {
         kernel_cache: options.kernel_cache,
         release,
         model_sha256,
+        serve: Serve::Generation,
     }
     .resolve()
     .map_err(|error| error.to_string())?;

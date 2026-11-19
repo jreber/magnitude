@@ -13,6 +13,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use magnitude_engine::options::Serve;
 use magnitude_engine::worker::Preparation as WorkerPreparation;
 use magnitude_engine::worker::protocol::LoadProgress;
 use magnitude_service_contracts::models::{
@@ -28,15 +29,30 @@ use crate::device_lock::{DeviceHold, DeviceJob, DeviceLock};
 
 type Report = Arc<dyn Fn(CatalogOptimizationProgress) + Send + Sync>;
 
-/// The preparation jobs, one per bundle, running or waiting for the device, and the loads of
+/// What a preparation is for: a bundle loaded for a purpose. Each purpose's Prepare tunes its own
+/// units (a scoring load's differ from a generation load's), so one purpose's preparation never
+/// stands for another's.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct PreparationKey {
+    bundle: ServableModelBundleKey,
+    purpose: Serve,
+}
+
+impl PreparationKey {
+    pub(crate) fn new(bundle: ServableModelBundleKey, purpose: Serve) -> Self {
+        Self { bundle, purpose }
+    }
+}
+
+/// The preparation jobs, one per bundle and purpose, running or waiting for the device, and the loads of
 /// each bundle requested and not yet ended.
 #[derive(Clone, Default)]
 pub(crate) struct PreparationJobs(Arc<Mutex<Preparations>>);
 
 #[derive(Default)]
 struct Preparations {
-    jobs: HashMap<ServableModelBundleKey, PreparationJob>,
-    loads: HashMap<ServableModelBundleKey, usize>,
+    jobs: HashMap<PreparationKey, PreparationJob>,
+    loads: HashMap<PreparationKey, usize>,
 }
 
 /// A job's progress report, its worker while one runs, and what loads of its bundle did:
@@ -54,7 +70,7 @@ struct PreparationJob {
 /// A registered job; dropping it unregisters the job.
 struct PreparationGuard {
     jobs: PreparationJobs,
-    key: ServableModelBundleKey,
+    key: PreparationKey,
     changed: watch::Receiver<()>,
 }
 
@@ -62,14 +78,14 @@ struct PreparationGuard {
 /// to it meanwhile.
 pub(crate) struct LoadRequest {
     jobs: PreparationJobs,
-    key: ServableModelBundleKey,
+    key: PreparationKey,
 }
 
 /// A load's Prepare sequence for a bundle, reported as its job's progress while the job waits.
 /// Dropped without [`LoadPreparation::prepared`], the job waits again.
 pub(crate) struct LoadPreparation {
     jobs: PreparationJobs,
-    key: ServableModelBundleKey,
+    key: PreparationKey,
     progression: OptimizationProgression,
     prepared: bool,
 }
@@ -77,7 +93,7 @@ pub(crate) struct LoadPreparation {
 impl PreparationJobs {
     /// Register a job for `key`, reporting through `report`, unless one already runs or waits
     /// for it.
-    fn register(&self, key: ServableModelBundleKey, report: Report) -> Option<PreparationGuard> {
+    fn register(&self, key: PreparationKey, report: Report) -> Option<PreparationGuard> {
         let mut preparations = self.0.lock().expect("preparation job lock");
         if preparations.jobs.contains_key(&key) {
             return None;
@@ -105,7 +121,7 @@ impl PreparationJobs {
     /// A load of `key` was requested: a job of that bundle leaves the device to it until the
     /// request ends. Taken before the residency releases another model, whose release frees the
     /// device.
-    pub(crate) fn request(&self, key: ServableModelBundleKey) -> LoadRequest {
+    pub(crate) fn request(&self, key: PreparationKey) -> LoadRequest {
         let mut preparations = self.0.lock().expect("preparation job lock");
         *preparations.loads.entry(key.clone()).or_default() += 1;
         if let Some(job) = preparations.jobs.get(&key) {
@@ -118,7 +134,7 @@ impl PreparationJobs {
     }
 
     /// A load of `key` on `device` starts its Prepare sequence.
-    pub(crate) fn load(&self, key: ServableModelBundleKey, device: ModelLoadDevice) -> LoadPreparation {
+    pub(crate) fn load(&self, key: PreparationKey, device: ModelLoadDevice) -> LoadPreparation {
         LoadPreparation {
             jobs: self.clone(),
             key,
@@ -130,7 +146,7 @@ impl PreparationJobs {
     /// `f` on `key`'s job, if one is registered, with whether a load of `key` is requested.
     fn with_job<T>(
         &self,
-        key: &ServableModelBundleKey,
+        key: &PreparationKey,
         f: impl FnOnce(&mut PreparationJob, bool) -> T,
     ) -> Option<T> {
         let mut preparations = self.0.lock().expect("preparation job lock");
@@ -277,7 +293,8 @@ pub(crate) async fn optimize(
     model_id: &ModelId,
     progress: Report,
 ) {
-    let outcome = prepare(environment, jobs, model_id, progress).await;
+    // The catalog optimization tunes what a generation load serves.
+    let outcome = prepare(environment, jobs, model_id, Serve::Generation, progress).await;
     match outcome {
         Ok(Preparation::Prepared) => tracing::info!(%model_id, "installed model optimized"),
         Ok(Preparation::Skipped(reason)) => {
@@ -301,14 +318,15 @@ async fn prepare(
     environment: &ResidencyEnvironment,
     jobs: &PreparationJobs,
     model_id: &ModelId,
+    purpose: Serve,
     progress: Report,
 ) -> Result<Preparation, ModelOperationFailure> {
     let configuration = environment.model_variants.serving_configuration(model_id)?;
-    let key = servable_model_bundle_key_for_bundle(&configuration.bundle);
+    let key = PreparationKey::new(servable_model_bundle_key_for_bundle(&configuration.bundle), purpose);
     let Some(mut job) = jobs.register(key, Arc::clone(&progress)) else {
         return Ok(Preparation::Skipped("the bundle is already being prepared"));
     };
-    let resolved = environment.configurations.resolve(&configuration).await?;
+    let resolved = environment.configurations.resolve(&configuration, purpose).await?;
     // A model this device cannot load has nothing to tune for.
     // Its plan waits for its prices as a load's does, holding nothing of the device.
     let previewed = priced(
@@ -455,8 +473,8 @@ mod tests {
     use super::*;
     use magnitude_service_contracts::{ExecutionBackend, HardwareDeviceId};
 
-    fn bundle(name: &str) -> ServableModelBundleKey {
-        ServableModelBundleKey(name.to_owned())
+    fn bundle(name: &str) -> PreparationKey {
+        PreparationKey::new(ServableModelBundleKey(name.to_owned()), Serve::Generation)
     }
 
     fn metal() -> ModelLoadDevice {
@@ -562,6 +580,27 @@ mod tests {
         drop(share);
         drop(request);
         assert!(device.try_job().is_some(), "the job released the device");
+    }
+
+    /// A scoring load tunes its own units: when it has prepared the bundle, the bundle's
+    /// generation job is not done, and still takes the device.
+    #[tokio::test]
+    async fn a_scoring_load_that_prepared_the_bundle_does_not_end_its_generation_job() {
+        let device = DeviceLock::default();
+        let jobs = PreparationJobs::default();
+        let reports = Reports::default();
+        let mut job = register(&jobs, &reports);
+        let mut load = jobs.load(
+            PreparationKey::new(ServableModelBundleKey("downloaded".to_owned()), Serve::Scoring),
+            metal(),
+        );
+        load.report(tuning(3, 10));
+        assert_eq!(reports.last(), None, "the scoring load reports for no generation job");
+        load.prepared();
+        assert!(
+            take_device(&device, &mut job).await.is_some(),
+            "the generation job still has its own tuning to do"
+        );
     }
 
     /// A load of the job's own model whose Prepare did not finish leaves the job pending: it
