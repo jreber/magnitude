@@ -15,6 +15,7 @@ use super::{
         AvailabilityEpoch, Operation as ScheduledOperation, Phase, Scheduler, Selection,
         ServiceLimits, Victim, order_victims,
     },
+    memory_condition::{MemoryCondition, MemoryObservation, ObservationCadence},
     prefix_cache::{
         CachedPrefixKeyInfo, CachePoint, MIN_BRANCH_GAIN, MIN_PREFIX_HIT, PrefixCache,
         PrefixCacheCapacity, PrefixPath, PrefixRetention,
@@ -475,6 +476,14 @@ enum Start {
     Returned(Request),
 }
 
+/// The failure a request reports for a domain error: every execution owner
+/// classifies them alike.
+impl From<DomainError> for RequestError {
+    fn from(error: DomainError) -> Self {
+        classify_domain_error(error)
+    }
+}
+
 fn classify_domain_error(error: DomainError) -> RequestError {
     match error {
         DomainError::Capacity(error) => RequestError::Capacity(ServiceCapacityError {
@@ -506,8 +515,9 @@ fn classify_domain_error(error: DomainError) -> RequestError {
     }
 }
 
-/// Whether a domain error stops execution rather than one request.
-fn is_fatal(error: &DomainError) -> bool {
+/// Whether a domain error stops execution rather than one request: every
+/// execution owner stops on the same errors.
+pub fn is_fatal(error: &DomainError) -> bool {
     matches!(
         error,
         DomainError::Device(_)
@@ -600,74 +610,6 @@ pub struct Ran {
     pub unload: bool,
 }
 
-/// How long Reclaim may persist after releases are exhausted, and how long
-/// observations may fail continuously, before the model unloads.
-const MEMORY_ESCALATION_NS: u64 = 1_000_000_000;
-
-/// How often the owner observes memory without another reason to run.
-const OBSERVATION_INTERVAL_NS: u64 = 100_000_000;
-
-/// One probe of every domain the loaded model uses.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum MemoryObservation {
-    /// Every domain's headroom is above its planning reserve.
-    Normal,
-    /// Some domain's headroom is at or below its planning reserve.
-    Reclaim,
-    /// A required observation failed.
-    Blind,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum MemoryCondition {
-    Normal,
-    /// Admission and growth pause while releases run. `since` starts the
-    /// unload clock: when the band was entered, restarted whenever a release
-    /// frees memory, so the model unloads once Reclaim persists for
-    /// [`MEMORY_ESCALATION_NS`] after releases are exhausted.
-    Reclaim {
-        since: u64,
-    },
-    /// Observations have failed continuously since `since`.
-    Blind {
-        since: u64,
-    },
-}
-
-impl MemoryCondition {
-    fn observe(self, observation: MemoryObservation, now: u64) -> Self {
-        match observation {
-            MemoryObservation::Normal => Self::Normal,
-            MemoryObservation::Reclaim => match self {
-                Self::Reclaim { since } => Self::Reclaim { since },
-                _ => Self::Reclaim { since: now },
-            },
-            MemoryObservation::Blind => match self {
-                // One continuous escalation interval of Blind is Reclaim
-                // whose unload clock has already expired.
-                Self::Blind { since } if now.saturating_sub(since) >= MEMORY_ESCALATION_NS => {
-                    Self::Reclaim { since }
-                }
-                Self::Blind { since } => Self::Blind { since },
-                Self::Reclaim { since } => Self::Reclaim { since },
-                Self::Normal => Self::Blind { since: now },
-            },
-        }
-    }
-
-    /// A release freed memory at `now`: releases are not exhausted yet.
-    fn released(self, now: u64) -> Self {
-        match self {
-            Self::Reclaim { .. } => Self::Reclaim { since: now },
-            other => other,
-        }
-    }
-
-    fn should_unload(self, now: u64) -> bool {
-        matches!(self, Self::Reclaim { since } if now.saturating_sub(since) >= MEMORY_ESCALATION_NS)
-    }
-}
-
 struct ActiveGroup<F: ProgramFamily> {
     flight: DomainFlight<F>,
     operations: Vec<Operation>,
@@ -724,7 +666,7 @@ struct Service<F: ProgramFamily> {
     /// Reclaim was observed while a flight held the bindings; its releases
     /// run once they return.
     release_owed: bool,
-    next_observation: u64,
+    observations: ObservationCadence,
     wakes: Arc<dyn Wakes>,
     throughput: ThroughputAccumulator,
     cold_tier: Option<Rc<RefCell<ColdTier>>>,
@@ -785,7 +727,7 @@ impl<F: ProgramFamily> Owner<F> {
             memory_condition: MemoryCondition::Normal,
             memory_deficits: Vec::new(),
             release_owed: false,
-            next_observation: 0,
+            observations: ObservationCadence::default(),
             wakes,
             throughput: ThroughputAccumulator::new(),
             cold_tier,
@@ -1508,7 +1450,7 @@ impl<F: ProgramFamily> Service<F> {
 
     fn ran(&self, in_flight: bool, unload: bool) -> Ran {
         Ran {
-            due: self.next_observation,
+            due: self.observations.next(),
             in_flight,
             unload,
         }
@@ -1519,9 +1461,8 @@ impl<F: ProgramFamily> Service<F> {
     /// memory escalation decided to unload, after terminating every request.
     fn observe(&mut self, bindings: Option<&mut StateBindings<F>>) -> Result<bool, RequestError> {
         let memory = |error: String| invariant("memory observation")(error);
-        if self.now >= self.next_observation {
-            self.next_observation = self.now.saturating_add(OBSERVATION_INTERVAL_NS);
-            let observation = memory_observation(self.domain.probe_memory()).map_err(memory)?;
+        if self.observations.take(self.now) {
+            let observation = MemoryObservation::of(self.domain.probe_memory()).map_err(memory)?;
             self.enter_memory_condition(self.memory_condition.observe(observation, self.now));
             if !matches!(self.memory_condition, MemoryCondition::Reclaim { .. }) {
                 self.release_owed = false;
@@ -1539,7 +1480,7 @@ impl<F: ProgramFamily> Service<F> {
             self.release_owed = false;
             if self.release_for_reclaim(bindings)? {
                 self.memory_condition = self.memory_condition.released(self.now);
-                let after = memory_observation(self.domain.probe_memory()).map_err(memory)?;
+                let after = MemoryObservation::of(self.domain.probe_memory()).map_err(memory)?;
                 self.enter_memory_condition(self.memory_condition.observe(after, self.now));
             }
         }
@@ -1652,7 +1593,7 @@ impl<F: ProgramFamily> Service<F> {
     /// Whether a fresh reading is still in the Reclaim band. A failed reading
     /// cannot measure a release, so it stops releasing.
     fn reclaim_needed(&mut self) -> Result<bool, RequestError> {
-        Ok(memory_observation(self.domain.probe_memory())
+        Ok(MemoryObservation::of(self.domain.probe_memory())
             .map_err(invariant("memory observation"))?
             == MemoryObservation::Reclaim)
     }
@@ -3519,15 +3460,6 @@ enum Residency {
     Waiting(Generation, Wait),
 }
 
-fn memory_observation(result: Result<(), DomainError>) -> Result<MemoryObservation, String> {
-    match result {
-        Ok(()) => Ok(MemoryObservation::Normal),
-        Err(DomainError::Reclaim) => Ok(MemoryObservation::Reclaim),
-        Err(DomainError::Blind(_)) => Ok(MemoryObservation::Blind),
-        Err(error) => Err(error.to_string()),
-    }
-}
-
 #[cfg(test)]
 mod branch_plan_tests {
     use super::{
@@ -3619,64 +3551,6 @@ mod branch_plan_tests {
             branches,
             BTreeSet::from([3000, 5800, 5800 + MIN_BRANCH_GAIN])
         );
-    }
-}
-
-#[cfg(test)]
-mod memory_condition_tests {
-    use super::{MEMORY_ESCALATION_NS, MemoryCondition, MemoryObservation};
-
-    #[test]
-    fn continuous_blind_escalates_to_immediately_eligible_reclaim() {
-        let blind = MemoryCondition::Normal.observe(MemoryObservation::Blind, 7);
-        assert_eq!(blind, MemoryCondition::Blind { since: 7 });
-        let before = blind.observe(MemoryObservation::Blind, 7 + MEMORY_ESCALATION_NS - 1);
-        assert_eq!(before, blind);
-        assert!(!before.should_unload(7 + MEMORY_ESCALATION_NS - 1));
-        let escalated = before.observe(MemoryObservation::Blind, 7 + MEMORY_ESCALATION_NS);
-        assert_eq!(escalated, MemoryCondition::Reclaim { since: 7 });
-        assert!(escalated.should_unload(7 + MEMORY_ESCALATION_NS));
-    }
-
-    #[test]
-    fn interrupted_blind_restarts_its_interval() {
-        let blind = MemoryCondition::Normal.observe(MemoryObservation::Blind, 7);
-        let normal = blind.observe(MemoryObservation::Normal, 8);
-        assert_eq!(normal, MemoryCondition::Normal);
-        let renewed = normal.observe(MemoryObservation::Blind, 7 + MEMORY_ESCALATION_NS);
-        assert_eq!(
-            renewed,
-            MemoryCondition::Blind {
-                since: 7 + MEMORY_ESCALATION_NS
-            }
-        );
-        assert!(!renewed.should_unload(7 + MEMORY_ESCALATION_NS));
-    }
-
-    #[test]
-    fn reclaim_unloads_one_interval_after_releases_are_exhausted() {
-        let reclaim = MemoryCondition::Normal.observe(MemoryObservation::Reclaim, 5);
-        assert_eq!(reclaim, MemoryCondition::Reclaim { since: 5 });
-        // Continued Reclaim keeps the clock; a release that frees memory
-        // restarts it.
-        assert_eq!(reclaim.observe(MemoryObservation::Reclaim, 9), reclaim);
-        let released = reclaim.released(100);
-        assert_eq!(released, MemoryCondition::Reclaim { since: 100 });
-        assert!(!released.should_unload(100 + MEMORY_ESCALATION_NS - 1));
-        assert!(released.should_unload(100 + MEMORY_ESCALATION_NS));
-        // A failed reading during Reclaim neither resets nor extends it.
-        assert_eq!(released.observe(MemoryObservation::Blind, 200), released);
-    }
-
-    #[test]
-    fn recovery_clears_reclaim_and_a_new_episode_starts_fresh() {
-        let reclaim = MemoryCondition::Normal.observe(MemoryObservation::Reclaim, 5);
-        let normal = reclaim.observe(MemoryObservation::Normal, 10);
-        assert_eq!(normal, MemoryCondition::Normal);
-        assert!(!normal.should_unload(10 + MEMORY_ESCALATION_NS));
-        assert_eq!(normal.released(11), MemoryCondition::Normal);
-        let renewed = normal.observe(MemoryObservation::Reclaim, 11);
-        assert_eq!(renewed, MemoryCondition::Reclaim { since: 11 });
     }
 }
 

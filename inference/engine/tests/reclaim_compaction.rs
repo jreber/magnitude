@@ -12,7 +12,7 @@
 use magnitude_engine::{
     build_native_domain,
     composition::EngineConfiguration,
-    options::{ModelMethod, ModelPolicy, PackageOptions, ProjectorSelection},
+    options::{ModelMethod, ModelPolicy, PackageOptions, ProjectorSelection, Serve},
 };
 use magnitude_executor::{
     platform::{DeviceRequest, MemoryReserves},
@@ -59,6 +59,7 @@ fn domain() -> (ExecutorDomain, StateBindings, usize, usize, usize) {
         kernel_cache: std::env::var_os("MAGNITUDE_TEST_KERNEL_CACHE").map(PathBuf::from),
         reserves: MemoryReserves::standard(),
         model_sha256: None,
+        serve: Serve::Generation,
     }
     .resolve()
     .unwrap();

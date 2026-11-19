@@ -127,7 +127,7 @@ fn planner_inputs(
 
 /// The resource limits a load of this manifest plans for, encoding images of
 /// at most `image_cells` cells.
-fn resource_limits(
+pub(crate) fn resource_limits(
     service: &ServiceLimits,
     model: &ResolvedModelPolicy,
     image_cells: usize,

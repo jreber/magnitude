@@ -20,7 +20,7 @@ use crate::error::{
 };
 use crate::fingerprint::ModelFingerprint;
 use crate::host::{bind_draft, interpret_target, vocabulary_mismatch, InterpretedTarget};
-use crate::options::{ExecutionManifest, ModelMethod, ModelPolicy, ResolvedMethod};
+use crate::options::{ExecutionManifest, ModelMethod, ModelPolicy, ResolvedMethod, Serve};
 use crate::planning::{plan_backend, plan_execution, ExecutionPlanningError};
 use magnitude_artifacts::{
     gguf::{Directory, FileHeaders, HeaderSource, TensorDescriptor},
@@ -697,6 +697,8 @@ impl Environment<'_> {
             self.service.clone(),
             ExecutionPath::Native,
             self.device,
+            // Assessment plans a serving profile: a generation load.
+            Serve::Generation,
             None,
             self.reserves,
         )

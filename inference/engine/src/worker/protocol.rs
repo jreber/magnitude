@@ -19,7 +19,9 @@ use magnitude_chat::ConstraintPlan;
 use magnitude_executor::UnpreparedUnits;
 use magnitude_family_contracts::PreparedModelInput;
 use magnitude_generation::{DetailedUsage, FinishReason, Options, OutputToken};
+use magnitude_executor::TokenId;
 use magnitude_scheduler::prefix_cache::PrefixRetention;
+use magnitude_scheduler::scoring::ScoreOutcome;
 use seismic::measure::Record;
 use seismic::{PointKey, StoreIdentity};
 use serde::{Deserialize, Serialize};
@@ -109,6 +111,14 @@ pub enum HostMessage {
     },
     Status {
         request_id: HostRequestId,
+    },
+    /// Teacher-forced scoring of `tokens` (see `ScoreRequest`); answered
+    /// with `Scored` or `ScoreFailed`.
+    Score {
+        request_id: HostRequestId,
+        tokens: Vec<TokenId>,
+        top: bool,
+        next: bool,
     },
     Observe,
     Throughput,
@@ -264,6 +274,14 @@ pub enum WorkerMessage {
         timings: ExecutionTimings,
     },
     Failed { request_id: HostRequestId, error: RequestError },
+    Scored {
+        request_id: HostRequestId,
+        outcome: ScoreOutcome,
+    },
+    ScoreFailed {
+        request_id: HostRequestId,
+        error: RequestError,
+    },
     /// `None` when the request is not live in the worker.
     Status {
         request_id: HostRequestId,
@@ -349,6 +367,64 @@ mod tests {
         assert_eq!(round_trip(&refusal), refusal);
         let modalities = InputModalities { image: true };
         assert_eq!(round_trip(&modalities), modalities);
+    }
+
+    #[test]
+    fn score_messages_round_trip_through_the_worker_encoding() {
+        use magnitude_scheduler::scoring::{ScoredPosition, TopToken};
+        let HostMessage::Score {
+            request_id,
+            tokens,
+            top,
+            next,
+        } = round_trip(&HostMessage::Score {
+            request_id: HostRequestId(7),
+            tokens: vec![TokenId(3), TokenId(9)],
+            top: true,
+            next: false,
+        })
+        else {
+            panic!("score request changed shape")
+        };
+        assert_eq!(request_id, HostRequestId(7));
+        assert_eq!(tokens, vec![TokenId(3), TokenId(9)]);
+        assert!(top && !next);
+        let outcome = ScoreOutcome {
+            positions: vec![ScoredPosition {
+                logprob: -1.5,
+                rank: 2,
+                top: Some(TopToken {
+                    token: TokenId(4),
+                    logprob: -0.25,
+                }),
+            }],
+            next: Some(TokenId(5)),
+        };
+        let WorkerMessage::Scored {
+            request_id,
+            outcome: decoded,
+        } = round_trip(&WorkerMessage::Scored {
+            request_id: HostRequestId(7),
+            outcome: outcome.clone(),
+        })
+        else {
+            panic!("score outcome changed shape")
+        };
+        assert_eq!(request_id, HostRequestId(7));
+        assert_eq!(decoded, outcome);
+        let error = RequestError::Internal { reason: "no".into() };
+        let WorkerMessage::ScoreFailed {
+            request_id,
+            error: decoded,
+        } = round_trip(&WorkerMessage::ScoreFailed {
+            request_id: HostRequestId(8),
+            error: error.clone(),
+        })
+        else {
+            panic!("score failure changed shape")
+        };
+        assert_eq!(request_id, HostRequestId(8));
+        assert_eq!(decoded, error);
     }
 
     #[test]

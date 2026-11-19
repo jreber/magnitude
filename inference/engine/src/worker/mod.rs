@@ -18,6 +18,7 @@ mod execution;
 pub mod measure;
 mod preparation;
 pub mod protocol;
+mod scoring;
 mod session;
 pub mod transport;
 
@@ -29,12 +30,14 @@ pub use preparation::{
     load_prepared, prepare, start_worker_process, ChildTransport, Preparation, WorkerProcess,
     WorkerReport,
 };
+// What `EngineClient::score` returns.
+pub use magnitude_scheduler::scoring::{ScoreOutcome, ScoredPosition, TopToken};
 
 use crate::census::AllocationCensus;
 use crate::execution::LoadAttempt;
 use magnitude_executor::UnpreparedUnits;
 use crate::error::{ArtifactError, LoadError, UnloadCause};
-use crate::options::{ExecutionManifest, InputModalities, ReadyInfo, ResourcePlanSummary};
+use crate::options::{ExecutionManifest, InputModalities, ReadyInfo, ResourcePlanSummary, Serve};
 use execution::ExecutionOwner;
 use magnitude_artifacts::Package;
 use magnitude_chat::{
@@ -48,6 +51,7 @@ use magnitude_scheduler::{
     worker::{Driven, SpawnError, Wakes, Worker, WorkerWakeHandle},
 };
 use protocol::{EngineBuild, HostMessage, WorkerMessage};
+use scoring::ScoringOwner;
 use session::{Loaded, Outbound, Session, Signal};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
@@ -260,8 +264,9 @@ struct ChatIdentity {
     modalities: InputModalities,
 }
 
-/// Build the execution owner on its own thread while this thread prepares
-/// the worker's tokenizer, constraint vocabulary and chat identity.
+/// Build the execution owner of the manifest's purpose on its own thread
+/// while this thread prepares the worker's tokenizer, constraint vocabulary
+/// and chat identity.
 fn load(
     manifest: ExecutionManifest,
     unprepared: UnpreparedUnits,
@@ -322,10 +327,6 @@ fn load(
             LoadAttempt::Loaded(built) => built,
             LoadAttempt::Unprepared => return Err(Stopped::Unprepared),
         };
-        let method = manifest
-            .model
-            .factory(&manifest.package.identity.to_string())
-            .map_err(internal)?;
         if built.domain.execution_path() != manifest.path {
             return Err(
                 internal("executor domain differs from the planned execution path").into(),
@@ -334,29 +335,51 @@ fn load(
         let backend = built.domain.execution_backend();
         let host_table_bytes = built.domain.host_table_bytes();
         let resources = ResourcePlanSummary::from_plan(&built.plan).map_err(internal)?;
-        // The identity the host resolved onto the manifest; `None` keys no
-        // disk state, and an identity that no longer parses disables the
-        // tier with a warning rather than failing the load.
-        let cold_identity = match manifest.state_cache_identity.as_deref() {
-            None => None,
-            Some(hex) => EntryKey::from_hex(hex).map(|key| key.bytes()).or_else(|| {
-                tracing::warn!("invalid state-cache identity {hex}; SSD state cache disabled");
-                None
-            }),
+        // The owner of the load's purpose, and the charge it reconciles at
+        // readiness.
+        let (owner, charge): (Box<dyn Driven<Stopped = UnloadCause>>, _) = match manifest.serve {
+            Serve::Generation => {
+                let method = manifest
+                    .model
+                    .factory(&manifest.package.identity.to_string())
+                    .map_err(internal)?;
+                // The identity the host resolved onto the manifest; `None`
+                // keys no disk state, and an identity that no longer parses
+                // disables the tier with a warning rather than failing the
+                // load.
+                let cold_identity = match manifest.state_cache_identity.as_deref() {
+                    None => None,
+                    Some(hex) => EntryKey::from_hex(hex).map(|key| key.bytes()).or_else(|| {
+                        tracing::warn!(
+                            "invalid state-cache identity {hex}; SSD state cache disabled"
+                        );
+                        None
+                    }),
+                };
+                let owner = Owner::with_resource_plan(
+                    built.domain,
+                    built.bindings,
+                    manifest.service.clone(),
+                    &built.plan,
+                    Arc::new(wakes) as Arc<dyn Wakes>,
+                    cold_identity,
+                    manifest.state_cache.clone(),
+                    manifest.state_cache_budget_bytes,
+                )
+                .map_err(internal)?;
+                let charge = owner.reconcile_memory_charge();
+                (Box::new(ExecutionOwner::new(owner, method)), charge)
+            }
+            Serve::Scoring => {
+                // A scoring load retains no prefix: the domain's own census
+                // over its live states is the whole charge.
+                let charge = built.domain.reconcile_memory_charge(&[]);
+                let owner = ScoringOwner::new(built.domain, built.bindings, &manifest.definition)
+                    .map_err(internal)?;
+                (Box::new(owner), charge)
+            }
         };
-        let owner = Owner::with_resource_plan(
-            built.domain,
-            built.bindings,
-            manifest.service.clone(),
-            &built.plan,
-            Arc::new(wakes) as Arc<dyn Wakes>,
-            cold_identity,
-            manifest.state_cache.clone(),
-            manifest.state_cache_budget_bytes,
-        )
-        .map_err(internal)?;
-        let census = owner
-            .reconcile_memory_charge()
+        let census = charge
             .and_then(|charge| AllocationCensus::classify(&charge, host_table_bytes))
             .map_err(internal)?;
         let ready = ExecutionReady {
@@ -365,10 +388,7 @@ fn load(
             backend,
             census,
         };
-        Ok((
-            Box::new(ExecutionOwner::new(owner, method)) as Box<dyn Driven<Stopped = UnloadCause>>,
-            (ready, host_table_bytes),
-        ))
+        Ok((owner, (ready, host_table_bytes)))
     };
     let host = move || -> Result<(GenerationBinding, ChatIdentity), Stopped> {
         use crate::error::UnsupportedModel;

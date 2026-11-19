@@ -36,6 +36,30 @@ pub fn standard_service_limits() -> ServiceLimits {
 /// serves one conversation, so its speed is that conversation's.
 pub const PROFILE_SEQUENCES: u32 = 1;
 
+/// What a load serves: generation, or teacher-forced scoring of given
+/// tokens. A worker runs the execution owner of its manifest's purpose, and
+/// refuses the other purpose's requests.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum Serve {
+    #[default]
+    Generation,
+    Scoring,
+}
+
+// S and W are to be set from measurement (rows per second at several W,
+// against the scoring load's memory). Every step selects at each of its
+// S·W rows, and the selection bound is the decode allowance, which
+// `ServiceLimits::validate` caps at 256: raising S·W past 256 means lifting
+// that cap.
+
+/// The scores a scoring load walks at once; the rest wait in arrival order.
+pub const SCORING_SEQUENCES: usize = 8;
+
+/// The rows of each walk one scoring step forwards.
+pub const SCORING_WIDTH: usize = 32;
+
+const _: () = assert!(SCORING_SEQUENCES * SCORING_WIDTH <= 256);
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ProjectorSelection {
     Discover,
@@ -317,6 +341,8 @@ pub struct ExecutionManifest {
     pub service: ServiceLimits,
     pub path: ExecutionPath,
     pub device: DeviceRequest,
+    /// What the load serves: the execution owner its worker runs.
+    pub serve: Serve,
     /// The kernel cache directory the host names; `None` caches nothing.
     pub kernel_cache: Option<PathBuf>,
     /// The model package's SHA-256 content hash, when the host names one;
@@ -497,6 +523,7 @@ impl ExecutionManifest {
         service: ServiceLimits,
         path: ExecutionPath,
         device: DeviceRequest,
+        serve: Serve,
         kernel_cache: Option<PathBuf>,
         reserves: MemoryReserves,
     ) -> Result<Self, String> {
@@ -513,6 +540,7 @@ impl ExecutionManifest {
             service,
             path,
             device,
+            serve,
             kernel_cache,
             model_sha256: None,
             state_cache: None,
@@ -695,7 +723,7 @@ pub(crate) mod tests {
         }
     }
 
-    fn definition(with_head: bool) -> ModelDefinition {
+    pub(crate) fn definition(with_head: bool) -> ModelDefinition {
         let head = with_head.then(|| Head {
             blocks: vec![HeadBlock {
                 residual: magnitude_family_contracts::ResidualForm::Single,
@@ -1037,9 +1065,13 @@ pub(crate) mod tests {
     /// arrives unchanged.
     #[test]
     fn execution_manifest_round_trips_through_the_worker_encoding() {
-        let manifest = manifest_with_kernel_cache(Some(PathBuf::from("/cache/kernels")));
+        let manifest = ExecutionManifest {
+            serve: Serve::Scoring,
+            ..manifest_with_kernel_cache(Some(PathBuf::from("/cache/kernels")))
+        };
         let encoded = postcard::to_allocvec(&manifest).unwrap();
         let decoded: ExecutionManifest = postcard::from_bytes(&encoded).unwrap();
+        assert_eq!(decoded.serve, Serve::Scoring);
         assert_eq!(decoded.package, manifest.package);
         assert_eq!(decoded.definition, manifest.definition);
         assert_eq!(decoded.model, manifest.model);
@@ -1100,6 +1132,7 @@ pub(crate) mod tests {
             standard_service_limits(),
             ExecutionPath::Native,
             "metal:00000001000004a5".parse().unwrap(),
+            Serve::Generation,
             kernel_cache,
             MemoryReserves::standard(),
         )

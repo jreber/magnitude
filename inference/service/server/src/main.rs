@@ -31,6 +31,7 @@ use magnitude_service_server::residency::controller::{
 };
 use magnitude_service_server::residency::supervisor::SeismicHostMemory;
 use magnitude_service_server::residency::worker::run_inference_worker;
+use magnitude_service_server::residency::{LINGER, MAX_WAIT};
 use magnitude_service_server::serving::ServiceModels;
 use magnitude_service_server::worker_process::{self, WorkerLauncher};
 use tower_http::trace::{DefaultOnResponse, TraceLayer};
@@ -238,6 +239,8 @@ async fn run(command: Command) -> anyhow::Result<()> {
                 catalog: catalog.clone(),
                 reserves,
                 idle_timeout: MODEL_IDLE_TIMEOUT,
+                linger: LINGER,
+                max_wait: MAX_WAIT,
                 launcher: worker_launcher,
                 device,
                 instance_id_namespace: instance_id.clone(),

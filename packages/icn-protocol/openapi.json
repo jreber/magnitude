@@ -2216,6 +2216,86 @@
         }
       }
     },
+    "/tokenize": {
+      "post": {
+        "tags": [
+          "chat"
+        ],
+        "operationId": "tokenize",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TokenizeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The token ids the prompt or conversation encodes to",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TokenizeResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Requested model is unavailable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Installed model cannot be resolved for serving",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Installed model failed integrity validation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Tokenization failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/chat/completions": {
       "post": {
         "tags": [
@@ -2336,6 +2416,96 @@
           },
           "reconnect": {
             "type": "none"
+          }
+        }
+      }
+    },
+    "/v1/completions": {
+      "post": {
+        "tags": [
+          "chat"
+        ],
+        "operationId": "createCompletion",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CompletionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Teacher-forced prompt log-probabilities in vLLM's shape",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CompletionResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Requested model is unavailable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Runtime model cannot be admitted, or the source cannot score it",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Runtime target failed validation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Runtime load or scoring failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Memory or request capacity is temporarily unavailable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
           }
         }
       }
@@ -4534,6 +4704,47 @@
         },
         "additionalProperties": false
       },
+      "CompletionChoice": {
+        "type": "object",
+        "required": [
+          "index",
+          "text",
+          "finish_reason",
+          "prompt_logprobs"
+        ],
+        "properties": {
+          "index": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "text": {
+            "type": "string",
+            "description": "The greedy next token when `max_tokens` is 1, else empty."
+          },
+          "logprobs": {},
+          "finish_reason": {
+            "type": "string"
+          },
+          "prompt_logprobs": {
+            "type": "array",
+            "items": {
+              "type": [
+                "object",
+                "null"
+              ],
+              "additionalProperties": {
+                "$ref": "#/components/schemas/PromptLogprob"
+              },
+              "propertyNames": {
+                "type": "string"
+              }
+            },
+            "description": "Position 0 is null; each later position maps token ids, as decimal\nstrings, to their scores."
+          }
+        },
+        "additionalProperties": false
+      },
       "CompletionFunctionCall": {
         "type": "object",
         "required": [
@@ -4546,6 +4757,82 @@
           },
           "arguments": {
             "type": "string"
+          }
+        },
+        "additionalProperties": false
+      },
+      "CompletionRequest": {
+        "type": "object",
+        "description": "Scoring only. Every field outside these is refused.",
+        "required": [
+          "model",
+          "prompt"
+        ],
+        "properties": {
+          "model": {
+            "type": "string"
+          },
+          "prompt": {
+            "type": "string",
+            "description": "One prompt string; it is tokenized as `/tokenize`'s plain form with\n`add_special_tokens: true`."
+          },
+          "prompt_logprobs": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Required. 0 scores the prompt's own tokens; 1 also reports the top-1\ntoken at each position where it differs.",
+            "minimum": 0
+          },
+          "max_tokens": {
+            "type": "integer",
+            "format": "int32",
+            "description": "0 (default) or 1; 1 also returns the greedy next token.",
+            "minimum": 0
+          },
+          "temperature": {
+            "type": "number",
+            "format": "double",
+            "description": "Must be 0 when given, and is required when `max_tokens` is 1."
+          },
+          "echo": {
+            "type": "boolean",
+            "description": "Must be false when given."
+          }
+        },
+        "additionalProperties": false
+      },
+      "CompletionResponse": {
+        "type": "object",
+        "required": [
+          "id",
+          "object",
+          "created",
+          "model",
+          "choices",
+          "usage"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "object": {
+            "type": "string"
+          },
+          "created": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "model": {
+            "type": "string"
+          },
+          "choices": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CompletionChoice"
+            }
+          },
+          "usage": {
+            "$ref": "#/components/schemas/CompletionUsage"
           }
         },
         "additionalProperties": false
@@ -4566,6 +4853,32 @@
           },
           "function": {
             "$ref": "#/components/schemas/CompletionFunctionCall"
+          }
+        },
+        "additionalProperties": false
+      },
+      "CompletionUsage": {
+        "type": "object",
+        "required": [
+          "prompt_tokens",
+          "completion_tokens",
+          "total_tokens"
+        ],
+        "properties": {
+          "prompt_tokens": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "completion_tokens": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "total_tokens": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
           }
         },
         "additionalProperties": false
@@ -9778,6 +10091,30 @@
         ],
         "description": "Whether the engine binds a model's projector. `None` means the model has no projector; a\n`Rejected` projector leaves the model assessed and served without it, taking text input only."
       },
+      "PromptLogprob": {
+        "type": "object",
+        "description": "A scored token: the real one, or the top-1 token at a position.",
+        "required": [
+          "logprob",
+          "rank",
+          "decoded_token"
+        ],
+        "properties": {
+          "logprob": {
+            "type": "number",
+            "format": "double"
+          },
+          "rank": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "decoded_token": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      },
       "PromptTokensDetails": {
         "type": "object",
         "required": [
@@ -11562,6 +11899,77 @@
             "type": "integer",
             "format": "int64",
             "minimum": 0
+          }
+        },
+        "additionalProperties": false
+      },
+      "TokenizeRequest": {
+        "type": "object",
+        "description": "Either `prompt` (plain) or `messages` (chat), never both.",
+        "required": [
+          "model"
+        ],
+        "properties": {
+          "model": {
+            "type": "string"
+          },
+          "prompt": {
+            "type": "string",
+            "description": "Plain form: the text to encode. Special-token text is encoded as\nspecial tokens."
+          },
+          "messages": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ChatMessageRequest"
+            },
+            "description": "Chat form: the conversation, rendered with the model's chat template."
+          },
+          "add_generation_prompt": {
+            "type": "boolean",
+            "description": "Chat form only; defaults to true."
+          },
+          "add_special_tokens": {
+            "type": "boolean",
+            "description": "Whether the tokenizer adds its own special tokens. Defaults to true for\nthe plain form and false for the chat form."
+          },
+          "chat_template_kwargs": {
+            "type": "object",
+            "description": "Chat form only.",
+            "additionalProperties": {
+              "$ref": "#/components/schemas/Value"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          }
+        },
+        "additionalProperties": false
+      },
+      "TokenizeResponse": {
+        "type": "object",
+        "required": [
+          "count",
+          "max_model_len",
+          "tokens"
+        ],
+        "properties": {
+          "count": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "max_model_len": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "tokens": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
           }
         },
         "additionalProperties": false

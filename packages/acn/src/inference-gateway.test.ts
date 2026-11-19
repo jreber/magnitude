@@ -718,6 +718,44 @@ describe("Codex WebSocket gateway", () => {
   })
 })
 
+describe("OpenAI-compatible inference proxy", () => {
+  test("forwards vLLM's root tokenize endpoint beside /v1", async () => {
+    let forwarded: Request | undefined
+    const body = '{"model":"m","prompt":"<|im_start|>user\\nping","add_special_tokens":false}'
+    const response = await proxyOpenAiInferenceRequest(
+      new Request("http://127.0.0.1:10100/inference/tokenize", {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: "Bearer caller" },
+        body,
+      }),
+      icn,
+      async (input, init) => {
+        forwarded = new Request(input, init)
+        return new Response('{"tokens":[1,2]}', { headers: { "content-type": "application/json" } })
+      },
+    )
+    expect(forwarded?.url).toBe("http://127.0.0.1:9999/tokenize")
+    expect(forwarded?.method).toBe("POST")
+    expect(await forwarded?.text()).toBe(body)
+    expect(forwarded?.headers.get("authorization")).toBe("Bearer private-icn-token")
+    expect(await response.json()).toEqual({ tokens: [1, 2] })
+  })
+
+  test("refuses other root paths without reaching the engine", async () => {
+    let reached = false
+    const response = await proxyOpenAiInferenceRequest(
+      new Request("http://127.0.0.1:10100/inference/other", { method: "POST", body: "{}" }),
+      icn,
+      async () => {
+        reached = true
+        return new Response("{}")
+      },
+    )
+    expect(response.status).toBe(404)
+    expect(reached).toBe(false)
+  })
+})
+
 describe("generic Anthropic inference proxy", () => {
   test("keeps the ordinary Anthropic endpoint separate from Claude Code discovery", async () => {
     let forwarded: Request | undefined

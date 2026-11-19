@@ -6,6 +6,7 @@
 //! source.
 pub mod anthropic;
 pub mod chat;
+pub mod completions;
 pub mod engine;
 pub mod error;
 mod media;
@@ -13,6 +14,7 @@ pub mod properties;
 pub mod responses;
 mod sampling;
 pub mod source;
+pub mod tokenize;
 #[cfg(test)]
 mod tests;
 
@@ -30,7 +32,7 @@ pub use error::{ApiError, ApiErrorBody, ErrorResponse, ModelUnavailable, Serving
 pub use media::MAX_HTTP_BODY_BYTES;
 pub use source::{
     GenerationEvent, GenerationStream, HostChat, LoadProgress, ModelInvocation, ModelLoadProgress,
-    ModelLoadStage, ServedModels,
+    ModelLoadStage, PositionScore, PromptScore, ServedModels, TokenizeInput, TopScore,
 };
 
 /// Protocol handler state: the model source and response identities.
@@ -57,6 +59,8 @@ impl Serving {
 pub fn router(serving: Serving) -> Router {
     Router::new()
         .route("/v1/chat/completions", post(chat::chat_completions))
+        .route("/v1/completions", post(completions::completions))
+        .route("/tokenize", post(tokenize::tokenize))
         .route(
             "/v1/responses",
             get(responses::responses_websocket).post(responses::responses),

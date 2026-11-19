@@ -46,6 +46,7 @@ use magnitude_service_server::residency::supervisor::{
     HostMemoryObserver, HostMemorySample, SeismicHostMemory,
 };
 use magnitude_service_server::residency::worker::run_inference_worker;
+use magnitude_service_server::residency::{LINGER, MAX_WAIT};
 use magnitude_service_server::serving::ServiceModels;
 use magnitude_service_server::worker_process::{WorkerLauncher, install_parent_watchdog};
 use tower::ServiceExt as _;
@@ -140,6 +141,8 @@ async fn lifecycle(arguments: Vec<String>) -> anyhow::Result<()> {
             reserves,
             host_memory: host_memory.clone(),
             idle_timeout,
+            linger: LINGER,
+            max_wait: MAX_WAIT,
             launcher: WorkerLauncher::current().expect("harness executable"),
             device: DeviceLock::default(),
             instance_id_namespace: namespace.to_owned(),
@@ -377,7 +380,7 @@ async fn lifecycle(arguments: Vec<String>) -> anyhow::Result<()> {
         started.elapsed().as_secs_f64()
     );
 
-    // Replacement: another model releases the first.
+    // Replacement: an explicit load of another model releases the first at once.
     let started = Instant::now();
     let replacement = main.instances.ensure_resident(&second).await?;
     assert_eq!(

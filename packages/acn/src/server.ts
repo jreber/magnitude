@@ -803,6 +803,10 @@ export const installAcnPublicRoutes = (
   yield* router.prefixed("/inference/v1").add(
     "*", "/*", makeInferenceProxy(icn, "openai", network, fetchTarget, undefined, activity),
   )
+  // vLLM's tokenizer endpoint, at the engine's root beside /v1.
+  yield* router.add(
+    "*", "/inference/tokenize", makeInferenceProxy(icn, "openai", network, fetchTarget, undefined, activity),
+  )
   yield* router.prefixed("/inference/anthropic/proxies/claude-code").add(
     "*", "/*", makeInferenceProxy(icn, "claude-code", network, fetchTarget, undefined, activity),
   )

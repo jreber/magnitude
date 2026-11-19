@@ -6,12 +6,14 @@
 
 pub mod cold_tier;
 pub mod domain;
+pub mod memory_condition;
 pub mod owner;
 pub mod policy;
 pub mod prefix_cache;
 pub mod protocol;
 pub mod publication;
 pub mod round_driver;
+pub mod scoring;
 pub mod throughput;
 pub mod worker;
 

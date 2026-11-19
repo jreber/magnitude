@@ -1925,6 +1925,8 @@ fn open_ai_model(
         magnitude_serving::properties::props,
         magnitude_serving::chat::apply_template,
         magnitude_serving::chat::chat_completions,
+        magnitude_serving::tokenize::tokenize,
+        magnitude_serving::completions::completions,
         magnitude_serving::responses::responses,
         magnitude_serving::anthropic::anthropic_messages,
         magnitude_serving::anthropic::anthropic_count_tokens
@@ -1974,6 +1976,13 @@ fn open_ai_model(
         TemplateCapabilitiesResponse,
         ApplyTemplateRequest,
         ApplyTemplateResponse,
+        magnitude_serving::tokenize::TokenizeRequest,
+        magnitude_serving::tokenize::TokenizeResponse,
+        magnitude_serving::completions::CompletionRequest,
+        magnitude_serving::completions::CompletionResponse,
+        magnitude_serving::completions::CompletionChoice,
+        magnitude_serving::completions::CompletionUsage,
+        magnitude_serving::completions::PromptLogprob,
         GrammarTriggerResponse,
         ChatCompletionRequest,
         ResponseCreateRequest,
@@ -2337,8 +2346,8 @@ mod tests {
         ModelAssessmentsInvalidation, ModelInstanceAllocation, ModelInstanceLifecycle,
     };
     use magnitude_serving::{
-        HostChat, LoadProgress, ModelInvocation, ModelUnavailable, ServedModels, Serving,
-        ServingError,
+        HostChat, LoadProgress, ModelInvocation, ModelUnavailable, PromptScore, ServedModels,
+        Serving, ServingError,
     };
     use serde_json::{Value, json};
     use tower::ServiceExt;
@@ -2357,6 +2366,17 @@ mod tests {
         }
 
         fn host(&self, model: &str) -> BoxFuture<'_, Result<Arc<dyn HostChat>, ServingError>> {
+            let model = model.to_owned();
+            Box::pin(async move { Err(ServingError::Model(ModelUnavailable::NotFound(model))) })
+        }
+
+        fn score(
+            &self,
+            model: &str,
+            _tokens: Vec<u32>,
+            _top: bool,
+            _next: bool,
+        ) -> BoxFuture<'_, Result<PromptScore, ServingError>> {
             let model = model.to_owned();
             Box::pin(async move { Err(ServingError::Model(ModelUnavailable::NotFound(model))) })
         }

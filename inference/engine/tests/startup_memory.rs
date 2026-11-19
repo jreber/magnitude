@@ -7,7 +7,7 @@ use magnitude_engine::{
     build_native_domain,
     composition::{EngineConfiguration, ResolvedEngineConfiguration},
     error::LoadError,
-    options::{ModelPolicy, PackageOptions, ProjectorSelection, standard_service_limits},
+    options::{ModelPolicy, PackageOptions, ProjectorSelection, standard_service_limits, Serve},
 };
 use magnitude_executor::{
     ExecutionPath,
@@ -33,6 +33,7 @@ fn model() -> ResolvedEngineConfiguration {
         kernel_cache: None,
         reserves: MemoryReserves::standard(),
         model_sha256: None,
+        serve: Serve::Generation,
     }
     .resolve()
     .unwrap()

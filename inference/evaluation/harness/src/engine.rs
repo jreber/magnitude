@@ -8,7 +8,7 @@ use magnitude_engine::composition::{
 };
 use magnitude_engine::load_native_domain;
 use magnitude_engine::options::{
-    ModelMethod, ModelPolicy, PackageOptions, ProjectorSelection, ResolvedMethod,
+    ModelMethod, ModelPolicy, PackageOptions, ProjectorSelection, ResolvedMethod, Serve,
 };
 use magnitude_executor::platform::{DeviceRequest, MemoryReserves};
 use magnitude_executor::{
@@ -115,6 +115,7 @@ pub fn configuration(
         kernel_cache: options.cache_dir.clone(),
         reserves: MemoryReserves::standard(),
         model_sha256: None,
+        serve: Serve::Generation,
     }
     .resolve()
     .map_err(|error| error.to_string())?;
