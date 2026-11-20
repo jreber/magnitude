@@ -165,6 +165,17 @@ pub struct PlaneBuffer {
     pub buffer: Tensor,
 }
 
+/// One history plane of a store's layout ([`StateStore::layout_planes`]):
+/// its domain, its region among the domain's planes, and the component it
+/// belongs to.
+struct LayoutPlane<'a> {
+    domain: HistoryDomainId,
+    region: usize,
+    component_index: usize,
+    layer: LayerRef,
+    plane: &'a PlaneDescriptor,
+}
+
 /// One exported history region (one plane's entire row set).
 #[derive(Clone, Debug, PartialEq)]
 pub struct ExportedRegion {
@@ -2347,37 +2358,53 @@ impl StateStore {
         })
     }
 
+    /// Every history plane of the store's layout, backed or not, in plane
+    /// order: the `n`th is the plane [`PlaneBuffer::plane_index`] `n` views
+    /// once the store is backed.
+    fn layout_planes(&self) -> impl Iterator<Item = LayoutPlane<'_>> {
+        self.domains.iter().enumerate().flat_map(|(index, domain)| {
+            domain
+                .components
+                .iter()
+                .enumerate()
+                .flat_map(|(component_index, component)| {
+                    component
+                        .planes()
+                        .iter()
+                        .map(move |plane| (component_index, component.layer, plane))
+                })
+                .enumerate()
+                .map(move |(region, (component_index, layer, plane))| LayoutPlane {
+                    domain: HistoryDomainId(index),
+                    region,
+                    component_index,
+                    layer,
+                    plane,
+                })
+        })
+    }
+
+    /// Views of every history plane ([`Self::layout_planes`]) over the
+    /// store's slabs; none while no domain is backed.
     pub fn history_planes(&self) -> Result<Vec<PlaneBuffer>, Error> {
         self.backing.borrow_mut().history.views_or_build(|slabs| {
-            let mut views = Vec::new();
-            for (index, (domain, history)) in self.domains.iter().zip(slabs).enumerate() {
-                let planes =
-                    domain
-                        .components
-                        .iter()
-                        .enumerate()
-                        .flat_map(|(component_index, component)| {
-                            component
-                                .planes()
-                                .iter()
-                                .map(move |plane| (component_index, component.layer, plane))
-                        });
-                for (region, (component_index, layer, plane)) in planes.enumerate() {
-                    views.push(PlaneBuffer {
-                        plane_index: views.len(),
-                        domain: HistoryDomainId(index),
-                        component_index,
-                        layer,
-                        vector: plane.vector,
-                        name: plane.name,
-                        row_bytes: plane.row_bytes,
-                        slab_rows: u32::try_from(domain.slab_rows).expect("slab rows fit u32"),
+            self.layout_planes()
+                .enumerate()
+                .map(|(plane_index, layout)| {
+                    Ok(PlaneBuffer {
+                        plane_index,
+                        domain: layout.domain,
+                        component_index: layout.component_index,
+                        layer: layout.layer,
+                        vector: layout.plane.vector,
+                        name: layout.plane.name,
+                        row_bytes: layout.plane.row_bytes,
+                        slab_rows: u32::try_from(self.domains[layout.domain.0].slab_rows).expect("slab rows fit u32"),
                         base_row: 0,
-                        buffer: history.slabs.logical_region(region)?,
-                    });
-                }
-            }
-            Ok(views)
+                        buffer: slabs[layout.domain.0].slabs.logical_region(layout.region)?,
+                    })
+                })
+                .collect::<Result<Vec<_>, Error>>()
         })
     }
     /// A domain's rows referenced by at least one claim; a shared row counts
@@ -2529,16 +2556,21 @@ impl StateStore {
     }
 
     /// Rebuild a live state from an [`ExportedState`] produced by
-    /// [`StateCheckpoint::export`]: validate it against this store, claim the
-    /// rows and successor bank it describes, and write the saved bytes into
-    /// them. Claiming takes only free backed rows, never growing the store;
-    /// a short store is [`Error::Capacity`]. The returned state's checkpoint
-    /// re-exports the saved bytes.
+    /// [`StateCheckpoint::export`]: validate it against this store's layout
+    /// (whatever of it is backed now), claim the rows and successor bank it
+    /// describes, and write the saved bytes into them. Claiming takes only
+    /// free backed rows, never growing the store; a short store is
+    /// [`Error::Capacity`]. The returned state's checkpoint re-exports the
+    /// saved bytes.
     pub fn import(self: &Rc<Self>, saved: &ExportedState) -> Result<SequenceState, Error> {
         let domains: Vec<HistoryDomainId> = self.history_domains().collect();
-        let planes = self.history_planes()?;
+        let layout: Vec<(usize, usize, usize)> = self
+            .layout_planes()
+            .enumerate()
+            .map(|(plane_index, layout)| (layout.domain.0, plane_index, layout.plane.row_bytes))
+            .collect();
         let mut expected: Vec<(usize, usize)> =
-            planes.iter().map(|plane| (plane.domain.0, plane.plane_index)).collect();
+            layout.iter().map(|&(domain, plane_index, _)| (domain, plane_index)).collect();
         let mut actual: Vec<(usize, usize)> =
             saved.history.iter().map(|region| (region.domain, region.region)).collect();
         expected.sort_unstable();
@@ -2548,16 +2580,16 @@ impl StateStore {
                 "import: the exported history regions do not match the store's planes".into(),
             ));
         }
-        for plane in &planes {
+        for &(domain, plane_index, row_bytes) in &layout {
             let region = saved
                 .history
                 .iter()
-                .find(|region| region.domain == plane.domain.0 && region.region == plane.plane_index)
+                .find(|region| region.domain == domain && region.region == plane_index)
                 .expect("regions matched the store's planes");
-            if region.row_bytes != plane.row_bytes {
+            if region.row_bytes != row_bytes {
                 return Err(Error::Request(format!(
-                    "import: domain {} plane {} row bytes {} differ from the store's {}",
-                    plane.domain.0, plane.plane_index, region.row_bytes, plane.row_bytes
+                    "import: domain {domain} plane {plane_index} row bytes {} differ from the store's {row_bytes}",
+                    region.row_bytes
                 )));
             }
         }
@@ -3027,40 +3059,44 @@ impl StateCheckpoint {
         }
     }
 
-    /// Export all history planes into [`ExportedRegion`]s, chunking each
-    /// `(start, count)` range at slab boundaries.
+    /// Export every history plane of the store's layout into an
+    /// [`ExportedRegion`], chunking each `(start, count)` range at slab
+    /// boundaries. A domain this checkpoint holds no rows of exports its
+    /// planes without ranges or bytes: an import matches the regions to the
+    /// whole layout ([`StateStore::import`]).
     pub fn export_history(&self) -> Result<Vec<ExportedRegion>, Error> {
         let planes = self.store().history_planes()?;
-        let mut regions = Vec::new();
-        for plane in &planes {
-            let ranges = self.history_ranges(plane.domain);
-            if ranges.is_empty() {
-                continue;
-            }
-            let slab_rows = plane.slab_rows as usize;
-            let mut bytes = Vec::new();
-            for (start, count) in &ranges {
-                let end = start + count;
-                let mut cstart = *start;
-                while cstart < end {
-                    let slab_end = (cstart / slab_rows + 1) * slab_rows;
-                    let cend = slab_end.min(end);
-                    let chunk = plane
-                        .buffer
-                        .read_rows_to_host(cstart as u64, cend as u64)?;
-                    bytes.extend(chunk);
-                    cstart = cend;
+        self.store()
+            .layout_planes()
+            .enumerate()
+            .map(|(plane_index, layout)| {
+                let ranges = self.history_ranges(layout.domain);
+                let mut bytes = Vec::new();
+                if !ranges.is_empty() {
+                    let plane = planes
+                        .get(plane_index)
+                        .expect("invariant violated: a checkpoint holds rows of an unbacked store");
+                    let slab_rows = plane.slab_rows as usize;
+                    for (start, count) in &ranges {
+                        let end = start + count;
+                        let mut cstart = *start;
+                        while cstart < end {
+                            let slab_end = (cstart / slab_rows + 1) * slab_rows;
+                            let cend = slab_end.min(end);
+                            bytes.extend(plane.buffer.read_rows_to_host(cstart as u64, cend as u64)?);
+                            cstart = cend;
+                        }
+                    }
                 }
-            }
-            regions.push(ExportedRegion {
-                domain: plane.domain.0,
-                region: plane.plane_index,
-                row_bytes: plane.row_bytes,
-                ranges: ranges.into_iter().collect(),
-                bytes,
-            });
-        }
-        Ok(regions)
+                Ok(ExportedRegion {
+                    domain: layout.domain.0,
+                    region: plane_index,
+                    row_bytes: layout.plane.row_bytes,
+                    ranges,
+                    bytes,
+                })
+            })
+            .collect()
     }
 
     /// Export one bank row from each recurrent arena.

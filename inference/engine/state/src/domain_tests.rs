@@ -1174,3 +1174,49 @@ fn an_exported_checkpoint_imports_its_rows_and_bank() {
         assert_eq!(saved.bytes, restored.bytes);
     }
 }
+
+/// An export holds every plane of the store's layout, those of a domain the
+/// checkpoint has no rows in yet too, and imports by the layout whatever of
+/// it is backed: once every slab is released, the store refuses it for
+/// capacity, not as an export of another layout.
+#[test]
+fn an_export_holds_every_plane_and_imports_by_the_layout() {
+    let device = cpu_device();
+    let mut store = indexed_store(device, 64, 16);
+    // Three rows complete no block of four.
+    let state = commit(store.create().unwrap(), 3);
+    assert!(state.history_ranges(BLOCKS).is_empty());
+    let exported = state.checkpoint().export().unwrap();
+    let geometry = |history: &[ExportedRegion]| {
+        history
+            .iter()
+            .map(|region| (region.domain, region.region, region.row_bytes))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        geometry(&exported.history),
+        store
+            .history_planes()
+            .unwrap()
+            .iter()
+            .map(|plane| (plane.domain.0, plane.plane_index, plane.row_bytes))
+            .collect::<Vec<_>>(),
+        "one region per plane"
+    );
+    let blocks = exported.history.iter().find(|region| region.domain == BLOCKS.0).unwrap();
+    assert!(blocks.ranges.is_empty() && blocks.bytes.is_empty());
+    drop(state);
+    let restored = store.import(&exported).unwrap();
+    let reexported = restored.checkpoint().export().unwrap();
+    assert_eq!(geometry(&reexported.history), geometry(&exported.history));
+    for (saved, restored) in exported.history.iter().zip(&reexported.history) {
+        assert_eq!(saved.bytes, restored.bytes);
+    }
+    drop(restored);
+    store.shrink(&NextSteps::default()).unwrap();
+    assert!(store.history_planes().unwrap().is_empty(), "every slab was released");
+    assert!(
+        matches!(store.import(&exported), Err(Error::Capacity { .. })),
+        "an unbacked store refuses the import for capacity"
+    );
+}
