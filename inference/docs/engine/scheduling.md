@@ -155,7 +155,10 @@ Apply these steps in order when preparation cannot fit:
    vision encoder and the expert bank's slots above its floor, each by the seconds
    serving it saves per byte held (no time decay). The expert bank yields to a claim
    like any cache. A holder frees what was taken of it as its release ends, and the
-   claim allocates those bytes only then.
+   claim allocates those bytes only then. A refused claim's relief counts only cache
+   that frees it room, never what it was refused against: a request's state counted
+   the cache worth nothing, and a pool's spare granules are counted by its own class's
+   claims and free another's only as whole empty blocks (`memory::ledger::Frees`).
 3. Drop trailing batch members.
 4. Reduce the actual legal token allowance.
 5. Evict victims, priced by exclusive releasable bytes and replay cost. Unloading the
@@ -210,7 +213,8 @@ that cannot be made is an invariant violation naming the figure.
 Supply is what the OS gives without writing anyone's dirty data: free pages above the
 OS's own free target, clean file cache, and the cold anonymous pages that compressing or
 swapping frees, bounded by where they can go. The process's own cold pages are never
-supply. Others' working set is read from harm, the pages others bring back after the OS
+supply: where the OS does not count them (macOS, Windows), they are at most the pageable
+bytes the process holds there, and those bytes are left out of the cold supply. Others' working set is read from harm, the pages others bring back after the OS
 reclaimed them, counted in one snapshot with the process's own share so its own paging
 never reads as theirs, and judged against a learned baseline over spans of at least the
 counters' lag. Harm above the baseline lowers a boundary B on what the process may hold,

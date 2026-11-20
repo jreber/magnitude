@@ -63,13 +63,19 @@ impl ReliefPlan {
 impl State {
     /// The relief that covers `need` in `store` for what `frees` names,
     /// taking what `allow` admits; none where all of it together does not.
+    /// Only cache that frees the need room covers it: a claim's own counted
+    /// room never does ([`Frees`]).
     pub(super) fn plan_relief(&self, store: &seismic::StoreIdentity, need: u64, allow: Relief, frees: Frees) -> Option<ReliefPlan> {
+        let covers = |kind: CacheKind| match frees {
+            Frees::RequestState => kind.valued(),
+            Frees::Room | Frees::Shortage => true,
+        };
         let mut order: Vec<(Value, CacheKind, EntryId, u64)> = self
             .held
             .iter()
             .filter_map(|(id, entry)| match entry.holding {
-                Holding::Cache(kind) if entry.bytes > 0 => Some((entry.value, kind, *id, entry.bytes)),
-                Holding::Pool(_) if entry.bytes > 0 => Some((entry.value, CacheKind::Spare, *id, entry.bytes)),
+                Holding::Cache(kind) if entry.bytes > 0 && covers(kind) => Some((entry.value, kind, *id, entry.bytes)),
+                Holding::Pool(_) if entry.bytes > 0 && frees == Frees::Shortage => Some((entry.value, CacheKind::Spare, *id, entry.bytes)),
                 _ => None,
             })
             .collect();

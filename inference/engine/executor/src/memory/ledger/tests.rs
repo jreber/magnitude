@@ -665,6 +665,38 @@ fn a_relief_plan_covers_its_need_whole_or_takes_nothing() {
     assert_eq!((bank.bytes(), prefix.bytes()), (0, 0), "the plan carried out whole");
 }
 
+/// A claim's relief never counts what the claim was refused against: a
+/// state growth refused past the state pool's spare granules, which it
+/// takes in place, is covered by the retained prefixes, never by that
+/// spare again, which yielded would free it nothing (Flash Next refused a
+/// 225 MB growth so with 354 MB of prefixes retained); and a request's
+/// state, refused past the cache worth nothing, never by that cache. A
+/// shortage, which counted none of it, takes the spare first.
+#[test]
+fn a_claims_relief_never_counts_what_it_was_refused_against() {
+    const PREFIX: u64 = 2 * GB;
+    const SPARE: u64 = GB;
+    const TOTAL: u64 = 36 * GB;
+    let (_scope, ledger, pools) = host();
+    let mut clock = Clock::new();
+    read(&ledger, &mut clock, TOTAL, TOTAL, None);
+    let prefix = ledger.cached(CacheKind::Prefix, PREFIX).expect("room");
+    prefix.value(Value::per_byte(1.0, NonZeroU64::new(GB).unwrap()));
+    ledger.change(|_| pools.state.take(&pools.state.change(), SPARE, Pageable)).expect("the state pool holds a spare block beside the prefix");
+    read(&ledger, &mut clock, TOTAL, 0, None);
+    assert_eq!(ledger.estimate().cache_of(CacheKind::Spare), SPARE, "the state pool's block is spare");
+    let short = ledger.change(|keeping| ledger.backing(&keeping.claims(), PoolClass::State, PREFIX)).err().expect("a growth past the spare is short");
+    assert_eq!(short.required - short.over, SPARE, "it counted the state pool's spare");
+    let shortage = ledger.plan_relief(short.over, Relief::CacheOnly, Frees::Shortage).expect("the spare covers a shortage");
+    let growth = ledger.plan_relief(short.over, Relief::CacheOnly, Frees::Room).expect("the prefix covers the growth");
+    assert_eq!(ledger.plan_relief(PREFIX + 1, Relief::CacheOnly, Frees::Room), None, "the spare covers no growth");
+    assert_eq!(ledger.plan_relief(1, Relief::CacheOnly, Frees::RequestState).map(|plan| plan.covers()), Some(1), "a request's state is covered by the prefix");
+    let owed = ledger.change(|keeping| ledger.execute(&keeping.claims(), growth));
+    assert_eq!((owed.yielded, prefix.bytes()), (short.over, PREFIX - short.over), "the growth's relief took the prefix");
+    assert_eq!(ledger.estimate().cache_of(CacheKind::Spare), SPARE, "and left the spare the growth takes in place");
+    drop(shortage);
+}
+
 /// An invariant broken under the ledger's lock panics as itself: the
 /// handles dropped while unwinding never touch the ledger it poisoned, so
 /// the test binary goes on.
@@ -747,6 +779,34 @@ fn every_claim_counts_the_supply() {
     assert_eq!(ledger.estimate().free(), 10 * GB, "the reading a baseline is learned at is judged by none");
     ledger.read(ledger.sampled(clock.next()), Reading::host(&counted_after(200)));
     assert_eq!(ledger.estimate().free(), 13 * GB, "a reading the baseline judges counts cold pages");
+}
+
+/// Where the OS counts no cold page of the process's own (macOS), the
+/// process's pageable bytes are the most of the machine's cold pages that
+/// can be its own, and each frees at most itself: the reclaimable cold
+/// pages beyond them are others' and supply. Flash Next's load left 3.8 GB
+/// of them on a 128 GB Mac, none counted while it held any pageable
+/// byte, and a request's 225 MB growth was refused.
+#[test]
+fn cold_pages_beyond_the_process_pageable_bytes_are_supply() {
+    let (_scope, ledger, _pool) = host();
+    let mut clock = Clock::new();
+    let sample = host_sample(64 * GB, 4 * GB);
+    let sample = seismic::HostSample { supply: seismic::Supply { cold_reclaimable: 3 * GB, ..sample.supply }, cold: 6 * GB, ..sample };
+    let counted_after = |ms: u64, free: u64| seismic::HostSample {
+        counted: seismic::Counted { at: sample.counted.at + Duration::from_millis(ms), ..sample.counted },
+        supply: seismic::Supply { free_beyond_target: i64::try_from(free).expect("bytes fit i64"), ..sample.supply },
+        ..sample
+    };
+    ledger.read(ledger.sampled(clock.next()), Reading::host(&sample));
+    let pageable = commit(&ledger, GB);
+    for ms in [100, 200, 300, 400] {
+        ledger.read(ledger.sampled(clock.next()), Reading::host(&counted_after(ms, 3 * GB)));
+    }
+    let estimate = ledger.estimate();
+    assert_eq!(estimate.supply(), 5 * GB as i64, "free room and the cold pages beyond the process's pageable gigabyte");
+    assert_eq!(estimate.free(), 5 * GB);
+    drop(pageable);
 }
 
 /// A reading whose supply exceeds its total is no reading.
