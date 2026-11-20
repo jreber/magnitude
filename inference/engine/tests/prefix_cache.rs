@@ -4,10 +4,14 @@
 //! keep their image conditioning across eviction and cached resumption.
 //!
 //! `MAGNITUDE_TEST_GGUF=M.gguf MAGNITUDE_TEST_MMPROJ=P.gguf
-//! [VISION_IMAGE=I.jpeg] cargo test --release -p magnitude-engine
-//! --test prefix_cache -- --ignored --nocapture`. The model must accept
-//! images through its projector; the image defaults to llama.cpp's
-//! `test-1.jpeg`.
+//! [VISION_IMAGE=I.jpeg] [MAGNITUDE_TEST_KERNEL_CACHE=DIR] cargo test
+//! --release -p magnitude-engine --test prefix_cache -- --ignored
+//! --nocapture`. Any supported model qualifies; the image tests need one
+//! that accepts images through its projector, and the image defaults to
+//! llama.cpp's `test-1.jpeg`. Each test loads as a load in its own process
+//! does, the prices its plan waits on measured into the kernel cache first
+//! (once per machine), and holds the process's one load while it runs, so
+//! the tests take turns whatever cargo's test threads ([`model_load`]).
 
 use magnitude_chat::{request::ImageInput, ByteBpeTokenizer, SpecialTokens};
 use magnitude_engine::{
@@ -19,7 +23,7 @@ use magnitude_engine::{
 use magnitude_executor::{
     platform::{DeviceRequest, ReleaseRate},
     CompletionWake, Demand, ExecutionPath, ExecutorDomain, Operation, Outcome, PhysicalDecision, RequestId,
-    ReservedResources, StateBindings, TokenId, WorkKind,
+    ReservedResources, ResumeState, StateBindings, TokenId, WorkKind,
 };
 use magnitude_family_contracts::{PreparedModelInput, TokenPlan};
 use magnitude_generation::{
@@ -27,6 +31,7 @@ use magnitude_generation::{
 };
 use tracing::subscriber::with_default;
 use magnitude_scheduler::{
+    cold_tier::{entry_key, EntryKey},
     owner::Owner,
     prefix_cache::{PrefixCacheCapacity, PrefixRetention, MIN_PREFIX_HIT},
     ServiceLimits,
@@ -34,9 +39,10 @@ use magnitude_scheduler::{
 use magnitude_state::{ExportedState, KvCodec};
 use owner_host::Host;
 use std::collections::BTreeSet;
-use std::path::PathBuf;
-use std::time::Duration;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
+mod model_load;
 mod owner_host;
 
 const CONTEXT: usize = 4096;
@@ -51,7 +57,7 @@ fn resolved_ctx(projector: bool, context_tokens: usize) -> ResolvedEngineConfigu
     let variable = |name: &str| {
         PathBuf::from(std::env::var_os(name).unwrap_or_else(|| panic!("set {name}")))
     };
-    EngineConfiguration {
+    model_load::resolve(EngineConfiguration {
         package: PackageOptions::single(
             variable("MAGNITUDE_TEST_GGUF"),
             if projector {
@@ -75,13 +81,11 @@ fn resolved_ctx(projector: bool, context_tokens: usize) -> ResolvedEngineConfigu
         service: limits(),
         path: ExecutionPath::Native,
         device: DeviceRequest::Automatic,
-        kernel_cache: std::env::var_os("MAGNITUDE_TEST_KERNEL_CACHE").map(PathBuf::from),
+        kernel_cache: Some(model_load::kernel_cache()),
         release: ReleaseRate::of_machine(None),
         model_sha256: None,
         serve: Serve::Generation,
-    }
-    .resolve()
-    .unwrap()
+    })
 }
 
 fn limits() -> ServiceLimits {
@@ -286,7 +290,7 @@ fn an_abandoned_request_resumes_where_it_stopped() {
     assert!(stopped < prompt.len() - 1, "stopped mid-prompt");
     host.owner_mut().cancel(id);
     host.release(stream, Duration::from_secs(300));
-    let [resumed] = run(&mut host, vocabulary, &[prompt.clone()], 12).try_into().ok().unwrap();
+    let [resumed] = run(&mut host, vocabulary, std::slice::from_ref(&prompt), 12).try_into().ok().unwrap();
     eprintln!("stopped at {stopped} of {}; resumed with {} cached", prompt.len(), resumed.cached);
     assert!(
         (stopped..prompt.len()).contains(&resumed.cached),
@@ -424,7 +428,7 @@ fn distinct_conversations_commit_no_state_beyond_the_charged_workload() {
 fn a_rewritten_reply_resumes_at_the_previous_prompt() {
     let (mut host, vocabulary, tokenizer) = owner();
     let first = text(&tokenizer, 2, 200);
-    let [done] = run(&mut host, vocabulary, &[first.clone()], 12)
+    let [done] = run(&mut host, vocabulary, std::slice::from_ref(&first), 12)
         .try_into()
         .ok()
         .unwrap();
@@ -514,7 +518,7 @@ fn a_changed_last_message_resumes_at_its_declared_start() {
     assert_ne!(messages[2].0[system.len()], lead[0]);
     let mut cached = Vec::new();
     for request in &messages {
-        let [done] = run_with_cache_points(&mut host, vocabulary, &[request.clone()], 8, CONTEXT)
+        let [done] = run_with_cache_points(&mut host, vocabulary, std::slice::from_ref(request), 8, CONTEXT)
             .try_into()
             .ok()
             .unwrap();
@@ -691,7 +695,7 @@ fn launch(
 /// Forward the input rows `range` and return the last row's logits.
 fn forward(
     domain: &mut ExecutorDomain,
-    mut bindings: StateBindings,
+    bindings: StateBindings,
     request: RequestId,
     input: &PreparedModelInput,
     range: std::ops::Range<usize>,
@@ -751,13 +755,9 @@ impl RestoreHits {
     }
 }
 
+#[derive(Default)]
 struct HitVisitor {
     hit: bool,
-}
-impl Default for HitVisitor {
-    fn default() -> Self {
-        Self { hit: false }
-    }
 }
 impl tracing::field::Visit for HitVisitor {
     fn record_debug(&mut self, _f: &tracing::field::Field, _v: &dyn std::fmt::Debug) {}
@@ -998,7 +998,7 @@ fn cold_tier_export_roundtrip() {
 
     let mut history_bytes = 0;
     for region in &first.history {
-        let rows: usize = region.ranges.iter().map(|(s, e)| e - s).sum();
+        let rows: usize = region.ranges.iter().map(|(_, count)| count).sum();
         assert_eq!(
             region.bytes.len(),
             region.row_bytes * rows,
@@ -1027,7 +1027,7 @@ fn cold_tier_export_roundtrip() {
     domain.install_input(request_b, input_b.clone()).unwrap();
     let encodes = domain.open_served(&mut bindings, request_b, None).unwrap();
     assert!(encodes.is_empty());
-    bindings = forward(&mut domain, bindings, request_b, &input_b, 0..512).1;
+    forward(&mut domain, bindings, request_b, &input_b, 0..512);
     domain.close(request_b).unwrap();
     let again = held.target().export().unwrap();
     assert_eq!(first, again, "the first export is stable across other prefills");
@@ -1050,9 +1050,20 @@ fn saved_content(saved: &ExportedState) -> impl PartialEq + std::fmt::Debug + '_
     )
 }
 
+/// The export of a resume state: its target's, and its head's where the
+/// load drafts with one.
+fn export(state: &ResumeState) -> (ExportedState, Option<ExportedState>) {
+    (
+        state.target().export().unwrap(),
+        state.head().map(|head| head.export().unwrap()),
+    )
+}
+
 /// The state import of an exported checkpoint (cold tier unit 02): after the
-/// original state is evicted and its rows are reused by a different prefill,
-/// importing the export back into the store reproduces it byte-for-byte.
+/// original state is evicted, its rows reused by a different prefill and the
+/// stores shrunk, a request restored from the export as the cold tier
+/// restores a spilled prefix (`ExecutorDomain::restore_state`, which backs
+/// the stores for the rows it imports) holds it byte-for-byte.
 #[test]
 #[ignore = "requires a Metal or CUDA device and MAGNITUDE_TEST_GGUF"]
 fn cold_tier_import_roundtrip() {
@@ -1076,9 +1087,8 @@ fn cold_tier_import_roundtrip() {
         bindings = forward(&mut domain, bindings, request_a, &input_a, start..start + 512).1;
     }
     let held = domain.resume_state(request_a).unwrap();
-    let original = held.target().export().unwrap();
+    let (original, original_head) = export(&held);
     assert_eq!(original.position, 2048);
-    let store = std::rc::Rc::clone(held.target().store());
     drop(held);
     domain.close(request_a).unwrap();
     let _ = domain.shrink_state(&mut bindings, CompletionWake::new(|| {})).unwrap();
@@ -1094,50 +1104,116 @@ fn cold_tier_import_roundtrip() {
     domain.close(request_b).unwrap();
     let _ = domain.shrink_state(&mut bindings, CompletionWake::new(|| {})).unwrap();
 
-    let imported = store.import(&original).unwrap();
-    let restored = imported.checkpoint().export().unwrap();
+    let restored_request = RequestId(3);
+    domain.install_input(restored_request, input_a).unwrap();
+    let unchained = domain.unchained(&mut bindings).expect("no chain is under way");
+    let encodes = domain
+        .restore_state(
+            unchained,
+            restored_request,
+            &original,
+            original_head.as_ref(),
+            prompt_a.len() as u64,
+        )
+        .unwrap();
+    assert!(encodes.is_empty(), "a restored text state encodes nothing");
+    let (restored, restored_head) = export(&domain.resume_state(restored_request).unwrap());
     assert_eq!(
         saved_content(&original),
         saved_content(&restored),
         "import reproduces the exported state byte-for-byte"
     );
+    assert_eq!(
+        original_head.as_ref().map(saved_content),
+        restored_head.as_ref().map(saved_content),
+        "and its head's"
+    );
+    domain.close(restored_request).unwrap();
 }
 
-/// The SSD cold tier keeps evicted prefixes on disk: A's retained prefix is
-/// pushed out of the RAM cache by larger distinct prefixes, spilled to the
-/// state-cache directory, and a later request extending A's path resumes from
-/// the disk entry instead of re-prefilling.
+/// The identity the cold-tier tests' owners spill under.
+const COLD_IDENTITY: [u8; 32] = [7; 32];
+
+/// An owner of `resolved`'s model spilling the prefixes it evicts to the
+/// cold tier in `dir`. It retains at most two prefixes, whatever their
+/// state's size: each one retained past them evicts, and so spills, the one
+/// worth least. Which prefixes spill then follows from the requests alone,
+/// unlike under the plan's workload bound, which pins the latest
+/// conversation's checkpoints and releases others only as far as the
+/// model's state bytes require.
+fn cold_owner(resolved: &ResolvedEngineConfiguration, dir: &Path) -> Host {
+    let (domain, bindings, _) =
+        build_native_domain(&resolved.manifest, resolved.host.shared_package()).unwrap();
+    Host::new(|wakes| {
+        Owner::with_prefix_cache_capacity(
+            domain,
+            bindings,
+            limits(),
+            PrefixCacheCapacity {
+                max_entries: 2,
+                workload_state_bytes: u64::MAX,
+            },
+            wakes,
+            Some(COLD_IDENTITY),
+            Some(dir.to_path_buf()),
+            8 * 1024 * 1024 * 1024,
+        )
+    })
+}
+
+/// Wait until the cold tier in `dir` holds the prefix a plain request
+/// retained at the end of `tokens`: a spill is written off the owner's
+/// thread.
+fn await_spilled(dir: &Path, tokens: &[TokenId]) {
+    let key = entry_key(&COLD_IDENTITY, tokens, &[], "Plain", tokens.len());
+    let file = dir
+        .join(EntryKey(COLD_IDENTITY).hex())
+        .join("entries")
+        .join(format!("{}.bin", key.hex()));
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while !file.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "the prefix of {} tokens was not spilled",
+            tokens.len()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// A request's two retained prefixes, its prompt boundary and then its
+/// terminal path, evicted by another request's two and spilled. A cold
+/// restore needs the terminal's write reconciled: its entry is pending until
+/// the owner hears it was written. The terminal, worth only its reply's
+/// tokens beyond the boundary, is evicted first, and the tier writes in
+/// order, so once the boundary's file exists the terminal's write has been
+/// reported, and the owner hears it before it opens the next request.
+fn await_both_spilled(dir: &Path, path: &[TokenId], prompt: usize) {
+    await_spilled(dir, &path[..prompt - 1]);
+    await_spilled(dir, path);
+}
+
+/// The SSD cold tier keeps evicted prefixes on disk: A's retained prefixes
+/// are pushed out of the RAM cache by a distinct prompt's, spilled to the
+/// state-cache directory, and a later request extending A's path resumes
+/// from the disk entry instead of re-prefilling.
 #[test]
 #[ignore = "requires a Metal or CUDA device and MAGNITUDE_TEST_GGUF"]
 fn cold_tier_spill_restore() {
     let resolved = resolved(false);
     let vocabulary = resolved.manifest.definition.decoder.vocabulary as usize;
     let tokenizer = resolved.host.shared_tokenizer();
-    let (domain, bindings, plan) =
-        build_native_domain(&resolved.manifest, resolved.host.shared_package()).unwrap();
 
-    let identity = [7u8; 32];
     let dir = std::env::temp_dir()
         .join(format!("magnitude-cold-tier-spill-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    let mut host = Host::new(|wakes| {
-        Owner::with_resource_plan(
-            domain,
-            bindings,
-            limits(),
-            &plan,
-            wakes,
-            Some(identity),
-            Some(dir.clone()),
-            8 * 1024 * 1024 * 1024,
-        )
-    });
+    let mut host = cold_owner(&resolved, &dir);
 
     let prompt_a: Vec<TokenId> = (0..5)
         .flat_map(|i| text(&tokenizer, 100u32 + i as u32, 512))
         .take(2048)
         .collect();
-    let [first] = run(&mut host, vocabulary, &[prompt_a], 12)
+    let [first] = run(&mut host, vocabulary, std::slice::from_ref(&prompt_a), 12)
         .try_into()
         .ok()
         .unwrap();
@@ -1145,47 +1221,27 @@ fn cold_tier_spill_restore() {
     let path_a = path(&first);
     eprintln!(
         "A: prompt={} path={} prefixes={}",
-        path_a.len(),
+        prompt_a.len(),
         path_a.len(),
         host.owner().cached_prefixes()
     );
 
-    // The tier dir holds one identity subdir; a spill is any entry file.
-    let spilled = || -> bool {
-        std::fs::read_dir(&dir)
-            .into_iter()
-            .flatten()
-            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-            .find_map(|identity_dir| {
-                std::fs::read_dir(identity_dir.join("entries"))
-                    .ok()
-                    .and_then(|entries| entries.flatten().next().map(|_| true))
-            })
-            .unwrap_or(false)
-    };
-
-    // Distinct larger prompts until A's LRU prefix is evicted and spilled.
-    for i in 0..6u32 {
-        let prompt_b: Vec<TokenId> = (0..8)
-            .flat_map(|j| text(&tokenizer, 300u32 + i * 100 + j, 512))
-            .take(3800)
-            .collect();
-        let [turn] = run(&mut host, vocabulary, &[prompt_b], 12)
-            .try_into()
-            .ok()
-            .unwrap();
-        eprintln!(
-            "B{i}: prompt={} cached={} prefixes={} spilled={}",
-            turn.prompt.len(),
-            turn.cached,
-            host.owner().cached_prefixes(),
-            spilled()
-        );
-        if spilled() {
-            break;
-        }
-    }
-    assert!(spilled(), "A's retained prefix was evicted and spilled to disk");
+    // A distinct larger prompt retains its own two prefixes, evicting A's.
+    let prompt_b: Vec<TokenId> = (0..8)
+        .flat_map(|j| text(&tokenizer, 300u32 + j, 512))
+        .take(3800)
+        .collect();
+    let [turn] = run(&mut host, vocabulary, &[prompt_b], 12)
+        .try_into()
+        .ok()
+        .unwrap();
+    eprintln!(
+        "B: prompt={} cached={} prefixes={}",
+        turn.prompt.len(),
+        turn.cached,
+        host.owner().cached_prefixes()
+    );
+    await_both_spilled(&dir, &path_a, prompt_a.len());
 
     // A' extends A's full path; the RAM cache no longer holds it, so the
     // request must resume from the spilled disk entry.
@@ -1200,9 +1256,10 @@ fn cold_tier_spill_restore() {
         .ok()
         .unwrap();
     eprintln!(
-        "A': prompt={} cached={} prefixes={}",
+        "A': prompt={} cached={} cold={} prefixes={}",
         a2_prompt_len,
         second.cached,
+        second.cold,
         host.owner().cached_prefixes()
     );
     assert_eq!(
@@ -1212,6 +1269,7 @@ fn cold_tier_spill_restore() {
     );
     assert_eq!(second.cold, path_a.len(), "A' is attributed to the cold tier");
 
+    drop(host);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1256,43 +1314,12 @@ fn cold_tier_restore_matches_fresh_prefill_impl(restart: bool) {
         .collect();
 
     // -- Part A: the owner path, end to end.
-    let identity = [7u8; 32];
     let dir = std::env::temp_dir()
         .join(format!("magnitude-cold-tier-06-{}-{}", restart as u8, std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
 
-    let spilled = || -> bool {
-        std::fs::read_dir(&dir)
-            .into_iter()
-            .flatten()
-            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-            .find_map(|identity_dir| {
-                std::fs::read_dir(identity_dir.join("entries"))
-                    .ok()
-                    .and_then(|entries| entries.flatten().next().map(|_| true))
-            })
-            .unwrap_or(false)
-    };
-
-    let build_owner = || -> Host {
-        let (domain, bindings, plan) =
-            build_native_domain(&resolved.manifest, resolved.host.shared_package()).unwrap();
-        Host::new(|wakes| {
-            Owner::with_resource_plan(
-                domain,
-                bindings,
-                limits(),
-                &plan,
-                wakes,
-                Some(identity),
-                Some(dir.clone()),
-                8 * 1024 * 1024 * 1024,
-            )
-        })
-    };
-
     // P: a full 8K prefill, thirty-two greedy tokens.
-    let mut host = build_owner();
+    let mut host = cold_owner(&resolved, &dir);
     let [first] = run_with_cache_points(
         &mut host,
         vocabulary,
@@ -1308,39 +1335,33 @@ fn cold_tier_restore_matches_fresh_prefill_impl(restart: bool) {
     assert_eq!(path_p.len(), PROMPT_06 + DECODE_STEPS);
     eprintln!(
         "P: prompt={} path={} prefixes={}",
-        path_p.len(),
+        prompt.len(),
         path_p.len(),
         host.owner().cached_prefixes()
     );
 
-    // Distinct longer prompts until P's LRU prefix is evicted and spilled.
-    for i in 0..6u32 {
-        let prompt_e: Vec<TokenId> = (0..24)
-            .flat_map(|j| text(&tokenizer, 600u32 + i * 100 + j, 512))
-            .take(12288)
-            .collect();
-        let [turn] = run_with_cache_points(
-            &mut host,
-            vocabulary,
-            &[(prompt_e, vec![])],
-            DECODE_STEPS,
-            CONTEXT_06,
-        )
-        .try_into()
-        .ok()
-        .unwrap();
-        eprintln!(
-            "E{i}: prompt={} cached={} prefixes={} spilled={}",
-            turn.prompt.len(),
-            turn.cached,
-            host.owner().cached_prefixes(),
-            spilled()
-        );
-        if spilled() {
-            break;
-        }
-    }
-    assert!(spilled(), "P's retained prefix was evicted and spilled to disk");
+    // A distinct longer prompt retains its own two prefixes, evicting P's.
+    let prompt_e: Vec<TokenId> = (0..24)
+        .flat_map(|j| text(&tokenizer, 600u32 + j, 512))
+        .take(12288)
+        .collect();
+    let [turn] = run_with_cache_points(
+        &mut host,
+        vocabulary,
+        &[(prompt_e, vec![])],
+        DECODE_STEPS,
+        CONTEXT_06,
+    )
+    .try_into()
+    .ok()
+    .unwrap();
+    eprintln!(
+        "E: prompt={} cached={} prefixes={}",
+        turn.prompt.len(),
+        turn.cached,
+        host.owner().cached_prefixes()
+    );
+    await_both_spilled(&dir, &path_p, PROMPT_06);
 
     // A' extends P's full path; the RAM cache no longer holds it, so the
     // request must resume from the spilled disk entry.
@@ -1354,7 +1375,7 @@ fn cold_tier_restore_matches_fresh_prefill_impl(restart: bool) {
     // restore — the disk entries must survive.
     if restart {
         drop(host);
-        host = build_owner();
+        host = cold_owner(&resolved, &dir);
     }
 
     let hits = RestoreHits::default();
@@ -1479,7 +1500,7 @@ fn cold_tier_restore_matches_fresh_prefill_impl(restart: bool) {
         assert_eq!(bits(a), bits(b), "chunk {} logit rows", i);
     }
     let held = domain.resume_state(export_req).unwrap();
-    let exported = held.target().export().unwrap();
+    let (exported, exported_head) = export(&held);
     assert_eq!(exported.position, PROMPT_06);
     drop(held);
     if restart {
@@ -1504,7 +1525,7 @@ fn cold_tier_restore_matches_fresh_prefill_impl(restart: bool) {
     let rows = (PROMPT_06 + DECODE_STEPS) as u64;
     let unchained = domain.unchained(&mut bindings).expect("no chain is under way");
     let encodes = domain
-        .restore_state(unchained, restore_req, &exported, None, rows)
+        .restore_state(unchained, restore_req, &exported, exported_head.as_ref(), rows)
         .unwrap();
     assert!(
         encodes.is_empty(),
