@@ -341,6 +341,13 @@ pub(crate) trait Storage: Send + Sync {
     /// and writes it in place (`DeviceService::host_address`, and never for
     /// read-only storage), valid while the storage lives.
     fn host_address(&self) -> Option<std::ptr::NonNull<u8>>;
+    /// The bytes the storage holds charged to its entry, its backing's
+    /// rounding included: what the entry was charged as it was allocated
+    /// and is freed of as it drops (`DeviceService::charged_bytes`); a
+    /// read-only mapping, which allocates nothing, its mapped bytes. The
+    /// one owner of what an allocation costs, so every report of its
+    /// charge ([`Allocation::charged_bytes`]) is what the ledger moved.
+    fn charged(&self) -> u64;
 }
 
 /// Storage the service allocated, which the host reads and writes.
@@ -361,6 +368,9 @@ impl<T: TargetFamily, E: NativeExecutor<T>> Storage for TypedStorage<T, E> {
     }
     fn host_address(&self) -> Option<std::ptr::NonNull<u8>> {
         self.service.host_address(&self.buffer)
+    }
+    fn charged(&self) -> u64 {
+        self.service.charged_bytes(&self.buffer)
     }
 }
 
@@ -389,11 +399,18 @@ impl<T: TargetFamily, E: NativeExecutor<T>> Storage for ReadOnlyStorage<T, E> {
     fn host_address(&self) -> Option<std::ptr::NonNull<u8>> {
         None
     }
+    /// The mapped bytes: memory its owner holds, which the mapping
+    /// allocates none of, so no entry is charged or freed for it.
+    fn charged(&self) -> u64 {
+        self.service.buffer_len(&self.buffer)
+    }
 }
 
 /// One physical allocation. Views share it, so access exclusion is allocation-wide.
 pub(crate) struct Allocation {
     identity: u64,
+    /// The bytes it was asked for, which views and transfers reach: short
+    /// of what it is charged by its backing's rounding ([`Storage::charged`]).
     bytes: u64,
     /// The record tables of the views record ports bind
     /// ([`Allocation::view_table`]), one for each record size and phase,
@@ -405,8 +422,7 @@ pub(crate) struct Allocation {
     /// it.
     tables: Mutex<Vec<Weak<Allocation>>>,
     /// The access path its storage lies along: that of the kind it landed
-    /// in, whose store's ledger entry its backend charged its exact bytes
-    /// to.
+    /// in, whose store's ledger entry its backend charged to.
     path: seismic_topology::AccessPathId,
     storage: Box<dyn Storage>,
     access: Arc<AccessGroup>,
@@ -573,10 +589,11 @@ impl AllocationAccess {
 }
 
 impl Allocation {
-    /// The bytes the allocation's own storage lies in along its access
-    /// path: what a view's byte range is attributed from.
+    /// The bytes the allocation's own storage holds along its access path,
+    /// as its entry is charged for them ([`Storage::charged`]): what a
+    /// view's byte range is attributed from.
     pub(crate) fn storage_path_charges(&self) -> Vec<(seismic_topology::AccessPathId, u64)> {
-        vec![(self.path, self.bytes)]
+        vec![(self.path, self.storage.charged())]
     }
 
     /// The bytes the allocation holds along each of its access paths: its
@@ -628,12 +645,14 @@ impl Allocation {
     pub(crate) fn bytes(&self) -> u64 {
         self.bytes
     }
-    /// The bytes the allocation holds, its record tables included: part of
-    /// its storage, held and released with it.
+    /// The bytes the allocation is charged, as its storage's entry is
+    /// ([`Storage::charged`]: its backing's rounding included), its record
+    /// tables included: part of its storage, held and released with it.
+    /// What its release frees, never its requested bytes.
     pub(crate) fn charged_bytes(&self) -> u64 {
         self.record_tables()
             .iter()
-            .try_fold(self.bytes, |charged, table| charged.checked_add(table.charged_bytes()))
+            .try_fold(self.storage.charged(), |charged, table| charged.checked_add(table.charged_bytes()))
             .expect("an allocation's charges sum within u64")
     }
 
@@ -1620,6 +1639,9 @@ mod physical_slot_tests {
         }
         fn host_address(&self) -> Option<std::ptr::NonNull<u8>> {
             None
+        }
+        fn charged(&self) -> u64 {
+            0
         }
     }
 

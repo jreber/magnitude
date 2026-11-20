@@ -702,9 +702,9 @@ impl StoredTable {
         &self.shared.directory
     }
 
-    /// What the table allocates beside its slots: its directory.
+    /// What the table is charged beside its slots: its directory.
     pub fn directory_bytes(&self) -> u64 {
-        self.shared.directory.storage_bytes()
+        self.shared.directory.charged_bytes()
     }
 
     /// Fill the slots with the rows steps named when the table was last

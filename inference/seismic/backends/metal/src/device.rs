@@ -235,8 +235,9 @@ fn charged_buffer(
     entry: &Arc<dyn Entry>,
     wiring: Wiring,
 ) -> Result<ChargedBuffer, ExecutionError> {
-    // What Metal takes for a buffer of `length`: its size class.
-    let sized = handle.raw().heapBufferSizeAndAlignWithLength_options(length, options).size as u64;
+    // What Metal takes for a buffer of `length` (`seismic_compiler::charge`),
+    // admitted before it is made.
+    let sized = seismic_compiler::charge::metal_buffer(length as u64);
     // The admission, the buffer and the record of what it took are one
     // change.
     Backed::take(entry, sized, wiring, |charging| {
@@ -246,7 +247,8 @@ fn charged_buffer(
             // working set as it reads now.
             .ok_or_else(|| handle.refused(length as u64))?;
         // Metal's own count of the buffer, which its working set holds: what it
-        // took beyond the size class, or the part it did not take.
+        // took beyond the rule (a storage mode it does not price), or the
+        // part it did not take.
         let allocated = buffer.allocatedSize() as u64;
         if allocated > sized {
             charging.took_more(allocated - sized);
@@ -379,7 +381,7 @@ pub struct MetalBuffer {
     /// Absent for a read-only host mapping, whose pages stay file-backed
     /// and outside the residency set: resident only where it is bound, so
     /// no record table addresses it.
-    _wired: Option<Arc<WiredAllocation>>,
+    wired: Option<Arc<WiredAllocation>>,
 }
 
 /// A [`MetalBuffer`] Metal allocated, which the host also writes.
@@ -390,6 +392,15 @@ impl WritableMetalBuffer {
     pub(crate) fn write_bytes(&self, offset: u64, bytes: &[u8]) {
         // Shared storage Metal allocated: host-writable for its lifetime.
         unsafe { self.0.write_device_bytes(offset, bytes) }
+    }
+
+    /// The bytes its entry is charged for it: Metal's own count of the
+    /// buffer (`allocatedSize`, its size class and rounding), or a pool
+    /// block's whole pages, freed from the entry as its last handle drops
+    /// ([`WiredAllocation`]).
+    pub fn charged(&self) -> u64 {
+        let wired = self.0.wired.as_ref().expect("invariant violated: a buffer Metal allocated is wired");
+        wired.buffer.charge().bytes()
     }
 }
 
@@ -604,7 +615,7 @@ impl MetalDevice {
             buffer,
             len: bytes,
             _host_owner: None,
-            _wired: Some(Arc::new(wired)),
+            wired: Some(Arc::new(wired)),
         }))
     }
 
@@ -672,7 +683,7 @@ impl MetalDevice {
             buffer,
             len: length as u64,
             _host_owner: Some(owner),
-            _wired: None,
+            wired: None,
         })
     }
 }
@@ -698,6 +709,10 @@ impl DeviceService<Metal> for MetalDevice {
         // `heapBufferSizeAndAlignWithLength:options:` for this same shared
         // buffer class; direct device buffers satisfy that requirement.
         self.allocate_bytes(bytes, entry)
+    }
+
+    fn charged_bytes(&self, buffer: &Self::Writable) -> u64 {
+        buffer.charged()
     }
 
     fn write(
@@ -1044,9 +1059,28 @@ mod mapped_tests {
         let device = MetalDevice::open(handle, crate::test_support::store()).unwrap();
         let entry = crate::test_support::entry();
         let buffer = device.allocate_bytes(1 << 16, &entry).unwrap();
-        let wired = buffer._wired.as_ref().expect("an allocated buffer is in the set");
+        let wired = buffer.wired.as_ref().expect("an allocated buffer is in the set");
         assert_eq!(wired.buffer.charge().wiring(), Wiring::Wired);
         assert_eq!(device.order.charge().wiring(), Wiring::Pageable);
+    }
+
+    /// Metal takes for a shared buffer what the charge rule says
+    /// (`seismic_compiler::charge::metal_buffer`): its entry is charged its
+    /// own count of the buffer, which the rule a load's plan prices it by
+    /// predicts, around the host page and well past it.
+    #[test]
+    fn a_buffer_is_charged_what_the_rule_prices() {
+        let Ok(handle) = DeviceHandle::system_default() else {
+            return;
+        };
+        let device = MetalDevice::open(handle, crate::test_support::store()).unwrap();
+        let page = seismic_compiler::charge::host_page();
+        for bytes in [1, 100, page - 1, page, page + 1, 3 * page + 5, (1 << 20) + 100, 60_313_856] {
+            let buffer = device.allocate_bytes(bytes, &crate::test_support::entry()).unwrap();
+            let allocated = buffer.raw().allocatedSize() as u64;
+            assert_eq!(seismic_compiler::charge::metal_buffer(bytes), allocated, "{bytes} bytes");
+            assert_eq!(buffer.charged(), allocated, "{bytes} bytes");
+        }
     }
 
     /// A pool's block is one buffer in the residency set: with a block of

@@ -516,7 +516,7 @@ impl ResidentWeight {
         }
     }
 
-    /// Every allocation of the weight: its representation (with the record
+    /// What every allocation of the weight is charged: its representation (with the record
     /// table its storage holds, `ModelLoadPlan::weight_storage_bytes`), its
     /// scale, its packing bound and a streamed table's directory and
     /// staging.
@@ -532,8 +532,8 @@ impl ResidentWeight {
     fn storage_bytes_staging(&self, stagings: u64) -> u64 {
         self.tensor.charged_bytes()
             + self.table.stored().map_or(0, |table| table.charged_bytes())
-            + self.scale.as_ref().map_or(0, Tensor::storage_bytes)
-            + self.bound.as_ref().map_or(0, Tensor::storage_bytes)
+            + self.scale.as_ref().map_or(0, Tensor::charged_bytes)
+            + self.bound.as_ref().map_or(0, Tensor::charged_bytes)
             + self.table.held_bytes()
             + stagings
     }

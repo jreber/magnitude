@@ -2181,7 +2181,7 @@ impl ExecutionPlanner {
             .map_err(PlanError::InvalidDefinition)?;
         // Native entries import the weights, through record ports.
         let load = match path {
-            ExecutionPath::Native => load.with_record_ports(backend),
+            ExecutionPath::Native => load.with_native(backend),
             ExecutionPath::Planned => load,
         };
         // The head in progressive planes, where the backend reads them.

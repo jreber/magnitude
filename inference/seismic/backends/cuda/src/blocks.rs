@@ -119,7 +119,7 @@ impl Blocks {
             }
         };
         Ok(Range {
-            _carved: Charge::carve(block.backed.charge(), entry, bytes),
+            carved: Charge::carve(block.backed.charge(), entry, bytes),
             blocks: self.clone(),
             block,
             offset,
@@ -163,7 +163,7 @@ impl Blocks {
 pub(crate) struct Range {
     /// Its bytes, carved for its allocation's entry from the block's;
     /// returned to the block as the range drops.
-    _carved: Carved,
+    carved: Carved,
     blocks: Arc<Blocks>,
     block: Arc<Block>,
     offset: u64,
@@ -177,6 +177,11 @@ impl Range {
 
     pub(crate) fn bytes(&self) -> u64 {
         self.bytes
+    }
+
+    /// The bytes carved for its allocation's entry from its block's.
+    pub(crate) fn charged(&self) -> u64 {
+        self.carved.bytes()
     }
 
     /// Precondition (this crate's own): the bytes lie within the range.
@@ -214,6 +219,11 @@ impl DeviceBlock {
 
     pub(crate) fn bytes(&self) -> u64 {
         self.backed.bytes as u64
+    }
+
+    /// Its whole allocation granules, charged to its entry.
+    pub(crate) fn charged(&self) -> u64 {
+        self.backed.charge().bytes()
     }
 
     /// Precondition (this crate's own): the bytes lie within the block.
