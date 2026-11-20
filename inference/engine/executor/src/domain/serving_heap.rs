@@ -262,6 +262,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// slabs wait while a chain is under way ([`Self::chain_holder`]).
     pub fn release_yielded(&mut self, bindings: &mut StateBindings, wake: crate::CompletionWake) -> Result<Yielded, DomainError> {
         self.idle_optional();
+        self.idle_export();
         let mut freed = false;
         if self.idle_components.iter().any(IdleComponent::taken) {
             let (taken, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.idle_components).into_iter().partition(IdleComponent::taken);
@@ -285,10 +286,13 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         if self.resources.releasing_slots() {
             return Ok(Yielded::Pending);
         }
-        if self.idle_class.taken() {
+        if self.idle_class.taken() || self.export_class.idle.taken() {
             // The slots' cache goes with their release, freed as it ends;
             // with no slot idling any more, their cache is let go at once.
-            return Ok(match self.resources.release_idle_slots(self.idle_class.release(), wake) {
+            // A closed group's and the export readout's idle slots go
+            // together: the release frees every pool's idle slots.
+            let cache = self.idle_class.release().into_iter().chain(self.export_class.idle.release()).collect();
+            return Ok(match self.resources.release_idle_slots(cache, wake) {
                 true => Yielded::Pending,
                 false => Yielded::Released { released: 0, returned: 0 },
             });

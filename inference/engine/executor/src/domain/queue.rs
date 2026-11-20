@@ -1151,7 +1151,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             TargetTokens::Host => TargetTokens::Host,
         };
         let graph = self.resources.target_graph();
-        let readout = self.resources.target_readout_graph(super::projected_rows(predicted));
+        let readout = self.resources.target_readout_graph(super::launch_readout(predicted));
         let (Ok(graph_workspace), Ok(graph_output), Ok(readout_workspace), Ok(readout_output)) = (
             graph.acquire_workspace(),
             graph.acquire_output(),

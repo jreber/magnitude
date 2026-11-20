@@ -525,11 +525,16 @@ pub struct PreparedTargetReadoutGraphs {
     classes: BTreeMap<(bool, ReadoutClass), PreparedTargetReadoutGraph>,
     /// Whether the load's own feature source fuses a separate draft's taps.
     fuses: bool,
-    /// Every class: any launch's readout runs in its slots.
+    /// Every served class ([`ReadoutFamily::Launch`]): any launch's readout
+    /// that exports nothing runs in its slots.
     family: NativeGraphFamily,
-    /// The classes a prompt chunk's readout runs ([`chunk_holds`]), whose
-    /// slots hold no more than it exports.
+    /// The served classes a prompt chunk's readout runs
+    /// ([`ReadoutFamily::Chunk`]), whose slots hold no more than it exports.
     chunk_family: NativeGraphFamily,
+    /// The export classes, in a load that exports logits
+    /// ([`ReadoutFamily::Export`]): a launch that exports runs its readout
+    /// in their slots, claimed as it reserves.
+    export_family: Option<NativeGraphFamily>,
     max_projected_rows: usize,
     certified_classes: Vec<u64>,
 }
@@ -549,6 +554,43 @@ pub(crate) struct BoundTargetReadoutGraphs {
 /// readout exports, not by the load's widest export.
 pub(crate) fn chunk_holds(projected: u64) -> bool {
     projected <= 1
+}
+
+/// The families a load's readout classes run in, each the slots of a pool
+/// of its own (`AllocatedResources::readout_pool`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReadoutFamily {
+    /// Every served class: any launch's readout that exports nothing runs
+    /// in its slots, the floor's among them.
+    Launch,
+    /// The served classes a prompt chunk's readout runs ([`chunk_holds`]).
+    Chunk,
+    /// The export classes ([`ReadoutKind::Logits`]), which only a launch
+    /// that exports runs: their slots are claimed as such a launch
+    /// reserves, none at load, so a served launch's slots and the floor
+    /// are a load's that exports none.
+    Export,
+}
+
+impl ReadoutFamily {
+    const ALL: [Self; 3] = [Self::Launch, Self::Chunk, Self::Export];
+
+    fn holds(self, class: ReadoutClass) -> bool {
+        let exports = class.kind == ReadoutKind::Logits;
+        match self {
+            Self::Launch => !exports,
+            Self::Chunk => !exports && chunk_holds(class.projected),
+            Self::Export => exports,
+        }
+    }
+
+    /// Whether the family keeps `class`'s graphs live for each launch in
+    /// flight: a class a decode step's launch reads out
+    /// ([`readout_decodes`]), but none of the export family's, whose graphs
+    /// each claimed activation charges and records at first use.
+    fn pins(self, class: ReadoutClass, limits: ResourceLimits) -> bool {
+        self != Self::Export && readout_decodes(class, limits)
+    }
 }
 
 /// Whether the load has export classes ([`ReadoutKind::Logits`]): it
@@ -666,8 +708,7 @@ impl PreparedTargetReadoutGraphs {
         let head = HeadPlans::for_recipe(load, WeightScope::Target, WeightScope::Target, false)?;
         let (regimes, qualified) = load_readout_regimes::<NativeGraphLayout>(device.backend(), load, geometry, norm, head, limits).map_err(error)?;
         let mut classes = BTreeMap::new();
-        let mut plans = Vec::new();
-        let mut chunk_plans = Vec::new();
+        let mut plans = ReadoutFamily::ALL.map(|_| Vec::new());
         for &(source, class) in &qualified {
             let layout = regimes
                 .get(&(source.fuses, readout_regime(class)))
@@ -682,22 +723,31 @@ impl PreparedTargetReadoutGraphs {
                 class,
                 layout,
             )?;
-            plans.push((readout_decodes(class, limits), variant.plan.clone()));
-            if chunk_holds(class.projected) {
-                chunk_plans.push((readout_decodes(class, limits), variant.plan.clone()));
+            for (family, plans) in ReadoutFamily::ALL.into_iter().zip(&mut plans) {
+                if family.holds(class) {
+                    plans.push((family.pins(class, limits), variant.plan.clone()));
+                }
             }
             classes.insert((source.fuses, class), variant);
         }
-        let family = super::serial_family("readout", plans, &readout_graphs(&regimes, &qualified, limits, false).map_err(error)?)
-            .map_err(|error| error.to_string())?;
-        let chunk_family = super::serial_family("chunk readout", chunk_plans, &readout_graphs(&regimes, &qualified, limits, true).map_err(error)?)
-            .map_err(|error| error.to_string())?;
+        let [launch, chunk, export] = plans;
+        let sealed = |name: &str, family, plans| {
+            super::serial_family(name, plans, &readout_graphs(&regimes, &qualified, limits, family).map_err(error)?)
+                .map_err(|error| error.to_string())
+        };
+        let family = sealed("readout", ReadoutFamily::Launch, launch)?;
+        let chunk_family = sealed("chunk readout", ReadoutFamily::Chunk, chunk)?;
+        let export_family = match export.is_empty() {
+            true => None,
+            false => Some(sealed("export readout", ReadoutFamily::Export, export)?),
+        };
         Ok(Self {
             residual_width: load.residual_conditioning(),
             classes,
             fuses: qualified.iter().any(|(source, _)| source.fuses),
             family,
             chunk_family,
+            export_family,
             max_projected_rows: max_projected_rows(limits),
             certified_classes: magnitude_batching::row_classes(limits.max_selected_rows)
                 .into_iter()
@@ -714,6 +764,11 @@ impl PreparedTargetReadoutGraphs {
     /// ([`chunk_holds`]).
     pub fn chunk_family(&self) -> &NativeGraphFamily {
         &self.chunk_family
+    }
+    /// The family of the export classes a launch that exports runs, in a
+    /// load that exports logits ([`ReadoutFamily::Export`]).
+    pub fn export_family(&self) -> Option<&NativeGraphFamily> {
+        self.export_family.as_ref()
     }
     pub fn workspace_bytes(&self) -> u64 {
         self.family.workspace_bytes()
@@ -1956,8 +2011,10 @@ pub(crate) fn checked_readout_family_storage(
 
 /// The readout family's storage ([`checked_readout_family_storage`]) and
 /// what its graphs hold ([`readout_graphs`]): what a load commits of its
-/// readout. A prompt chunk's family is charged by the class a group claims
-/// as it opens, from the pools themselves, never here.
+/// readout, its served classes' alone ([`ReadoutFamily::Launch`]). A prompt
+/// chunk's family is charged by the class a group claims as it opens, and
+/// the export family by a launch that exports as it reserves, from the
+/// pools themselves, never here.
 pub(crate) fn checked_readout_storage(
     backend: BackendName,
     load: &ModelLoadPlan,
@@ -1967,11 +2024,18 @@ pub(crate) fn checked_readout_storage(
     let norm = target_readout_norm(load, geometry)?;
     let head = HeadPlans::for_recipe(load, WeightScope::Target, WeightScope::Target, false)?;
     let (regimes, classes) = load_readout_regimes::<seismic::NativeGraphOutline>(backend, load, geometry, norm, head, limits)?;
-    let most = |layouts: &mut dyn Iterator<Item = &seismic::NativeGraphOutline>| {
-        layouts.map(Certified::storage_bytes).reduce(NativeGraphStorageBytes::most)
-    };
-    let family = most(&mut regimes.values()).ok_or("readout graph family has no classes")?;
-    Ok((family, readout_graphs(&regimes, &classes, limits, false)?))
+    let served = classes
+        .iter()
+        .filter(|(_, class)| ReadoutFamily::Launch.holds(*class))
+        .map(|(source, class)| (source.fuses, readout_regime(*class)))
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut family = None::<NativeGraphStorageBytes>;
+    for regime in &served {
+        let bytes = regimes.get(regime).ok_or("readout class has no resource regime")?.storage_bytes();
+        family = Some(family.map_or(bytes, |most| most.most(bytes)));
+    }
+    let family = family.ok_or("readout graph family has no classes")?;
+    Ok((family, readout_graphs(&regimes, &classes, limits, ReadoutFamily::Launch)?))
 }
 
 /// A readout regime of one of a load's sources: whether that source fuses a
@@ -2021,21 +2085,20 @@ fn readout_decodes(class: ReadoutClass, limits: ResourceLimits) -> bool {
     class.rows <= limits.decode_rows()
 }
 
-/// What the readout family of `classes` holds (`seismic::LaunchGraphs::of`),
-/// each launch one run of its class's regime's graph, those of a class a
-/// decode step's launch reads out ([`readout_decodes`]) kept live; or, with
-/// `chunk`, the chunk family's, of its classes ([`chunk_holds`]), whose
-/// slots a decode step's readout of one row takes where they are free
-/// (`AllocatedResources::readout_pool`).
+/// What `family`'s slots hold of the readout graphs of `classes`
+/// (`seismic::LaunchGraphs::of`), each launch one run of its class's
+/// regime's graph, those the family pins ([`ReadoutFamily::pins`]) kept
+/// live: the chunk family's slots a decode step's readout of one row takes
+/// where they are free (`AllocatedResources::readout_pool`).
 fn readout_graphs(
     regimes: &BTreeMap<SourcedRegime, impl Certified>,
     classes: &[(ReadoutSource<'_>, ReadoutClass)],
     limits: ResourceLimits,
-    chunk: bool,
+    family: ReadoutFamily,
 ) -> Result<LaunchGraphs, GraphError> {
     let mut decodes = BTreeMap::<SourcedRegime, bool>::new();
-    for &(source, class) in classes.iter().filter(|(_, class)| !chunk || chunk_holds(class.projected)) {
-        *decodes.entry((source.fuses, readout_regime(class))).or_default() |= readout_decodes(class, limits);
+    for &(source, class) in classes.iter().filter(|(_, class)| family.holds(*class)) {
+        *decodes.entry((source.fuses, readout_regime(class))).or_default() |= family.pins(class, limits);
     }
     let graphs = decodes
         .into_iter()
@@ -2631,7 +2694,7 @@ mod resource_regime_tests {
     fn every_readout_class_fits_its_shared_regime_layout() {
         // A Q8_0 head, so a backend that reads progressive heads places it
         // in planes and certifies selection classes.
-        let (served, exporting) = (exporting(0), exporting(64));
+        let (served, exporting) = (limits_exporting(0), limits_exporting(64));
         let certified = magnitude_batching::row_classes(served.max_selected_rows)
             .into_iter()
             .map(|rows| rows as u64)
@@ -2898,7 +2961,7 @@ mod resource_regime_tests {
 
     /// A load of up to 512 rows, selecting up to 32, exporting `exported`
     /// rows of logits.
-    fn exporting(exported: usize) -> ResourceLimits {
+    fn limits_exporting(exported: usize) -> ResourceLimits {
         ResourceLimits {
             max_launch_rows: 512,
             max_launch_slots: 512,
@@ -2925,8 +2988,8 @@ mod resource_regime_tests {
         let head =
             HeadPlans::for_recipe(&load, WeightScope::Target, WeightScope::Target, false).unwrap();
         assert!(head.certifies(1));
-        let served = qualified_readout_classes(exporting(0), head).unwrap();
-        let classes = qualified_readout_classes(exporting(256), head).unwrap();
+        let served = qualified_readout_classes(limits_exporting(0), head).unwrap();
+        let classes = qualified_readout_classes(limits_exporting(256), head).unwrap();
         for kind in [
             ReadoutKind::Selection { shaped: true, certified: false },
             ReadoutKind::Selection { shaped: true, certified: true },
@@ -2988,7 +3051,7 @@ mod resource_regime_tests {
             classes
         };
         for certified_rows in [0, 1, 4] {
-            assert_eq!(readout_classes(exporting(0), certified_rows).unwrap(), served_branch(exporting(0), certified_rows));
+            assert_eq!(readout_classes(limits_exporting(0), certified_rows).unwrap(), served_branch(limits_exporting(0), certified_rows));
         }
         for backend in [BackendName::Cpu, BackendName::Metal, BackendName::Cuda, BackendName::Vulkan] {
             let (definition, load) = q8_head_load(backend, &[1]);
@@ -3006,13 +3069,38 @@ mod resource_regime_tests {
                 )
                 .unwrap()
             };
-            let (served, exported) = (regimes(exporting(0)), regimes(exporting(256)));
+            let (served, exported) = (regimes(limits_exporting(0)), regimes(limits_exporting(256)));
             for (regime, layout) in &served {
                 let exporting = exported
                     .get(regime)
                     .unwrap_or_else(|| panic!("{backend:?}: the exporting load has no regime {regime:?}"));
                 assert_eq!(exporting.storage_bytes(), layout.storage_bytes(), "{backend:?} {regime:?}");
             }
+        }
+    }
+
+    /// A load that exports logits plans and charges exactly the readout a
+    /// load exporting none does, the slots' storage and the graphs its
+    /// family keeps live alike: its export classes are a family of their
+    /// own, charged as a launch that exports claims it, never at load.
+    #[test]
+    fn an_exporting_load_plans_the_readout_of_a_load_exporting_none() {
+        for backend in [BackendName::Cpu, BackendName::Metal, BackendName::Cuda, BackendName::Vulkan] {
+            let (definition, load) = q8_head_load(backend, &[1]);
+            let planned = |exported| checked_readout_storage(backend, &load, &definition.decoder, limits_exporting(exported)).unwrap();
+            let (served, exporting) = (planned(0), planned(256));
+            assert_eq!(exporting.0, served.0, "{backend:?}: the readout slots' storage");
+            assert_eq!(exporting.1, served.1, "{backend:?}: the readout family's graphs");
+            // The export family keeps none of its graphs live: each claimed
+            // activation charges them, recorded at first use.
+            let head = HeadPlans::for_recipe(&load, WeightScope::Target, WeightScope::Target, false).unwrap();
+            let norm = target_readout_norm(&load, &definition.decoder).unwrap();
+            let limits = limits_exporting(256);
+            let (regimes, classes) =
+                load_readout_regimes::<seismic::NativeGraphOutline>(backend, &load, &definition.decoder, norm, head, limits).unwrap();
+            let export = readout_graphs(&regimes, &classes, limits, ReadoutFamily::Export).unwrap();
+            assert_eq!(export.pinned, seismic::GraphCensus::default(), "{backend:?}");
+            assert!(export.union.graphs > 0, "{backend:?}");
         }
     }
 }

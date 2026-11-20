@@ -147,14 +147,28 @@ impl From<AllocationError> for seismic::BuildError {
     }
 }
 
+/// What a target launch reads out, which decides the readout pool it takes
+/// its slots from ([`AllocatedResources::target_readout_graph`]): the logits
+/// rows it projects, and whether it exports them (a row demands
+/// `Demand::LOGITS`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LaunchReadout {
+    pub projected: usize,
+    pub exports: bool,
+}
+
 /// A target readout pool ([`AllocatedResources::readout_pool`]).
 #[derive(Clone, Copy)]
 enum ReadoutPool {
-    /// Any launch's: the floor's slots.
+    /// Any served launch's (one that exports nothing): the floor's slots.
     Launch,
-    /// A prompt chunk's (`readout::chunk_holds`): a group's places beyond
-    /// the floor.
+    /// A served prompt chunk's (`readout::chunk_holds`): a group's places
+    /// beyond the floor.
     Chunk,
+    /// A launch's that exports logits: the export classes' own slots, none
+    /// held at load, claimed as such a launch reserves
+    /// (`ExecutorDomain::provision_export`).
+    Export,
 }
 
 /// A prompt-group class whose pools' slots [`AllocatedResources::grow_class`]
@@ -179,6 +193,11 @@ pub struct AllocatedResources {
     /// exports (`readout::chunk_holds`): a group's places beyond
     /// the floor.
     target_readout_chunk_graph: NativeGraphPool,
+    /// Readout slots a launch that exports logits runs in, in a load that
+    /// exports them: none until such a launch claims them
+    /// ([`NativeGraphPool::on_demand`]), so a served launch's slots are a
+    /// load's that exports none.
+    target_readout_export_graph: Option<NativeGraphPool>,
     head_graph: Option<NativeGraphPool>,
     vision_graph: Option<VisionGraphPool>,
     state_graph: NativeGraphPool,
@@ -222,6 +241,7 @@ impl AllocatedResources {
             Some(&self.target_graph),
             Some(&self.target_readout_graph),
             Some(&self.target_readout_chunk_graph),
+            self.target_readout_export_graph.as_ref(),
             self.head_graph.as_ref(),
             Some(&self.state_graph),
         ]
@@ -248,20 +268,33 @@ impl AllocatedResources {
         &self.target_graph
     }
 
-    /// The readout pool a launch projecting `projected` rows takes its
-    /// activation and output slot from ([`Self::readout_pool`]).
-    pub fn target_readout_graph(&self, projected: usize) -> &NativeGraphPool {
-        self.readout(self.readout_pool(projected))
+    /// The readout pool a launch reading out `readout` takes its activation
+    /// and output slot from ([`Self::readout_pool`]).
+    pub(crate) fn target_readout_graph(&self, readout: LaunchReadout) -> &NativeGraphPool {
+        self.readout(self.readout_pool(readout))
     }
 
-    /// The one choice of a launch's readout pool, among those whose output
-    /// class holds its `projected` rows, smallest first: the first with an
+    /// The export readout's pool, in a load that exports logits.
+    pub(crate) fn target_readout_export_graph(&self) -> Option<&NativeGraphPool> {
+        self.target_readout_export_graph.as_ref()
+    }
+
+    pub(crate) fn target_readout_export_graph_mut(&mut self) -> Option<&mut NativeGraphPool> {
+        self.target_readout_export_graph.as_mut()
+    }
+
+    /// The one choice of a launch's readout pool: the export pool for a
+    /// launch that exports; for any other, among the pools whose output
+    /// class holds its projected rows, smallest first, the first with an
     /// activation and an output slot free; else the first with an
     /// activation free, whose retained outputs grow by a slot
     /// (`ExecutorDomain::provision_output`); else the launch pool, which
-    /// holds any launch's.
-    fn readout_pool(&self, projected: usize) -> ReadoutPool {
-        let pools = readout::chunk_holds(projected as u64)
+    /// holds any served launch's.
+    fn readout_pool(&self, readout: LaunchReadout) -> ReadoutPool {
+        if readout.exports {
+            return ReadoutPool::Export;
+        }
+        let pools = readout::chunk_holds(readout.projected as u64)
             .then_some(ReadoutPool::Chunk)
             .into_iter()
             .chain([ReadoutPool::Launch]);
@@ -277,6 +310,12 @@ impl AllocatedResources {
         match pool {
             ReadoutPool::Launch => &self.target_readout_graph,
             ReadoutPool::Chunk => &self.target_readout_chunk_graph,
+            // Reservation refuses logits from a load that exports none
+            // (`ExecutorDomain::admit_selection`).
+            ReadoutPool::Export => self
+                .target_readout_export_graph
+                .as_ref()
+                .expect("invariant violated: a launch exports logits from a load that exports none"),
         }
     }
     pub fn head_graph(&self) -> Option<&NativeGraphPool> {
@@ -293,20 +332,23 @@ impl AllocatedResources {
     }
 
     /// The pool whose output slots `lane`'s launches retain beyond their
-    /// completion, for a launch projecting `projected` rows: target readout
-    /// or head outputs. A target launch's is the readout pool it takes its
-    /// slots from ([`Self::readout_pool`]). Encoded images hold slots of
+    /// completion, one at a time, for a launch reading out `readout`: target
+    /// readout or head outputs. A served target launch's is the readout pool
+    /// it takes its slots from ([`Self::readout_pool`]); an exporting one's
+    /// are claimed with the export readout's slots instead
+    /// (`ExecutorDomain::provision_export`). Encoded images hold slots of
     /// their own class ([`VisionGraphPool`]).
     pub(crate) fn retained_outputs_mut(
         &mut self,
         lane: crate::domain::ReservationLane,
-        projected: usize,
+        readout: LaunchReadout,
     ) -> Option<&mut NativeGraphPool> {
         match lane {
-            crate::domain::ReservationLane::Target => Some(match self.readout_pool(projected) {
-                ReadoutPool::Launch => &mut self.target_readout_graph,
-                ReadoutPool::Chunk => &mut self.target_readout_chunk_graph,
-            }),
+            crate::domain::ReservationLane::Target => match self.readout_pool(readout) {
+                ReadoutPool::Launch => Some(&mut self.target_readout_graph),
+                ReadoutPool::Chunk => Some(&mut self.target_readout_chunk_graph),
+                ReadoutPool::Export => None,
+            },
             crate::domain::ReservationLane::Head => self.head_graph.as_mut(),
             crate::domain::ReservationLane::Vision => None,
         }
@@ -405,6 +447,7 @@ impl AllocatedResources {
             Some(&mut self.target_graph),
             Some(&mut self.target_readout_graph),
             Some(&mut self.target_readout_chunk_graph),
+            self.target_readout_export_graph.as_mut(),
             self.head_graph.as_mut(),
             Some(&mut self.state_graph),
         ]
@@ -570,6 +613,9 @@ impl ResourceAllocator {
             charges,
             Outputs::Host,
         )?;
+        let target_readout_export_graph = target_readout_graphs
+            .export_family()
+            .map(|family| NativeGraphPool::on_demand(domain.clone(), family, Outputs::Host));
         let head_graph = match (head_graphs, plan.head_graph()) {
             (Some(graphs), Some(charge)) if admitted(graphs.family(), charge) => Some(
                 NativeGraphPool::new(domain.clone(), graphs.family(), charge, &arena, charges, Outputs::Host)?,
@@ -609,6 +655,7 @@ impl ResourceAllocator {
             target_graph,
             target_readout_graph,
             target_readout_chunk_graph,
+            target_readout_export_graph,
             head_graph,
             vision_graph,
             state_graph,

@@ -466,10 +466,11 @@ fn a_group_takes_the_places_its_plan_holds() {
     assert_eq!(group_places_opened(fixture_with(None, false, false)), 1, "a plan of one place holds no class");
 }
 
-/// A prompt chunk's readout exports at most its final row, so the places a
-/// group's class holds beyond the floor's, once a group opens with chunks
-/// behind it, are charged what that exports, whatever the load's widest
-/// export; the launch pool's floor holds the widest.
+/// A prompt chunk's readout reads out at most its final row, so the places
+/// a group's class holds beyond the floor's, once a group opens with
+/// chunks behind it, are charged what that reads out, and the launch
+/// pool's floor what a served launch reads out, whatever the load exports:
+/// a launch that exports claims slots of its own.
 #[test]
 fn a_groups_places_hold_what_a_prompt_chunk_exports() {
     let load = |exported| {
@@ -482,13 +483,13 @@ fn a_groups_places_hold_what_a_prompt_chunk_exports() {
         let operations = group_opening(&mut domain, &mut bindings);
         domain.open_group(&operations).unwrap();
         assert_eq!(domain.group_places().get(), 3, "the group holds its chain's places");
-        let floor = domain.resources.target_readout_graph(usize::MAX).committed_bytes().unwrap();
-        let places = domain.resources.target_readout_graph(1).committed_bytes().unwrap();
+        let floor = domain.resources.target_readout_graph(served_readout(usize::MAX)).committed_bytes().unwrap();
+        let places = domain.resources.target_readout_graph(served_readout(1)).committed_bytes().unwrap();
         (floor, places)
     };
-    let ((narrow_floor, narrow_places), (wide_floor, wide_places)) = (load(1), load(2));
-    assert!(wide_floor > narrow_floor, "the floor's readout holds the widest export");
-    assert_eq!(wide_places, narrow_places);
+    let served = load(0);
+    assert_eq!(load(1), served, "the floor and the places hold no export");
+    assert_eq!(load(2), served);
 }
 
 /// A one-row decode of `request` at 0 demanding `demand`, sampling its next
@@ -574,6 +575,155 @@ fn an_exporting_load_exports_per_launch() {
     assert!(reserve(&[exporting(requests[4], 2)]).is_ok(), "the exported rows fit");
     let detail = refused(reserve(&[sampling(requests[5], none, crate::Shaping::default()), exporting(requests[3], 2)]));
     assert!(detail.contains("projects 3 logits rows; the load exports 2"), "{detail}");
+}
+
+/// The controlled fixture of up to 256 rows a launch, exporting `exported`
+/// rows of logits.
+fn exporting_load(exported: usize) -> Fixture {
+    fixture_of(
+        tiny_definition(),
+        ResourceLimits {
+            max_launch_rows: 256,
+            exported_logits_rows: exported,
+            ..limits(4, 1, false)
+        },
+        None,
+        false,
+        platform::DeviceRequest::Automatic,
+    )
+}
+
+/// Strict upgrade: a load that exports 256 rows of logits plans, charges
+/// and holds the readout of the same load exporting none (its launch
+/// pool's floor, and the output slot a served launch's retained output
+/// grows by), a served launch takes its readout slots from it as there,
+/// and its graph pools commit nothing more until a launch exports.
+#[test]
+fn an_exporting_loads_served_readout_is_a_load_exporting_nones() {
+    let readout = |(mut domain, mut bindings): Fixture| {
+        let planned = domain.execution.resources().target_readout_graph().clone();
+        let pool = |domain: &ExecutorDomain<TestFamily>| {
+            let pool = domain.resources.target_readout_graph(served_readout(usize::MAX));
+            (pool.committed_bytes().unwrap(), pool.output_slot_bytes(), pool.available_output())
+        };
+        let floor = pool(&domain);
+        let request = RequestId(1);
+        open(&mut domain, &mut bindings, request);
+        let reserved = domain
+            .reserve(&mut bindings, &[sampling(request, crate::batching::Demand::NONE, crate::Shaping::default())])
+            .unwrap();
+        let serving = pool(&domain);
+        drop(reserved);
+        (planned, floor, serving, domain.resources.committed_bytes().unwrap())
+    };
+    let (served, exporting) = (readout(exporting_load(0)), readout(exporting_load(256)));
+    assert_eq!(exporting, served);
+}
+
+/// What a served launch projecting `projected` rows reads out: the readout
+/// pool it takes its slots from.
+fn served_readout(projected: usize) -> crate::resources::LaunchReadout {
+    crate::resources::LaunchReadout { projected, exports: false }
+}
+
+/// The bytes `domain`'s device ledger holds as `holding`.
+fn held_as<F: ProgramFamily>(domain: &ExecutorDomain<F>, holding: crate::memory::ledger::Holding) -> u64 {
+    domain
+        .resources
+        .ledgers()
+        .device()
+        .entries()
+        .into_iter()
+        .filter(|entry| entry.holding == holding)
+        .map(|entry| entry.bytes)
+        .sum()
+}
+
+/// The export readout's slots, allocated and committed now.
+fn export_slots<F: ProgramFamily>(domain: &ExecutorDomain<F>) -> (crate::GraphSlots, u64) {
+    let pool = domain.resources.target_readout_export_graph().expect("an exporting load has an export pool");
+    (pool.allocated(), pool.committed_bytes().unwrap())
+}
+
+/// The export readout's slots are claimed on demand: a load that exports
+/// holds none until a launch that exports reserves, which claims an
+/// activation and an output slot of the export family; once no launch
+/// holds them they idle as the ledger's cache, and the next launch that
+/// exports takes them up again, growing none.
+#[test]
+fn a_launch_that_exports_claims_the_export_slots_and_they_idle_once_done() {
+    use crate::memory::ledger::{CacheKind, CommittedKind, Holding};
+    let (mut domain, mut bindings) = exporting_load(256);
+    let requests = (1..=3).map(RequestId).collect::<Vec<_>>();
+    for &request in &requests {
+        open(&mut domain, &mut bindings, request);
+    }
+    let none = crate::GraphSlots { activations: 0, output: 0 };
+    let one = crate::GraphSlots { activations: 1, output: 1 };
+    let exports = Holding::Committed(CommittedKind::Exports);
+    let idle = Holding::Cache(CacheKind::GraphSlots);
+    assert_eq!(export_slots(&domain), (none, 0), "a load holds no export slot until a launch exports");
+    let reserved = domain.reserve(&mut bindings, &[exporting(requests[0], 2)]).unwrap();
+    let (slots, bytes) = export_slots(&domain);
+    assert_eq!(slots, one, "the launch claims an activation and an output slot");
+    assert!(bytes > 0 && held_as(&domain, exports) > 0, "its claim holds them");
+    drop(reserved);
+    // A launch that exports nothing finds them free and idles them.
+    drop(domain.reserve(&mut bindings, &[sampling(requests[1], crate::batching::Demand::NONE, crate::Shaping::default())]).unwrap());
+    assert_eq!(export_slots(&domain), (one, bytes), "idle, they stay allocated");
+    assert_eq!(held_as(&domain, exports), 0, "no claim holds them");
+    assert!(held_as(&domain, idle) > 0, "they are the ledger's cache");
+    let reserved = domain.reserve(&mut bindings, &[exporting(requests[2], 2)]).unwrap();
+    assert_eq!(export_slots(&domain), (one, bytes), "the next launch that exports grows none");
+    assert_eq!(held_as(&domain, idle), 0, "it takes their cache up again");
+    assert!(held_as(&domain, exports) > 0);
+    drop(reserved);
+}
+
+/// A launch that exports whose slots the device's memory cannot hold is
+/// refused at reservation for capacity, which the owner's release order
+/// answers: short of memory to grow them, and again once a claim took the
+/// idle slots' cache, until the release of what yielded frees them.
+#[test]
+fn a_launch_that_exports_short_of_memory_is_refused_for_capacity() {
+    use crate::memory::ledger::CommittedKind;
+    let take_all = |domain: &ExecutorDomain<TestFamily>| {
+        let ledger = domain.resources.ledgers().device().clone();
+        ledger.change(|keeping| ledger.claim_units(&keeping.claims(), CommittedKind::Scratch, std::num::NonZeroU64::MIN, u64::MAX)).0
+    };
+    let refused = |result: Result<DomainReservation, DomainError>| match result {
+        Err(DomainError::Capacity(error)) => error,
+        Err(other) => panic!("refused as {other:?}, not for capacity"),
+        Ok(_) => panic!("the launch was admitted"),
+    };
+    let (mut domain, mut bindings) = exporting_load(256);
+    let requests = (1..=4).map(RequestId).collect::<Vec<_>>();
+    for &request in &requests {
+        open(&mut domain, &mut bindings, request);
+    }
+    let one = crate::GraphSlots { activations: 1, output: 1 };
+    let slot_bytes = domain.resources.target_readout_export_graph().unwrap().hold_bytes(one).unwrap();
+    let room = take_all(&domain);
+    let short = refused(domain.reserve(&mut bindings, &[exporting(requests[0], 2)]));
+    assert!(short.required >= slot_bytes, "short of the export slots' {slot_bytes} bytes: {short:?}");
+    assert_eq!(export_slots(&domain).0, crate::GraphSlots { activations: 0, output: 0 }, "nothing was grown");
+    drop(room);
+    drop(domain.reserve(&mut bindings, &[exporting(requests[0], 2)]).unwrap());
+    drop(domain.reserve(&mut bindings, &[sampling(requests[1], crate::batching::Demand::NONE, crate::Shaping::default())]).unwrap());
+    // A claim takes the idle slots' cache with every byte that yields.
+    let room = take_all(&domain);
+    assert!(domain.export_class.idle.taken());
+    refused(domain.reserve(&mut bindings, &[exporting(requests[2], 2)]));
+    for _ in 0..4 {
+        if domain.release_yielded(&mut bindings, crate::CompletionWake::new(|| {})).unwrap() == crate::domain::Yielded::Pending {
+            while domain.advance_slot_release().is_none() {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+    }
+    assert_eq!(export_slots(&domain), (crate::GraphSlots { activations: 0, output: 0 }, 0), "the taken slots are released");
+    drop(room);
+    assert!(domain.reserve(&mut bindings, &[exporting(requests[3], 2)]).is_ok(), "with memory again, a launch grows them anew");
 }
 
 /// A prompt chunk plans the rest of its group behind it, or without chains
@@ -1995,7 +2145,7 @@ fn attach_pending_priming(
     let row_bytes = domain.head_conditioning_bytes();
     let conditioning = FeatureRows::new(vec![0u8; row_bytes].into(), 1).unwrap();
     // The launch pool: only it holds any launch's projected rows.
-    let pool = domain.resources.target_readout_graph(usize::MAX);
+    let pool = domain.resources.target_readout_graph(served_readout(usize::MAX));
     let inputs = crate::HeadLaunchInputs::new(
         batch,
         vec![advance],
@@ -2050,7 +2200,7 @@ fn publish_before_priming(
 fn deferred_priming_commits_after_target_publication_and_releases_leases() {
     let request = RequestId(93);
     let (mut domain, flight, control) = target_with_pending_priming(request);
-    let held_outputs = domain.resources.target_readout_graph(usize::MAX).available_output();
+    let held_outputs = domain.resources.target_readout_graph(served_readout(usize::MAX)).available_output();
     let (pending, mut priming) = publish_before_priming(&mut domain, flight);
     domain
         .reconcile(pending, PhysicalDecision { accepted_rows: 2 })
@@ -2066,7 +2216,7 @@ fn deferred_priming_commits_after_target_publication_and_releases_leases() {
         "no eviction before head completion"
     );
     assert_eq!(
-        domain.resources.target_readout_graph(usize::MAX).available_output(),
+        domain.resources.target_readout_graph(served_readout(usize::MAX)).available_output(),
         held_outputs
     );
     let woke = Arc::new(AtomicBool::new(false));
@@ -2082,7 +2232,7 @@ fn deferred_priming_commits_after_target_publication_and_releases_leases() {
     assert_eq!(checkpoint.target.position(), 2);
     assert_eq!(checkpoint.head.as_ref().unwrap().position(), 1);
     assert_eq!(
-        domain.resources.target_readout_graph(usize::MAX).available_output(),
+        domain.resources.target_readout_graph(served_readout(usize::MAX)).available_output(),
         held_outputs + 1
     );
     // The returned binding right is usable only after the second flight ends.

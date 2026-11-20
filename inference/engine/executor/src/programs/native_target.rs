@@ -903,9 +903,14 @@ impl NativeTargetProgram {
             }
             ReadoutKind::Logits
         } else if actual_selected > 0 {
-            // A served selection projects exactly the rows it selects. The
-            // certified readout serves it where every selected row samples
-            // or takes its largest admitted logit at a temperature at most.
+            // A served selection projects exactly the rows it selects: a
+            // row demanding a selection is one (`magnitude_batching`), and
+            // any other projected row demands logits. The certified readout
+            // serves it where every selected row samples or takes its
+            // largest admitted logit at a temperature at most.
+            if actual_projected != actual_selected {
+                return Err(invalid("a served selection projects only its selected rows"));
+            }
             ReadoutKind::Selection {
                 shaped: shaping.iter().any(shapes),
                 certified: self
