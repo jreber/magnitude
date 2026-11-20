@@ -491,6 +491,91 @@ fn a_groups_places_hold_what_a_prompt_chunk_exports() {
     assert_eq!(wide_places, narrow_places);
 }
 
+/// A one-row decode of `request` at 0 demanding `demand`, sampling its next
+/// token under `shaping`.
+fn sampling(request: RequestId, demand: crate::batching::Demand, shaping: crate::Shaping) -> Operation {
+    Operation::Forward {
+        request,
+        kind: WorkKind::Decode,
+        tokens: vec![crate::TokenId(1)],
+        position: 0,
+        conditioning: None,
+        demand: demand | crate::batching::Demand::SELECT,
+        select: vec![crate::SelectSpec {
+            sampling: crate::Sampling::Categorical,
+            seed: 1,
+            position: 0,
+            domain: 0,
+            mask: None,
+            shaping,
+            history: None,
+        }],
+        committed: 1,
+        prime: None,
+    }
+}
+
+/// A decode of `rows` rows of `request` at 0, each demanding its logits.
+fn exporting(request: RequestId, rows: usize) -> Operation {
+    Operation::Forward {
+        request,
+        kind: WorkKind::Decode,
+        tokens: vec![crate::TokenId(1); rows],
+        position: 0,
+        conditioning: None,
+        demand: crate::batching::Demand::LOGITS,
+        select: Vec::new(),
+        committed: rows,
+        prime: None,
+    }
+}
+
+/// A load that exports logits decides per launch, at reservation: a launch
+/// none of whose rows demands logits selects shaped, as in a load that
+/// exports none; a launch with a row demanding logits selects only
+/// unshaped, in any of its forwards, and projects at most the rows the
+/// load exports, its selected rows among them.
+#[test]
+fn an_exporting_load_exports_per_launch() {
+    let shaped = crate::Shaping {
+        temperature: 0.7,
+        top_k: 2,
+        ..crate::Shaping::default()
+    };
+    let (none, logits) = (crate::batching::Demand::NONE, crate::batching::Demand::LOGITS);
+    let (mut domain, mut bindings) = fixture_of(
+        tiny_definition(),
+        ResourceLimits {
+            exported_logits_rows: 2,
+            ..limits(4, 1, false)
+        },
+        None,
+        false,
+        platform::DeviceRequest::Automatic,
+    );
+    let requests = (1..=6).map(RequestId).collect::<Vec<_>>();
+    for &request in &requests {
+        open(&mut domain, &mut bindings, request);
+    }
+    let refused = |result: Result<DomainReservation, DomainError>| match result {
+        Err(DomainError::Input(detail)) => detail,
+        Err(other) => panic!("refused as {other:?}, not as invalid input"),
+        Ok(_) => panic!("the launch was admitted"),
+    };
+    let mut reserve = |operations: &[Operation]| domain.reserve(&mut bindings, operations);
+    assert!(reserve(&[sampling(requests[0], none, shaped)]).is_ok(), "a launch demanding no logits selects shaped");
+    let detail = refused(reserve(&[sampling(requests[1], logits, shaped)]));
+    assert!(detail.contains("selects unshaped"), "{detail}");
+    let detail = refused(reserve(&[sampling(requests[1], none, shaped), exporting(requests[2], 1)]));
+    assert!(detail.contains("selects unshaped"), "{detail}");
+    assert!(reserve(&[sampling(requests[1], logits, crate::Shaping::default()), exporting(requests[2], 1)]).is_ok());
+    let detail = refused(reserve(&[exporting(requests[3], 3)]));
+    assert!(detail.contains("projects 3 logits rows; the load exports 2"), "{detail}");
+    assert!(reserve(&[exporting(requests[4], 2)]).is_ok(), "the exported rows fit");
+    let detail = refused(reserve(&[sampling(requests[5], none, crate::Shaping::default()), exporting(requests[3], 2)]));
+    assert!(detail.contains("projects 3 logits rows; the load exports 2"), "{detail}");
+}
+
 /// A prompt chunk plans the rest of its group behind it, or without chains
 /// the one chunk a pipelined successor runs.
 #[test]

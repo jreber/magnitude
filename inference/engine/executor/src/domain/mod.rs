@@ -1984,10 +1984,12 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     }
 
     /// Refuse a launch whose vocabulary work the load did not plan: more
-    /// selected target rows or drafting requests than the selection bound,
-    /// logits a served load does not export, more exported rows than a
-    /// diagnostic load exports, or shaping in a launch whose logits are
-    /// exported (shaping rewrites the logits in place).
+    /// selected target rows or drafting requests than the selection bound;
+    /// and where a row demands logits, so the launch runs an export class
+    /// (`readout::ReadoutKind::Logits`), logits from a load that exports
+    /// none, shaping (shaping rewrites the logits in place), or more
+    /// projected rows than the load exports. A launch none of whose rows
+    /// demands logits runs the load's served classes, whatever it exports.
     fn admit_selection(
         &self,
         lane: ReservationLane,
@@ -1997,18 +1999,12 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         match lane {
             ReservationLane::Target => {
                 let forwards = operations.iter().filter_map(|operation| match operation {
-                    Operation::Forward {
-                        kind,
-                        tokens,
-                        demand,
-                        select,
-                        ..
-                    } => Some((kind, tokens, demand, select)),
+                    Operation::Forward { demand, select, .. } => Some((demand, select)),
                     Operation::Head { .. } | Operation::Encode { .. } => None,
                 });
                 let selected = forwards
                     .clone()
-                    .map(|(_, _, _, select)| select.len())
+                    .map(|(_, select)| select.len())
                     .sum::<usize>();
                 if selected > limits.max_selected_rows {
                     return Err(DomainError::Input(format!(
@@ -2016,19 +2012,18 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                         limits.max_selected_rows
                     )));
                 }
-                if !readout::exports_logits(limits) {
-                    if forwards
-                        .clone()
-                        .any(|(_, _, demand, _)| demand.contains(Demand::LOGITS))
-                    {
-                        return Err(DomainError::Input(
-                            "launch demands logits from a load that exports none".into(),
-                        ));
-                    }
+                if !forwards
+                    .clone()
+                    .any(|(demand, _)| demand.contains(Demand::LOGITS))
+                {
                     return Ok(());
                 }
-                let projected = projected_rows(operations);
-                for (_, _, _, select) in forwards {
+                if !readout::exports_logits(limits) {
+                    return Err(DomainError::Input(
+                        "launch demands logits from a load that exports none".into(),
+                    ));
+                }
+                for (_, select) in forwards {
                     for spec in select {
                         let params = target::select_row(spec)
                             .shaping
@@ -2036,11 +2031,12 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                             .map_err(|error| DomainError::Input(error.to_string()))?;
                         if readout::shapes(&params) {
                             return Err(DomainError::Input(
-                                "a load that exports logits selects unshaped".into(),
+                                "a launch that exports logits selects unshaped".into(),
                             ));
                         }
                     }
                 }
+                let projected = projected_rows(operations);
                 if projected > limits.exported_logits_rows {
                     return Err(DomainError::Input(format!(
                         "launch projects {projected} logits rows; the load exports {}",

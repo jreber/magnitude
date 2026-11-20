@@ -66,8 +66,10 @@ pub struct ResourceLimits {
     /// Requests one drafter launch drafts for: the selection bound of the
     /// head and separate draft.
     pub max_drafting_slots: usize,
-    /// Rows one launch may export full logits for. Zero for a served load,
-    /// which prepares no logits class; diagnostics that read logits set it.
+    /// Rows one launch may export full logits for: a launch with a row
+    /// demanding logits runs one of the load's export classes, beside the
+    /// classes every other launch runs. Zero for a load that prepares no
+    /// export class.
     pub exported_logits_rows: usize,
     pub max_images_per_request: usize,
     pub max_image_cells: usize,

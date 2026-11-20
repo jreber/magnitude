@@ -723,9 +723,11 @@ impl<'a> Preparation<'a> {
     /// Store `scope` as its planes when its head admits them and the
     /// backend has their kernels (`super::readout`): this reader's
     /// selections of up to the backend's `certified_rows` run the certified
-    /// levels, its other reads the planes' full pass. `selected_rows` are
-    /// the reader's selection classes. Every reader of a scope reads the one
-    /// form it is stored in.
+    /// levels, its other reads the planes' full pass, the logits a load
+    /// exports among them: a load stores the same form whether it exports
+    /// logits or not, so its launches demanding none select as a load
+    /// exporting none does. `selected_rows` are the reader's selection
+    /// classes. Every reader of a scope reads the one form it is stored in.
     #[allow(clippy::too_many_arguments)]
     fn qualified_readout(
         &mut self,
@@ -737,10 +739,7 @@ impl<'a> Preparation<'a> {
         selected_rows: Vec<u64>,
         canonical: Option<ProjectionKernels>,
     ) -> Result<Option<ProjectionKernels>, CatalogFailure> {
-        if self
-            .selection_limits
-            .is_none_or(|limits| limits.exported_logits_rows != 0)
-        {
+        if self.selection_limits.is_none() {
             return Ok(None);
         }
         let Some(device) = self.tuning.device() else {
