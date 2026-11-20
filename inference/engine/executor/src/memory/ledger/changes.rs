@@ -37,7 +37,10 @@
 //!   way, and a settled one ([`Sample::settled`]) waits for them to end. So
 //!   what waits inside a change (a backend waiting for the device to finish
 //!   with a block's storage before it frees it) holds readings off that
-//!   long, and nothing inside a change waits for a sample: a step off the
+//!   long, and nothing inside a change waits for a sample but its owner
+//!   (a load, which reads between its own allocations): its change is set
+//!   aside while it waits, so it holds no reading off then, and owners
+//!   waiting beside one another never wait on each other. A step off the
 //!   owner's thread waits for a settled sample before it begins, never
 //!   inside.
 
@@ -50,8 +53,9 @@ use std::time::Instant;
 #[cfg(test)] use super::view::Ledger;
 
 /// A scope's own allocation changes across its stores ([`Ledgers`]): above
-/// [`IN_FLIGHT_BITS`], how many were begun (a journaled change's number, and the
-/// place a sample takes among them, [`Sampled`]); below, how many are under
+/// [`IN_FLIGHT_BITS`], how many were begun, or taken up again after a wait
+/// for a sample ([`Aside`]) (a journaled change's number, and the place a
+/// sample takes among them, [`Sampled`]); below, how many are under
 /// way ([`Changing`]). A sample stands only where none was under way as it
 /// began and none began while it read ([`Sampled::attempt`]): a change
 /// numbered below its place was made, OS effect and record alike, before
@@ -78,15 +82,14 @@ pub struct Changes {
     pub(super) clock: Clock,
 }
 
-/// How many changes ended, how many settled samples wait to stand (a step
-/// off the owner's thread begins none while one waits, [`Changes::back`],
-/// so a sample waits for the steps under way and the entry changes beside
-/// it, [`Sampled::settled`]), and how many
-/// changes under way are the owner's and whose thread is not itself waiting
-/// in a settled sample (a step never waits beside one: the owner may be
-/// waiting on the step; but an owner waiting for a sample is waiting on no
-/// step, so its change stops counting from the wait's start to its end,
-/// [`Sampled::settled`]).
+/// How many changes ended or were set aside, how many settled samples wait
+/// to stand (a step off the owner's thread begins none while one waits,
+/// [`Changes::back`], so a sample waits for the steps under way and the
+/// entry changes beside it, [`Sampled::settled`]), and how many changes
+/// under way are the owner's and not set aside by a wait for a settled
+/// sample (a step never waits beside one: the owner may be waiting on the
+/// step; but an owner waiting for a sample is waiting on no step,
+/// [`Aside`]).
 #[derive(Default)]
 pub(super) struct Meet {
     ended: u64,
@@ -162,12 +165,6 @@ impl Changes {
     /// The number of the change of this scope this thread has under way.
     pub(super) fn open_here(&self) -> Option<u64> {
         OPEN.with_borrow(|open| open.iter().find(|open| open.key == self.key()).map(|open| open.number))
-    }
-
-    /// Whether the change of this scope this thread has under way is an
-    /// owner's ([`Self::change`], [`OpenChange`]).
-    fn owner_open_here(&self) -> bool {
-        OPEN.with_borrow(|open| open.iter().any(|open| open.key == self.key() && open.owner))
     }
 
     /// Whether the change of this scope this thread has under way claims
@@ -369,6 +366,60 @@ impl<'c> Claiming<'c> {
     }
 }
 
+/// A wait for a settled sample ([`Sampled::settled`]), let go however it
+/// ends, and the owner's change its thread has open set aside meanwhile.
+///
+/// An owner's change spans a whole load, but the owner reads only between
+/// its own allocations, each recorded as it is made: while its thread waits
+/// for a sample, no effect of its change is under way. So for the wait the
+/// change is not under way: it leaves the thread's open changes (an effect
+/// there, the wait's reconcile's included, is a change of its own) and the
+/// count of those under way, which is signalled as an end, and it stops
+/// counting among the owner's ([`Meet::owner`]). Owners waiting beside one
+/// another so never wait on one another's changes, which would only end
+/// after each waiter went on. As the wait ends, the change is open again
+/// and counted as begun anew (its number unchanged): a sample whose figures
+/// were read across its return never stands, however the count's
+/// under-way part moved meanwhile.
+struct Aside<'a> {
+    changes: &'a Changes,
+    open: Option<Open>,
+}
+
+impl<'a> Aside<'a> {
+    fn set(changes: &'a Changes) -> Self {
+        let open = OPEN.with_borrow_mut(|open| open.iter().position(|open| open.key == changes.key()).map(|at| open.remove(at)));
+        if let Some(open) = &open {
+            assert!(open.owner, "invariant violated: a step waits for a settled sample inside its change");
+            changes.count.fetch_sub(1, Ordering::SeqCst);
+        }
+        let mut meet = changes.meet();
+        meet.wanted += 1;
+        if open.is_some() {
+            meet.owner -= 1;
+            meet.ended += 1;
+        }
+        drop(meet);
+        changes.moved.notify_all();
+        Self { changes, open }
+    }
+}
+
+impl Drop for Aside<'_> {
+    fn drop(&mut self) {
+        let changes = self.changes;
+        let mut meet = changes.meet();
+        meet.wanted -= 1;
+        if let Some(open) = self.open.take() {
+            meet.owner += 1;
+            changes.count.fetch_add(ONE_CHANGE + 1, Ordering::SeqCst);
+            OPEN.with_borrow_mut(|opened| opened.push(open));
+        }
+        drop(meet);
+        changes.moved.notify_all();
+    }
+}
+
 /// The instant a sample was taken at: its time on the owner's clock, and
 /// its place among the process's own allocation changes ([`Changes`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -425,37 +476,19 @@ impl Sampled {
     /// reconcile takes, and a wait there would deadlock with it. So the
     /// wait is bounded by the steps under way plus the entry changes that
     /// overlap it, each one native call, and by no growth's length (a
-    /// growth is steps, which are held back). A
-    /// thread that waits here waits on no step, so the owner's change it
-    /// has open (a load's, which takes its reading inside it) stops
-    /// counting in [`Meet::owner`] while it waits, and steps begun
-    /// meanwhile are held back ([`Changes::back`]) exactly as beside a
-    /// sample with no change open. The change itself stays open (its
-    /// number still counts in the sample's own place, `mine`); it counts
-    /// again as the wait ends.
+    /// growth is steps, which are held back), and by the owners' changes
+    /// under way beside it, each of which ends or is itself set aside at
+    /// its next wait for a sample, never waiting on this one ([`Aside`]).
+    /// The owner's change the waiting thread has open (a load's, which takes
+    /// its reading between its own allocations) is set aside for the wait:
+    /// the sample waits beside no change of its own, and no other wait
+    /// waits on it.
     fn settled<G, T>(changes: &Changes, now: &impl Fn() -> Instant, reconcile: impl Fn() -> G, read: &impl Fn() -> T) -> (Self, G, T) {
-        /// The wait for a sample, let go however it ends.
-        struct Wanted<'a>(&'a Changes, usize);
-        impl Drop for Wanted<'_> {
-            fn drop(&mut self) {
-                let mut meet = self.0.meet();
-                meet.wanted -= 1;
-                meet.owner += self.1;
-                drop(meet);
-                self.0.moved.notify_all();
-            }
-        }
-        let owned = usize::from(changes.owner_open_here());
-        let mut meet = changes.meet();
-        meet.wanted += 1;
-        meet.owner -= owned;
-        drop(meet);
-        let _wanted = Wanted(changes, owned);
-        let mine = u64::from(changes.open_here().is_some());
+        let _aside = Aside::set(changes);
         loop {
             let grant = reconcile();
             let ended = changes.meet().ended;
-            if let Some((at, figures)) = Self::attempt(changes, now, read, mine) {
+            if let Some((at, figures)) = Self::attempt(changes, now, read, 0) {
                 return (at, grant, figures);
             }
             let meet = changes.meet();
