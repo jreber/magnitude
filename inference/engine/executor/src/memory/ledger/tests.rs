@@ -1956,6 +1956,61 @@ fn an_effect_and_its_record_are_one_change_no_reading_stands_across() {
     ledger.change(|_| drop(claim));
 }
 
+/// Loads in one process, each with its change open (`OpenChange::begin` in
+/// the load path), take their settled samples beside one another: each
+/// stands, since an owner waiting for a sample has its change set aside,
+/// where each once waited for the others' changes to end, which they only
+/// did after it went on. Its change is open again once its sample stands.
+#[test]
+fn loads_beside_one_another_take_their_settled_samples() {
+    const LOADS: usize = 4;
+    let changes = Ledgers::strict().changes().clone();
+    let all_open = Arc::new(std::sync::Barrier::new(LOADS));
+    let (sampled, samples) = std::sync::mpsc::channel();
+    for _ in 0..LOADS {
+        let (changes, all_open, sampled) = (changes.clone(), all_open.clone(), sampled.clone());
+        std::thread::spawn(move || {
+            let _load = OpenChange::begin(&changes);
+            all_open.wait();
+            let _sample = Sample::scripted(&changes, host_sample(64 * GB, 64 * GB));
+            sampled.send(changes.open_here().is_some()).expect("the test waits for every sample");
+        });
+    }
+    for _ in 0..LOADS {
+        let open = samples.recv_timeout(Duration::from_secs(60)).expect("a load's settled sample stands beside the others' open changes");
+        assert!(open, "a load's change is open again once its sample stood");
+    }
+}
+
+/// A load's settled sample still waits for an owner's change under way
+/// beside it that is not itself waiting for a sample, until it ends.
+#[test]
+fn a_settled_sample_waits_for_a_load_under_way() {
+    let changes = Ledgers::strict().changes().clone();
+    let (opened, open) = std::sync::mpsc::channel();
+    let (end, ended) = std::sync::mpsc::channel::<()>();
+    let under_way = {
+        let changes = changes.clone();
+        std::thread::spawn(move || {
+            let _load = OpenChange::begin(&changes);
+            opened.send(()).expect("the test waits for the change");
+            ended.recv().expect("the test ends the load");
+        })
+    };
+    open.recv().expect("the load's change is open");
+    let (sampled, samples) = std::sync::mpsc::channel();
+    let waiting = std::thread::spawn(move || {
+        let _load = OpenChange::begin(&changes);
+        let _sample = Sample::scripted(&changes, host_sample(64 * GB, 64 * GB));
+        sampled.send(()).expect("the test waits for the sample");
+    });
+    assert!(samples.recv_timeout(Duration::from_millis(50)).is_err(), "a settled sample waits for a load's change under way");
+    end.send(()).expect("the load waits for its end");
+    under_way.join().expect("the load ends");
+    samples.recv_timeout(Duration::from_secs(60)).expect("the sample stands once the load ended");
+    waiting.join().expect("the waiting load ends");
+}
+
 /// An entry's holder dropping is its close: what its allocations keep idle
 /// returns then, and an entry already closed runs what is asked at once.
 #[test]
