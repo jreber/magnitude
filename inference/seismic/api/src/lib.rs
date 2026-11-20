@@ -368,6 +368,10 @@ pub use trace::{
 };
 
 pub use seismic_compiler::blocks::Packing as DeviceBlockPacking;
+/// What `backend` charges one allocation of a contract: its allocator's
+/// rounding, which a load's plan prices each allocation by and the ledger
+/// is charged (`seismic_compiler::charge`).
+pub use seismic_compiler::charge::allocation_charge;
 
 /// A replay of `backend`'s device block allocator, the rule its blocks are
 /// placed by (`DeviceBlockPacking`), or `None` for a backend whose memory is

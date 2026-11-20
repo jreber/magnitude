@@ -33,14 +33,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 /// buffers share before it fills another.
 const CARVED_BLOCK_PAGES: u64 = 16;
 
-/// The largest buffer carved from an entry's held block; a larger one takes
-/// pages of its own. Faulting fresh pages costs far more than zeroing held
-/// ones, so every buffer a heap serves from memory it keeps is carved, and
-/// the heap keeps what is under its mmap threshold ceiling (32 MiB); this
-/// is 1 MiB because the block an entry holds idle is as large as the
-/// largest buffer carved, and a buffer of more (weights, state) lives long
-/// enough for its faults to amortize.
-const CARVED_LIMIT: u64 = 1 << 20;
+// The largest buffer carved from an entry's held block; a larger one takes
+// pages of its own (the charge rule's, `seismic_compiler::charge`).
+use seismic_compiler::charge::CPU_CARVED_LIMIT as CARVED_LIMIT;
 
 /// The least alignment of every buffer's first byte, whatever its request:
 /// the widest SIMD register the backend emits, as the heap's `max_align_t`
@@ -56,8 +51,10 @@ pub(crate) fn allocation_error(error: AllocationFailure) -> ExecutionError {
 }
 
 enum Allocation {
-    /// A range of host pages of this crate's ([`WritableBuffer::new`]).
-    Pages(PageRange),
+    /// Host pages of its own, the whole of its block ([`WritableBuffer::pages`]).
+    Block(PageRange),
+    /// A range of its entry's filling block ([`Carver`]).
+    Carved(PageRange),
     /// Host memory another owner holds ([`Buffer::borrowed`]).
     Borrowed(BorrowedRegion),
 }
@@ -86,6 +83,11 @@ impl PageBlock {
 
     fn bytes(&self) -> u64 {
         self.0.bytes() as u64
+    }
+
+    /// Its whole pages, charged to its entry.
+    fn charged(&self) -> u64 {
+        self.0.charge().bytes()
     }
 
     fn entry(&self) -> &Arc<dyn Entry> {
@@ -285,7 +287,7 @@ impl WritableBuffer {
             return Self::pages(bytes, entry);
         }
         let range = Carver::process().carve(bytes, alignment.max(LEAST_ALIGNMENT), page, entry)?;
-        Ok(Self(Buffer { inner: Arc::new(Allocation::Pages(range)) }))
+        Ok(Self(Buffer { inner: Arc::new(Allocation::Carved(range)) }))
     }
 
     /// `bytes` in whole host pages of its own, at least one, never carved:
@@ -300,7 +302,18 @@ impl WritableBuffer {
             .checked_next_multiple_of(page)
             .ok_or_else(|| allocation_error(AllocationFailure::Unrepresentable))?;
         let range = PageRange { block: Some(PageBlock::allocate(whole, entry)?), offset: 0, bytes };
-        Ok(Self(Buffer { inner: Arc::new(Allocation::Pages(range)) }))
+        Ok(Self(Buffer { inner: Arc::new(Allocation::Block(range)) }))
+    }
+
+    /// The bytes its entry is charged for it: pages of its own, their whole
+    /// pages, freed as its last handle drops; a carved range, its bytes of
+    /// the block its entry holds charged whole ([`Carver`]).
+    pub fn charged(&self) -> u64 {
+        match &*self.0.inner {
+            Allocation::Block(range) => range.block().charged(),
+            Allocation::Carved(range) => range.bytes,
+            Allocation::Borrowed(_) => panic!("invariant violated: a writable buffer over borrowed memory"),
+        }
     }
 
     /// Copies `bytes` into the buffer at `offset`. The range lies inside the
@@ -346,7 +359,7 @@ impl Buffer {
     /// Logical bytes.
     pub fn len(&self) -> u64 {
         match &*self.inner {
-            Allocation::Pages(range) => range.bytes,
+            Allocation::Block(range) | Allocation::Carved(range) => range.bytes,
             Allocation::Borrowed(region) => region.len,
         }
     }
@@ -359,7 +372,7 @@ impl Buffer {
     pub fn data_pointer(&self) -> *mut u8 {
         match &*self.inner {
             // In the block by construction.
-            Allocation::Pages(range) => unsafe { range.block().base().as_ptr().add(range.offset as usize) },
+            Allocation::Block(range) | Allocation::Carved(range) => unsafe { range.block().base().as_ptr().add(range.offset as usize) },
             Allocation::Borrowed(region) => region.pointer.as_ptr(),
         }
     }

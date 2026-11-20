@@ -53,6 +53,19 @@ impl Buffer {
             Memory::Registered(block) => block.bytes() as u64,
         }
     }
+    /// The bytes its allocation's entry is charged for it, freed from it as
+    /// it drops: a device range's bytes carved from its block, or the whole
+    /// charge of memory of its own (whole host pages, allocation
+    /// granules).
+    pub fn charged(&self) -> u64 {
+        match &*self.memory {
+            Memory::Device(range) => range.charged(),
+            Memory::Mapped(mapped) => mapped.charged(),
+            Memory::Block(block) => block.charged(),
+            Memory::HostNode(block) => block.charged(),
+            Memory::Registered(block) => block.charged(),
+        }
+    }
     /// The host address of host memory's first byte (mapped, host-node or
     /// registered memory); device memory has none (the host reaches it by
     /// driver copies).

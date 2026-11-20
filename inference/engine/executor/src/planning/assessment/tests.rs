@@ -1525,7 +1525,7 @@ fn checked_vision_family_bounds_exact_patch_classes() {
             readout_choices: Vec::new(),
             unplaced_output: Vec::new(),
             bank: None,
-            record_ports: None,
+            native: None,
         };
         let program =
             crate::operators::vision::vision_program(&description, &|_| Ok(f32)).unwrap();
