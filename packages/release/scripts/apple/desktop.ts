@@ -38,9 +38,22 @@ export const detachDesktopDmg = (device: string) => appleCommand("/usr/bin/hdiut
   }),
 )
 
+const INSTALLER_VOLUME = "Install Magnitude"
+
+// Finder resolves the layout's folder by volume name, so another mounted installer would receive
+// the layout instead of the image being built.
+export const assertInstallerVolumeFree = Effect.gen(function* () {
+  const fs = yield* FileSystem.FileSystem
+  const mounted = join("/Volumes", INSTALLER_VOLUME)
+  if (yield* fs.exists(mounted)) {
+    return yield* new AppleDistributionFailed({ message: `Eject the volume mounted at ${mounted} before building the installer; Finder would lay out that volume instead` })
+  }
+})
+
 /** Lay out the installer around the sealed app without changing its contents. */
 export const packageDesktopDmg = (app: string, output: string) => Effect.scoped(Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem
+  yield* assertInstallerVolumeFree
   const stage = yield* fs.makeTempDirectoryScoped({ prefix: "magnitude-dmg-" })
   const contents = join(stage, "contents")
   yield* fs.makeDirectory(join(contents, ".background"), { recursive: true })
@@ -52,7 +65,7 @@ export const packageDesktopDmg = (app: string, output: string) => Effect.scoped(
   const writable = join(stage, "installer.dmg")
   const mount = join(stage, "mounted")
   yield* fs.makeDirectory(mount)
-  yield* appleCommand("/usr/bin/hdiutil", "create", "-volname", "Install Magnitude", "-srcfolder", contents, "-format", "UDRW", writable)
+  yield* appleCommand("/usr/bin/hdiutil", "create", "-volname", INSTALLER_VOLUME, "-srcfolder", contents, "-format", "UDRW", writable)
   yield* Effect.scoped(Effect.gen(function* () {
     yield* Effect.acquireRelease(
       attachDesktopDmg(writable, mount, "-readwrite"),

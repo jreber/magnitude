@@ -7,7 +7,7 @@ import { linuxPackageFormats } from "../../src/linux-package"
 import { buildWindowsDesktopInstaller } from "./desktop-windows"
 import { signWindowsCode } from "./windows-signing"
 import { BunContext } from "@effect/platform-bun"
-import { buildDesktopDmg, validateDesktopDistribution } from "../apple/desktop"
+import { assertInstallerVolumeFree, buildDesktopDmg, validateDesktopDistribution } from "../apple/desktop"
 import { appleSigning, signAppleCode, appleCommand, verifyNotaryCredentials } from "../apple/signing"
 import { runAppleBuild } from "../apple/compile-bun"
 import { notarizeAppleUnit, regularAppleFiles, writeAppleReceipt } from "../apple/distribution"
@@ -179,7 +179,7 @@ export const buildHostArtifacts = async (
   const host = hostById(hostId)
   // Resolved before compiling so a missing or malformed publisher identity fails immediately.
   const desktopEnvironment = await Effect.runPromise(desktopBuildEnvironment(host.id))
-  if (host.id.startsWith("darwin-")) await runAppleBuild(verifyNotaryCredentials)
+  if (host.id.startsWith("darwin-")) await runAppleBuild(Effect.all([verifyNotaryCredentials, assertInstallerVolumeFree], { discard: true }))
   const output = resolve(outputRoot)
   await rm(output, { recursive: true, force: true })
   await mkdir(output, { recursive: true, mode: 0o700 })
