@@ -865,6 +865,9 @@ fn vision_claims_its_slots_on_an_image_and_releases_them_at_idle() {
     };
     let mut cycles = Vec::new();
     for request in [RequestId(1), RequestId(2)] {
+        // The request's open grows the state it runs in, which idle shrink
+        // returns with vision's slots: a cycle claims from before its open.
+        let before = charged(&domain);
         domain.install_input(request, input.clone()).unwrap();
         let encodes = domain.open_served(&mut bindings, request, None).unwrap();
         assert_eq!(encodes.len(), 1);
@@ -881,13 +884,13 @@ fn vision_claims_its_slots_on_an_image_and_releases_them_at_idle() {
         assert_eq!(encoded - idle, released);
         assert!(released > 0, "idle released no vision storage");
         eprintln!(
-            "vision cycle: opened={opened} encoded={encoded} idle={idle} released={released}"
+            "vision cycle: before={before} opened={opened} encoded={encoded} idle={idle} released={released}"
         );
-        cycles.push((encoded - opened, released, idle));
+        cycles.push((encoded - before, released, idle));
     }
     // The first image also loads the vision weights, which stay resident
-    // until optional components are released; the second claims only the
-    // slots, and idle releases exactly them both times.
+    // until optional components are released; the second claims only its
+    // state and the slots, and idle releases exactly them both times.
     let [(_, first_released, first_idle), (second_claimed, second_released, second_idle)] =
         cycles[..]
     else {
