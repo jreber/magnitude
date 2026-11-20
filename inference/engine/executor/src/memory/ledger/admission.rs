@@ -34,14 +34,23 @@ impl Over {
     }
 }
 
-/// What a relief frees room for, which decides what a preempted request
-/// frees for it ([`State::preemptible_by_value`]).
+/// What a relief frees room for, which decides what covers it and what a
+/// preempted request frees for it ([`State::preemptible_by_value`]). A
+/// claim's relief covers only what the claim was not already refused
+/// against: what it counted as room frees it no more room once yielded.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Frees {
-    /// A request's state, which draws on the load's request slot first.
+    /// A request's state, which draws on the load's request slot first,
+    /// refused past free room and the cache worth nothing, which it counted
+    /// ([`State::take_beside`]).
     RequestState,
-    /// Anything else: room beside the slot.
+    /// Any other claim: room beside the slot. A pool's spare granules
+    /// never cover it: a claim of the pool's class counted them, taking
+    /// them in place, and of another class they free only as whole blocks
+    /// empty, which no figure here knows.
     Room,
+    /// A shortage: room beside the slot, nothing counted.
+    Shortage,
 }
 
 /// Admission by the budget's figures alone: the check inside every take,
@@ -86,7 +95,7 @@ impl State {
             .map(|(sequence, bytes)| {
                 let frees = match frees {
                     Frees::RequestState => *bytes,
-                    Frees::Room => bytes - drawn(*sequence),
+                    Frees::Room | Frees::Shortage => bytes - drawn(*sequence),
                 };
                 (self.value_of(*sequence), *sequence, frees)
             })

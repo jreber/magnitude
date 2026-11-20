@@ -254,8 +254,8 @@ impl Reading {
 /// of its pageable bytes (CPU buffers, host blocks, a discrete device's
 /// host tier, on unified Metal what lies outside the residency set). Such
 /// cold bytes are never supply (`memory::ledger`'s `cold_supply`, which
-/// counts none while the process holds pageable memory there), and serve
-/// only as regrowth evidence past B, which needs a rise of a whole step's
+/// leaves out of it as many bytes as the process holds pageable there), and
+/// serve only as regrowth evidence past B, which needs a rise of a whole step's
 /// bytes (11-11 §4.2): a rise of the process's own aging read as others'
 /// admits at most one step, whose harm sets B again, one step's faults,
 /// the bound the rule already pays for wrong evidence.

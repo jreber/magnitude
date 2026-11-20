@@ -528,9 +528,10 @@ impl State {
     /// until a baseline judges harm, as growth into them could not be told
     /// from harm before; then others' alone. The process's own cold pages
     /// are never supply: where the OS counts them they are left out, and
-    /// where it does not, no cold page is supply while the process holds
-    /// pageable memory there, which may be any of them. A device store
-    /// has none.
+    /// where it does not (macOS, Windows), they are at most the pageable
+    /// bytes the process holds there, each of which frees at most itself
+    /// when compressed or swapped, so what is reclaimable less those bytes
+    /// is others' at the least. A device store has none.
     fn cold_supply(&self, reading: &Reading, figures: seismic::Supply) -> u64 {
         let Some(paging) = reading.paging() else {
             return figures.cold_reclaimable;
@@ -540,8 +541,7 @@ impl State {
         }
         match paging.own_cold {
             seismic::OwnCold::Bytes(_) => figures.cold_reclaimable.min(paging.cold),
-            seismic::OwnCold::Unobserved if self.allocated > self.wired => 0,
-            seismic::OwnCold::Unobserved => figures.cold_reclaimable,
+            seismic::OwnCold::Unobserved => figures.cold_reclaimable.saturating_sub(self.allocated.saturating_sub(self.wired)),
         }
     }
 }
