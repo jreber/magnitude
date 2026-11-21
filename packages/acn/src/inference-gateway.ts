@@ -155,7 +155,9 @@ export const proxyOpenAiInferenceRequest = async (
 ): Promise<Response> => {
   const incoming = new URL(source.url)
   const targetPath = incoming.pathname.slice("/inference".length) || "/"
-  if (targetPath !== "/v1" && !targetPath.startsWith("/v1/")) {
+  // `/tokenize` sits at the engine's root, beside `/v1`, where vLLM serves it,
+  // so a vLLM client finds both from one base URL (`…/inference`).
+  if (targetPath !== "/v1" && !targetPath.startsWith("/v1/") && targetPath !== "/tokenize") {
     return new Response("Not found", { status: 404 })
   }
   const { headers, body } = forwardedRequest(source.headers, originalBody(source.body))

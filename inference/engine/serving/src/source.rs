@@ -93,12 +93,70 @@ pub trait ServedModels: Send + Sync + 'static {
     /// The model's host chat semantics for operations that never lease or
     /// load: counting, template application.
     fn host(&self, model: &str) -> BoxFuture<'_, Result<Arc<dyn HostChat>, ServingError>>;
+
+    /// Teacher-forced scoring of `tokens` under the model `model` names, which
+    /// the source may load. One position per token after the first. `top` asks
+    /// for the top-1 token where it differs from the real one; `next` asks for
+    /// the greedy token after the prompt. A source that cannot score the model
+    /// answers with the error it would give any unsupported operation.
+    fn score(
+        &self,
+        model: &str,
+        tokens: Vec<u32>,
+        top: bool,
+        next: bool,
+    ) -> BoxFuture<'_, Result<PromptScore, ServingError>>;
+}
+
+/// A prompt's teacher-forced score, in the token ids [`HostChat`] uses: one
+/// position per token after the first, and the greedy token after the prompt
+/// when it was asked for.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PromptScore {
+    pub positions: Vec<PositionScore>,
+    pub next: Option<u32>,
+}
+
+/// One prompt position: the real token's log-probability and 1-based rank,
+/// and the top-1 token when it was asked for and differs from the real one.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PositionScore {
+    pub logprob: f64,
+    pub rank: u32,
+    pub top: Option<TopScore>,
+}
+
+/// A position's most likely token and its log-probability.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TopScore {
+    pub token: u32,
+    pub logprob: f64,
 }
 
 /// One bound model generation.
 pub trait ModelInvocation: Send {
     /// Start generating. Dropping the returned stream cancels the request.
     fn generate(self: Box<Self>, request: GenerationRequest) -> GenerationStream;
+}
+
+/// What `/tokenize` encodes: raw text, or chat messages rendered through the
+/// model's chat template.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TokenizeInput {
+    /// Special-token text in `text` is encoded as special tokens;
+    /// `add_special_tokens` controls only what the tokenizer adds itself, such
+    /// as a start-of-text token.
+    Text {
+        text: String,
+        add_special_tokens: bool,
+    },
+    /// `input` carries the caller's `chat_template_kwargs` as its template
+    /// arguments, as template application takes them.
+    Chat {
+        input: ChatInput,
+        add_generation_prompt: bool,
+        add_special_tokens: bool,
+    },
 }
 
 /// Chat semantics that run on the host alone, with the same rendering and
@@ -108,6 +166,13 @@ pub trait HostChat: Send + Sync {
     fn count(&self, input: &ChatInput) -> Result<u64, ServingError>;
     fn apply_template(&self, input: &ChatInput) -> Result<AppliedTemplate, ServingError>;
     fn properties(&self) -> Result<ModelProperties, ServingError>;
+    /// The token ids `input` encodes to, with the tokenizer and template
+    /// generation uses.
+    fn tokenize(&self, input: &TokenizeInput) -> Result<Vec<u32>, ServingError>;
+    /// The text one token id stands for.
+    fn decode_token(&self, token: u32) -> Result<String, ServingError>;
+    /// The longest prompt, in tokens, the model's serving context takes.
+    fn context_limit(&self) -> u64;
 }
 
 /// A request's lifecycle as the engine reports it. `Admitted` precedes all

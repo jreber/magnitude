@@ -53,15 +53,17 @@ struct Workload {
 
 /// The standard service's limits (`standard_service_limits`: 512 prefill
 /// tokens, 32 decode tokens, one conversation) as the engine resolves them
-/// (`planning::resource_limits`): lookahead where the backend is not the
-/// CPU's and the entry gathers no per-layer inputs (`ModelPolicy::resolve`).
+/// (`planning::resource_limits`): a scoring flight's exported logits
+/// (`composition::scoring_rows`: `SCORING_ROWS`, 256, within the 512 launch
+/// rows); lookahead where the backend is not the CPU's and the entry gathers
+/// no per-layer inputs (`ModelPolicy::resolve`).
 fn service(backend: BackendName, definition: &ModelDefinition) -> ResourceLimits {
     ResourceLimits {
         max_launch_rows: 512,
         max_launch_slots: 512,
         max_selected_rows: 32,
         max_drafting_slots: 32,
-        exported_logits_rows: 0,
+        exported_logits_rows: 256,
         max_images_per_request: magnitude_artifacts::MAX_IMAGES_PER_REQUEST,
         max_image_cells: 0,
         lookahead: backend != BackendName::Cpu && definition.decoder.entry.per_layer.is_none(),

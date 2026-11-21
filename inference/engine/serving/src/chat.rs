@@ -1914,6 +1914,16 @@ mod tests {
         fn host(&self, _model: &str) -> BoxFuture<'_, Result<Arc<dyn HostChat>, ServingError>> {
             Box::pin(async { Err(ServingError::Internal("unused".into())) })
         }
+
+        fn score(
+            &self,
+            _model: &str,
+            _tokens: Vec<u32>,
+            _top: bool,
+            _next: bool,
+        ) -> BoxFuture<'_, Result<crate::PromptScore, ServingError>> {
+            Box::pin(async { Err(ServingError::Internal("unused".into())) })
+        }
     }
 
     #[tokio::test]

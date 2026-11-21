@@ -372,13 +372,15 @@ impl AttestedPrograms {
     /// (`seismic::NativeGraphFamily::graph_replays`), by family: this load's
     /// of what its device counts, each plan's once. The chunk readout
     /// family's plans are the readout family's
-    /// (`PreparedTargetReadoutGraphs`), so the readout family counts them.
+    /// (`PreparedTargetReadoutGraphs`), so the readout family counts them;
+    /// the export classes' are their own family's.
     pub(crate) fn graph_replays(&self) -> Vec<(&'static str, seismic::GraphReplays)> {
         let named = |name: &'static str, family: &seismic::NativeGraphFamily| (name, family.graph_replays());
         self.target_graphs
             .iter()
             .map(|graphs| named("target", graphs.family()))
             .chain(self.target_readout_graphs.iter().map(|graphs| named("readout", graphs.family())))
+            .chain(self.target_readout_graphs.iter().filter_map(|graphs| graphs.export_family().map(|family| named("export readout", family))))
             .chain(self.drafter_graphs.iter().map(|graphs| named("drafter", graphs.family())))
             .chain(self.vision_graphs.iter().map(|graphs| named("vision", graphs.family())))
             .chain(self.state_graphs.iter().map(|graphs| named("state", graphs.family())))

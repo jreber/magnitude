@@ -9,7 +9,8 @@ use std::{cell::RefCell, rc::Rc};
 
 /// One family's graph storage. Activations cover the launches of the family
 /// in flight at once; each holds its upload regions and binds the device's
-/// one workspace arena. Output slots outlive their launches (a request
+/// one workspace arena, or, in a pool with no floor, holds its own
+/// ([`Scratch`]). Output slots outlive their launches (a request
 /// retains its last published features), so their count follows the live
 /// requests: they grow one slot at a time under a heap claim. Both start at
 /// the floor of a prompt group of one place and grow to the class a group is
@@ -18,7 +19,8 @@ use std::{cell::RefCell, rc::Rc};
 pub struct NativeGraphPool {
     domain: ResourceDomainId,
     family: NativeGraphFamily,
-    arena: NativeExecutionArena,
+    /// Where its activations hold their workspace ([`Scratch`]).
+    scratch: Scratch,
     upload_regions: Vec<u64>,
     /// Upload regions of one activation.
     activation_bytes: u64,
@@ -33,6 +35,17 @@ pub struct NativeGraphPool {
     allocated: GraphSlots,
     workspace: FreeSlots<NativeGraphFamilySlot>,
     output: FreeSlots<NativeGraphFamilyOutputSlot>,
+}
+
+/// Where a pool's activations hold their workspace.
+enum Scratch {
+    /// The device's one workspace arena, which every family holding
+    /// activations from startup binds.
+    Arena(NativeExecutionArena),
+    /// Each activation its own, made with it: a family that holds none from
+    /// startup (the export readout's), whose workspace then never enlarges
+    /// what every load holds, as vision's.
+    Own,
 }
 
 /// Who reads a family's outputs. The host reads a selection as its step
@@ -67,7 +80,7 @@ impl NativeGraphPool {
         let mut pool = Self {
             domain,
             family: family.clone(),
-            arena: arena.clone(),
+            scratch: Scratch::Arena(arena.clone()),
             upload_regions: charge.upload_regions.clone(),
             activation_bytes: charge.activation_bytes(),
             output_bytes: charge.output_bytes,
@@ -83,6 +96,32 @@ impl NativeGraphPool {
         };
         pool.grow(charges, floor)?;
         Ok(pool)
+    }
+
+    /// A pool of `family` that holds nothing until a launch claims its
+    /// slots: no floor, each activation's workspace its own
+    /// ([`Scratch::Own`]), its slots grown ([`Self::grow`]) under the
+    /// claim of what [`Self::hold_bytes`] and [`Self::hold_graphs`] price.
+    pub(crate) fn on_demand(domain: ResourceDomainId, family: &NativeGraphFamily, outputs: Outputs) -> Self {
+        let upload_regions = crate::planning::serial_upload_regions(family.upload_bytes());
+        let none = GraphSlots {
+            activations: 0,
+            output: 0,
+        };
+        Self {
+            domain,
+            family: family.clone(),
+            scratch: Scratch::Own,
+            activation_bytes: family.workspace_bytes() + family.sync_bytes() + upload_regions.iter().sum::<u64>(),
+            upload_regions,
+            output_bytes: family.output_bytes(),
+            outputs,
+            floor: none,
+            held: none,
+            allocated: none,
+            workspace: Rc::new(RefCell::new(Vec::new())),
+            output: Rc::new(RefCell::new(Vec::new())),
+        }
     }
 
     /// The bytes [`Self::grow`] of `slots` allocates.
@@ -114,10 +153,16 @@ impl NativeGraphPool {
     pub(crate) fn grow(&mut self, charges: &seismic::Charges, slots: GraphSlots) -> Result<(), super::AllocationError> {
         let grows = self.allocated.activations < slots.activations;
         while self.allocated.activations < slots.activations {
-            let slot = self
-                .family
-                .new_slot_in(charges, &self.arena, &self.upload_regions)
-                .map_err(super::AllocationError::Workflow)?;
+            let slot = match &self.scratch {
+                Scratch::Arena(arena) => self
+                    .family
+                    .new_slot_in(charges, arena, &self.upload_regions)
+                    .map_err(super::AllocationError::Workflow)?,
+                Scratch::Own => self
+                    .family
+                    .new_slot(charges, &self.upload_regions)
+                    .map_err(super::AllocationError::Tensor)?,
+            };
             self.workspace.borrow_mut().push(Claimed::under_class(slot));
             self.allocated.activations += 1;
         }
@@ -156,6 +201,17 @@ impl NativeGraphPool {
     /// The slots of a group of one place, never released.
     pub(crate) fn floor(&self) -> GraphSlots {
         self.floor
+    }
+
+    /// The activations and output slots allocated now, lent or free.
+    pub(crate) fn allocated(&self) -> GraphSlots {
+        self.allocated
+    }
+
+    /// Whether every slot it allocated is free: none lent to a launch, and
+    /// no output to the views of one.
+    pub(crate) fn idle(&self) -> bool {
+        self.workspace.borrow().len() == self.allocated.activations && self.output.borrow().len() == self.allocated.output
     }
 
     /// Physical arenas owned by this pool, including slots currently lent

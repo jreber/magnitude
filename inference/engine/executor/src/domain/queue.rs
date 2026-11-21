@@ -1448,8 +1448,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// its predecessor's as `follow` says. `ahead` are the operations of its
     /// chain before it, whose tokens are not yet fed (`target_preceding`).
     /// `None` when the advances or their leases do not fit without growing
-    /// anything, or a slot needs input slices: the step is then submitted as
-    /// usual.
+    /// anything, a slot needs input slices, or the step exports logits: the
+    /// step is then submitted as usual.
     fn build_successor<'a>(
         &mut self,
         predecessor: impl Iterator<Item = &'a TentativeAdvance>,
@@ -1457,6 +1457,12 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         follow: Follow,
         ahead: &[Operation],
     ) -> Result<Option<ValidatedTargetLaunch>, DomainError> {
+        // A launch that exports claims the export readout's slots as it
+        // reserves (`provision_export`): queued, it would take them outside
+        // that claim, idle ones the ledger counts as cache among them.
+        if super::launch_readout(predicted).exports {
+            return Ok(None);
+        }
         // The step's rows are admitted and placed as its own provisioning
         // would place them once its predecessors commit.
         let (advances, tokens) = match follow {
@@ -1579,7 +1585,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             ),
         };
         let graph = self.resources.target_graph();
-        let readout = self.resources.target_readout_graph(super::projected_rows(predicted));
+        let readout = self.resources.target_readout_graph(super::launch_readout(predicted));
         let (Ok(graph_workspace), Ok(graph_output), Ok(readout_workspace), Ok(readout_output)) = (
             graph.acquire_workspace(),
             graph.acquire_output(),

@@ -58,6 +58,11 @@ pub enum CommittedKind {
     /// A prompt group's class beyond one place, from its open to its
     /// close: optional, as [`Self::Scratch`].
     GroupClass,
+    /// A load's export readout slots (`readout::ReadoutKind::Logits`), none
+    /// at load: from the reservation of a launch that exports logits while
+    /// such a launch holds them, idle as cache between
+    /// (`domain::ExportClass`).
+    Exports,
     /// What a load allocated as it started ([`Recorded`]), until the
     /// holdings that name it carve it out.
     Load,

@@ -15,13 +15,14 @@ use crate::census::AllocationCensus;
 use crate::error::{LoadError, RequestError, UnloadCause};
 use crate::execution::LoadAttempt;
 use crate::invocation::ReleaseGuard;
-use magnitude_executor::UnpreparedUnits;
+use magnitude_executor::{TokenId, UnpreparedUnits};
 use crate::options::{ExecutionManifest, ReadyInfo};
 use magnitude_chat::ConstraintPlan;
 use magnitude_family_contracts::PreparedModelInput;
 use magnitude_generation::{DetailedUsage, FinishReason, Options, OutputToken};
 use magnitude_scheduler::prefix_cache::PrefixRetention;
 use magnitude_scheduler::protocol::RoomAnswer;
+use magnitude_scheduler::scoring::ScoreOutcome;
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
     future::poll_fn,
@@ -213,6 +214,11 @@ impl<T> Default for SharedReply<T> {
 }
 
 impl<T> SharedReply<T> {
+    /// A reply nobody has answered yet.
+    fn pending() -> Shared<T> {
+        Arc::new(Mutex::new(Self::default()))
+    }
+
     fn fulfill(&mut self, value: Result<T, RequestError>) {
         self.value = Some(value);
         self.wakers.wake_all();
@@ -331,6 +337,8 @@ struct State {
     room: Option<(RoomClaimId, Shared<RoomAnswer>)>,
     next_claim: u64,
     throughput: Option<Shared<ThroughputSnapshot>>,
+    /// Scoring requests awaiting the worker's outcome.
+    scores: HashMap<HostRequestId, Shared<ScoreOutcome>>,
     phase: ConnectionPhase,
     /// The census the worker pushed last, and how many it pushed
     /// ([`EngineClient::census`]).
@@ -344,8 +352,7 @@ struct State {
 impl State {
     fn open_request(&mut self, lease: ReleaseGuard) -> Result<HostRequestId, RequestError> {
         self.phase.check_open()?;
-        let id = HostRequestId(self.next_id);
-        self.next_id += 1;
+        let id = self.allocate_id();
         self.requests.insert(id, RequestSlot::default());
         if lease.is_held() {
             self.leases.insert(id, lease);
@@ -357,6 +364,13 @@ impl State {
     /// asked for one, so a stopped model's requests end alike whenever its worker ends.
     fn lost(&self, reason: String) -> RequestError {
         self.phase.lost(reason)
+    }
+
+    /// The next host request identity, unique for this connection.
+    fn allocate_id(&mut self) -> HostRequestId {
+        let id = HostRequestId(self.next_id);
+        self.next_id += 1;
+        id
     }
 
     fn close(&mut self, error: RequestError) {
@@ -381,6 +395,9 @@ impl State {
             reply.lock().unwrap().fulfill(Err(error.clone()));
         }
         if let Some(reply) = self.throughput.take() {
+            reply.lock().unwrap().fulfill(Err(error.clone()));
+        }
+        for (_, reply) in self.scores.drain() {
             reply.lock().unwrap().fulfill(Err(error.clone()));
         }
         self.leases.clear();
@@ -496,6 +513,23 @@ impl State {
                     .take()
                     .ok_or("throughput reply without a query")?;
                 reply.lock().unwrap().fulfill(snapshot);
+            }
+            WorkerMessage::Scored {
+                request_id,
+                outcome,
+            } => {
+                let reply = self
+                    .scores
+                    .remove(&request_id)
+                    .ok_or("score outcome without a request")?;
+                reply.lock().unwrap().fulfill(Ok(outcome));
+            }
+            WorkerMessage::ScoreFailed { request_id, error } => {
+                let reply = self
+                    .scores
+                    .remove(&request_id)
+                    .ok_or("score failure without a request")?;
+                reply.lock().unwrap().fulfill(Err(error));
             }
             WorkerMessage::Unloaded { cause } => {
                 self.unload(cause);
@@ -942,6 +976,39 @@ impl EngineClient {
         Self::wait(reply).await
     }
 
+    /// Teacher-force `tokens` through the model: each token's log-probability
+    /// given those before it. With `top`, each position also reports its most
+    /// likely token; with `next`, the outcome carries the most likely token
+    /// after the last. Fails like an open request when the worker unloads or
+    /// is lost.
+    pub async fn score(
+        &self,
+        tokens: Vec<TokenId>,
+        top: bool,
+        next: bool,
+    ) -> Result<ScoreOutcome, RequestError> {
+        let (id, reply) = {
+            let mut state = self.connection.state.lock().unwrap();
+            state.phase.check_open()?;
+            let id = state.allocate_id();
+            let reply = SharedReply::pending();
+            state.scores.insert(id, reply.clone());
+            (id, reply)
+        };
+        // Registered before sending, so the reply cannot arrive first; the
+        // state lock is not held across the send of a long token vector.
+        if let Err(error) = self.connection.send(HostMessage::Score {
+            request_id: id,
+            tokens,
+            top,
+            next,
+        }) {
+            self.connection.state.lock().unwrap().scores.remove(&id);
+            return Err(error);
+        }
+        Self::wait(reply).await
+    }
+
     /// Ask the worker to unload and exit. Open requests fail with
     /// `ModelUnloaded { cause: Shutdown }`.
     pub fn shutdown(&self) -> Result<(), RequestError> {
@@ -1321,5 +1388,75 @@ mod tests {
                 cause: UnloadCause::Shutdown
             })
         );
+    }
+
+    use magnitude_scheduler::scoring::ScoredPosition;
+
+    fn outcome() -> ScoreOutcome {
+        ScoreOutcome {
+            positions: vec![ScoredPosition {
+                logprob: -1.0,
+                rank: 1,
+                top: None,
+            }],
+            next: None,
+        }
+    }
+
+    fn pending_score(state: &mut State) -> (HostRequestId, Shared<ScoreOutcome>) {
+        let id = state.allocate_id();
+        let reply = SharedReply::pending();
+        state.scores.insert(id, reply.clone());
+        (id, reply)
+    }
+
+    #[test]
+    fn scored_resolves_a_pending_score() {
+        let mut state = State::default();
+        let (request_id, reply) = pending_score(&mut state);
+        state
+            .deliver(WorkerMessage::Scored {
+                request_id,
+                outcome: outcome(),
+            })
+            .unwrap();
+        assert_eq!(reply.lock().unwrap().value, Some(Ok(outcome())));
+    }
+
+    #[test]
+    fn score_failed_resolves_a_pending_score_with_the_error() {
+        let mut state = State::default();
+        let (request_id, reply) = pending_score(&mut state);
+        let error = RequestError::InvalidRequest { reason: "no".into() };
+        state
+            .deliver(WorkerMessage::ScoreFailed {
+                request_id,
+                error: error.clone(),
+            })
+            .unwrap();
+        assert_eq!(reply.lock().unwrap().value, Some(Err(error)));
+    }
+
+    #[test]
+    fn close_fails_every_pending_score() {
+        let mut state = State::default();
+        let (_, first) = pending_score(&mut state);
+        let (_, second) = pending_score(&mut state);
+        let error = RequestError::WorkerLost { reason: "gone".into() };
+        state.close(error.clone());
+        assert_eq!(first.lock().unwrap().value, Some(Err(error.clone())));
+        assert_eq!(second.lock().unwrap().value, Some(Err(error)));
+    }
+
+    #[test]
+    fn a_duplicate_outcome_is_a_protocol_error() {
+        let mut state = State::default();
+        let (request_id, _) = pending_score(&mut state);
+        let scored = || WorkerMessage::Scored {
+            request_id,
+            outcome: outcome(),
+        };
+        state.deliver(scored()).unwrap();
+        assert!(state.deliver(scored()).is_err());
     }
 }

@@ -75,13 +75,16 @@ fn support_levels() -> BTreeMap<String, String> {
         .collect()
 }
 
-/// The standard service's limits, as assessment plans them.
+/// The standard service's limits, as assessment plans them. A service load
+/// exports a scoring flight's logits (`composition::scoring_rows`:
+/// `SCORING_ROWS`, 256, within its 512 launch rows), so every load prepares
+/// export classes and this sweep covers them.
 pub(super) const LIMITS: ResourceLimits = ResourceLimits {
     max_launch_rows: 512,
     max_launch_slots: 8,
     max_selected_rows: 8,
     max_drafting_slots: 8,
-    exported_logits_rows: 0,
+    exported_logits_rows: 256,
     max_images_per_request: 1,
     max_image_cells: 0,
     lookahead: true,

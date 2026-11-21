@@ -303,6 +303,109 @@ fn a_verification_row_scores_its_history_as_plain_decode_does() {
     assert!(failures.is_empty(), "verification rows that do not score as plain decode:\n{}", failures.join("\n"));
 }
 
+/// On the CPU, export is a launch's, not a load's: a load that exports
+/// logits samples a prompt shaped as a load exporting none does, the same
+/// token; and a launch of its demanding logits exports each row's, its
+/// unshaped selection their largest.
+#[test]
+fn an_exporting_load_samples_shaped_and_exports_per_launch() {
+    let _placement = crate::test_support::process_placement();
+    let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
+    let (directory, definition, package) = fixture("exporting-per-launch");
+    let backend = seismic::BackendName::Cpu;
+    let token = |position: usize| TokenId((position * 37 + 11) as u32 % 256);
+    let select = |position: usize, sampling: Sampling, shaping: Shaping| SelectSpec {
+        sampling,
+        seed: 7,
+        position,
+        domain: 0,
+        mask: None,
+        shaping,
+        history: None,
+    };
+    let shaped = Shaping { temperature: 0.7, top_k: 4, ..Shaping::default() };
+    let rows = |outcome: Outcome| match outcome {
+        Outcome::Forward { rows, .. } => rows,
+        other => panic!("a forward has a forward outcome: {other:?}"),
+    };
+    let mut sampled = Vec::new();
+    for exported in [0, 2] {
+        let (mut domain, mut bindings, _, _) =
+            load(&catalog, &definition, &package, backend, limits(4, false, 1, exported), Banked::Resident);
+        let request = RequestId(1);
+        domain.install_input(request, PreparedModelInput::continuation_only()).unwrap();
+        domain.open_served(&mut bindings, request, None).unwrap();
+        let prompt = Operation::Forward {
+            request,
+            kind: WorkKind::Prefill,
+            tokens: (0..4).map(token).collect(),
+            position: 0,
+            conditioning: None,
+            demand: crate::batching::Demand::SELECT,
+            select: vec![select(3, Sampling::Categorical, shaped)],
+            committed: 4,
+            prime: None,
+            front: Vec::new(),
+            chain: None,
+        };
+        let (outcome, returned) = run(&mut domain, bindings, prompt, false, backend);
+        bindings = returned;
+        let prompt = rows(outcome);
+        assert!(prompt.iter().all(|row| row.logits.is_none()), "exported {exported}: a launch demanding no logits exports none");
+        sampled.push(prompt.last().and_then(|row| row.selected).expect("the prompt samples its next token"));
+        if exported == 0 {
+            continue;
+        }
+        let decode = Operation::Forward {
+            request,
+            kind: WorkKind::Decode,
+            tokens: vec![token(4)],
+            position: 4,
+            conditioning: None,
+            demand: crate::batching::Demand::SELECT | crate::batching::Demand::LOGITS,
+            select: vec![select(4, Sampling::Greedy, Shaping::default())],
+            committed: 1,
+            prime: None,
+            front: Vec::new(),
+            chain: None,
+        };
+        let (outcome, returned) = run(&mut domain, bindings, decode, false, backend);
+        bindings = returned;
+        let [row] = &rows(outcome)[..] else {
+            panic!("a decode step has one row");
+        };
+        let logits = row.logits.as_ref().expect("a row demanding logits exports them").read_to_host().unwrap();
+        assert_eq!(logits.len(), definition.decoder.vocabulary as usize);
+        let largest = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let crate::Selected::Token(selected) = row.selected.expect("the decode step selects its next token") else {
+            panic!("the decode step selects a token");
+        };
+        assert_eq!(logits[selected.0 as usize], largest, "the unshaped greedy selection is the largest logit");
+        let scored = Operation::Forward {
+            request,
+            kind: WorkKind::Decode,
+            tokens: vec![token(5), token(6)],
+            position: 5,
+            conditioning: None,
+            demand: crate::batching::Demand::LOGITS,
+            select: Vec::new(),
+            committed: 2,
+            prime: None,
+            front: Vec::new(),
+            chain: None,
+        };
+        let (outcome, returned) = run(&mut domain, bindings, scored, false, backend);
+        drop(returned);
+        for row in rows(outcome) {
+            let logits = row.logits.expect("every row demanding logits exports them").read_to_host().unwrap();
+            assert_eq!(logits.len(), definition.decoder.vocabulary as usize);
+            assert!(row.selected.is_none());
+        }
+    }
+    assert_eq!(sampled[0], sampled[1], "the exporting load samples as a load exporting none");
+    std::fs::remove_dir_all(&directory).ok();
+}
+
 /// On Metal and on the CPU, a load streaming its experts through a bank
 /// (some layers' experts partly held, some held whole as the bank fills):
 /// a prompt chunk, then two decode steps of the device's selected tokens,
@@ -1270,7 +1373,9 @@ fn a_whole_bank_shrunk_between_decode_steps_scores_as_resident() {
 /// so a shrink with no memory left to allocate, every ledger of the device
 /// bound to what it charges, begins and completes, and its step records
 /// none. The steps before it ran the whole bank's resident forms; none after
-/// it does.
+/// it does. The load exports logits, as the service's does; its steps export
+/// none, as a launch that exports runs an export class, no decode launch,
+/// whose graphs are recorded at first use.
 #[test]
 #[ignore = "needs a CUDA device: run with --ignored on one"]
 fn a_whole_banks_shrink_step_records_no_graph() {
@@ -1284,11 +1389,11 @@ fn a_whole_banks_shrink_step_records_no_graph() {
     let request = RequestId(1);
     domain.install_input(request, PreparedModelInput::continuation_only()).unwrap();
     domain.open_served(&mut bindings, request, None).unwrap();
-    let (_, mut bindings) = run(&mut domain, bindings, scored(forward(request, WorkKind::Prefill, &[5, 1], 0, true)), false, cuda);
+    let (_, mut bindings) = run(&mut domain, bindings, forward(request, WorkKind::Prefill, &[5, 1], 0, true), false, cuda);
     let mut position = 2;
     let mut decode = |domain: &mut ExecutorDomain, bindings: crate::StateBindings| {
         let token = (position * 37 % 256) as u32;
-        let (_, next, _) = step(domain, bindings, scored(forward(request, WorkKind::Decode, &[token], position, true)), cuda);
+        let (_, next, _) = step(domain, bindings, forward(request, WorkKind::Decode, &[token], position, true), cuda);
         position += 1;
         next
     };
@@ -1387,12 +1492,14 @@ impl DecodeSteps {
     }
 
     /// A decode step of the first `count` requests, its recordings kept as
-    /// `step`'s.
+    /// `step`'s: it exports no logits, as a launch that exports runs an
+    /// export class, no decode launch, whose graphs are recorded at first
+    /// use.
     fn step(&mut self, domain: &mut ExecutorDomain, mut bindings: crate::StateBindings, count: usize, step: &'static str, backend: seismic::BackendName) -> crate::StateBindings {
         let operations = self.requests[..count]
             .iter()
             .zip(&self.positions)
-            .map(|(&request, &position)| scored(forward(request, WorkKind::Decode, &[(position * 37 % 256) as u32], position, true)))
+            .map(|(&request, &position)| forward(request, WorkKind::Decode, &[(position * 37 % 256) as u32], position, true))
             .collect::<Vec<_>>();
         let before = domain.family_graph_replays();
         let reserved = domain.reserve(&mut bindings, &operations).unwrap().into_resources();

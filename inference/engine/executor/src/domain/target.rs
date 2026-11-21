@@ -259,7 +259,11 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         let launch_trace = self.trace_target_submission(operations);
         let started = Instant::now();
         let epoch = self.launch_epoch();
-        let decodes = operations.iter().all(|operation| matches!(operation, Operation::Forward { kind: WorkKind::Decode, .. }));
+        // A launch that exports logits runs an export class, whose graphs no
+        // backend records ahead: it is no decode launch here, whatever its
+        // rows' kind.
+        let decodes = !launch_readout(operations).exports
+            && operations.iter().all(|operation| matches!(operation, Operation::Forward { kind: WorkKind::Decode, .. }));
         // A bank shrink's step is the first decode launch after it began; it
         // records no graph only where decode graphs are recorded ahead
         // (CUDA's): elsewhere it records its graphs at first use, as any

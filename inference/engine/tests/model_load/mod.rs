@@ -5,7 +5,7 @@
 //! cache holds; a load without one plans only a model held whole, and a load
 //! whose figures are not measured yet waits for them. So the tests keep a
 //! kernel cache and settle the prices before they open anything, through the
-//! engine's own step for it ([`settle_prices`]).
+//! engine's own step for it ([`in_process_priced`]).
 //!
 //! A process holds one load: its memory ledger opens one state pool per
 //! store, as a worker process serves one load. Cargo runs tests on threads
@@ -13,7 +13,7 @@
 //! ([`resolve`]) and holds it until the test's thread ends, after everything
 //! the test loaded is dropped.
 
-use magnitude_engine::composition::{settle_prices, EngineConfiguration, ResolvedEngineConfiguration};
+use magnitude_engine::composition::{in_process_priced, EngineConfiguration, ResolvedEngineConfiguration};
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard, PoisonError};
@@ -44,9 +44,6 @@ pub fn resolve(configuration: EngineConfiguration) -> ResolvedEngineConfiguratio
             .get_or_insert_with(|| LOAD.lock().unwrap_or_else(PoisonError::into_inner));
     });
     let resolved = configuration.resolve().unwrap();
-    let measured = settle_prices(&resolved.manifest).unwrap();
-    if measured > 0 {
-        eprintln!("settled the load's prices: {measured} measurement runs");
-    }
+    in_process_priced(&resolved.manifest, || Ok(())).unwrap();
     resolved
 }

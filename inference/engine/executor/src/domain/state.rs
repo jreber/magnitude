@@ -303,6 +303,13 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         if self.claim_slots(operations).is_some() {
             return Ok(());
         }
+        // Admitted before anything is provisioned for it: the scheduler
+        // provisions a group before it asks for its requirements, and a
+        // launch that exports would otherwise grow the export readout's
+        // slots, or find none, before its refusal.
+        if let Some(lane) = operations.first().map(ReservationLane::of) {
+            self.admit_selection(lane, operations)?;
+        }
         // Any other group resolves the queue: a chain under way concludes,
         // its holder's state the one its reconciled chunks reached, from
         // which a group of its holder's that is not its queued chunk
@@ -463,9 +470,16 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 let class = self
                     .image_class(image.patches())
                     .map_err(DomainError::Input)?;
+                self.idle_export();
                 self.provision_vision(class as u64)?;
             }
-            _ => self.provision_output(lane, super::projected_rows(operations))?,
+            _ => match super::launch_readout(operations) {
+                readout if lane == ReservationLane::Target && readout.exports => self.provision_export()?,
+                readout => {
+                    self.idle_export();
+                    self.provision_output(lane, readout)?
+                }
+            },
         }
         // Advance each request's reservation reach only after every fallible
         // provisioning step succeeds, so a refused launch never inflates
@@ -552,16 +566,108 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         })
     }
 
+    /// Hold the export readout's slots for a launch that exports logits,
+    /// before it reserves ([`ExportClass`]): their idle cache taken up again
+    /// in place, then an activation and an output slot more claimed
+    /// ([`Self::claim_growth`]) and grown where none is free, each
+    /// activation with the memory its graphs take once recorded
+    /// ([`graph_demand`]). Refused as a capacity deficit, for the owner's
+    /// release order, where a claim took the idle slots' cache (the release
+    /// of what yielded frees them) or the growth is short.
+    fn provision_export(&mut self) -> Result<(), DomainError> {
+        let changes = self.resources.ledgers().changes().clone();
+        if self.export_class.held.is_empty() && !self.export_class.idle.0.is_empty() {
+            let kept = changes.change(|keeping| self.export_class.idle.reclaim(&keeping, crate::memory::ledger::CommittedKind::Exports));
+            let pool = self.export_pool();
+            let Some(claims) = kept else {
+                return Err(DomainError::Capacity(CapacityError::new(
+                    ResourceKind::DeviceMemory,
+                    pool.committed_bytes().map_err(DomainError::invariant)?,
+                    0,
+                )));
+            };
+            self.export_class.held = claims;
+        }
+        let pool = self.export_pool();
+        let allocated = pool.allocated();
+        let wanted = crate::GraphSlots {
+            activations: allocated.activations + usize::from(pool.available_workspace() == 0),
+            output: allocated.output + usize::from(pool.available_output() == 0),
+        };
+        if wanted == allocated {
+            self.export_pool_mut().hold(allocated);
+            return Ok(());
+        }
+        let device = self.domain.device().clone();
+        let graphs = pool
+            .hold_graphs(wanted)
+            .ok_or_else(|| DomainError::invariant("the export readout's graph census overflows"))?;
+        let graphs = graph_demand(device.graph_cost(), device.graph_budget(), graphs).map_err(DomainError::invariant)?;
+        let demand = crate::memory::ClaimDemand { device: pool.hold_bytes(wanted).map_err(DomainError::invariant)?, ..Default::default() }
+            .checked_plus(graphs)
+            .expect("invariant violated: the export readout's demand overflows");
+        changes.change(|keeping| {
+            let mut held = self.claim_growth(&keeping.claims(), crate::memory::ledger::CommittedKind::Exports, demand)?;
+            let pool = self.export_pool_mut();
+            match held.allocate(&device, |charges| pool.grow(charges, wanted)) {
+                Ok(()) => {
+                    pool.hold(wanted);
+                    // Each claim holds what its allocations charged, so it
+                    // turns cache whole once idle, as a group's class.
+                    let mut claims = held.into_claims();
+                    claims.iter_mut().for_each(crate::memory::ledger::Claim::fit_allocated);
+                    self.export_class.held.extend(claims);
+                    Ok(())
+                }
+                Err(
+                    crate::resources::AllocationError::Tensor(error)
+                    | crate::resources::AllocationError::Workflow(seismic::WorkflowError::TensorView(error)),
+                ) => Err(growth_failure(error, demand.bytes(), "export readout growth")),
+                Err(error) => Err(DomainError::invariant(error.to_string())),
+            }
+        })
+    }
+
+    /// Idle the export readout's slots as the ledger's cache once no launch
+    /// holds any ([`ExportClass`]): their claims turn into cache in place,
+    /// in one change with the pool's holding them no more, so a release of
+    /// what yielded frees them.
+    pub(super) fn idle_export(&mut self) {
+        if self.export_class.held.is_empty() || !self.resources.target_readout_export_graph().is_some_and(crate::NativeGraphPool::idle) {
+            return;
+        }
+        let changes = self.resources.ledgers().changes().clone();
+        changes.change(|_| {
+            self.export_pool_mut().hold_floor();
+            let claims = std::mem::take(&mut self.export_class.held);
+            self.export_class.idle.idle(claims);
+        });
+    }
+
+    /// The export readout's pool, of a load that exports logits, which a
+    /// launch exports from only once reservation admitted it.
+    fn export_pool(&self) -> &crate::NativeGraphPool {
+        self.resources
+            .target_readout_export_graph()
+            .expect("invariant violated: a launch exports logits from a load that exports none")
+    }
+
+    fn export_pool_mut(&mut self) -> &mut crate::NativeGraphPool {
+        self.resources
+            .target_readout_export_graph_mut()
+            .expect("invariant violated: a launch exports logits from a load that exports none")
+    }
+
     /// Grow `lane`'s retained-output pool by one slot when none is free, so
     /// the launch finds its output: a request keeps its last published
     /// output after its launch completes, so the pool follows the live
     /// requests. A target launch's pool is of the readout class that holds
-    /// its `projected` rows (`AllocatedResources::retained_outputs_mut`).
+    /// what it reads out (`AllocatedResources::retained_outputs_mut`).
     /// The slot is claimed first like any growth ([`Self::claim_growth`])
     /// and keeps its claim until released; a refusal is a demand deficit
     /// for the owner's release order.
-    pub(super) fn provision_output(&mut self, lane: ReservationLane, projected: usize) -> Result<(), DomainError> {
-        let Some(pool) = self.resources.retained_outputs_mut(lane, projected) else {
+    pub(super) fn provision_output(&mut self, lane: ReservationLane, readout: crate::resources::LaunchReadout) -> Result<(), DomainError> {
+        let Some(pool) = self.resources.retained_outputs_mut(lane, readout) else {
             return Ok(());
         };
         if pool.available_output() > 0 {
@@ -576,7 +682,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 crate::memory::ClaimDemand { device: bytes, ..Default::default() },
             )?;
             self.resources
-                .retained_outputs_mut(lane, projected)
+                .retained_outputs_mut(lane, readout)
                 .expect("the pool was found above")
                 .grow_claimed_output(self.domain.device(), held)
                 .map_err(|error| growth_failure(error, bytes, "graph output growth"))
@@ -941,7 +1047,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         // slots idle as cache again. One change: no reading sees them free.
         let changes = self.resources.ledgers().changes().clone();
         changes.change(|keeping| {
-            let Some(idle) = self.idle_class.reclaim(&keeping) else {
+            let Some(idle) = self.idle_class.reclaim(&keeping, crate::memory::ledger::CommittedKind::GroupClass) else {
                 return Ok(());
             };
             let opened = self.claim_group_class(&keeping.claims(), chunks, quiet);
@@ -1240,7 +1346,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         if self.resources.releasing_slots() {
             return SlotRelease::Running;
         }
-        match self.resources.release_idle_slots(self.idle_class.release(), wake) {
+        let cache = self.idle_class.release().into_iter().chain(self.export_class.idle.release()).collect();
+        match self.resources.release_idle_slots(cache, wake) {
             true => SlotRelease::Began,
             false => SlotRelease::None,
         }
@@ -1351,11 +1458,12 @@ impl IdleClass {
         std::mem::take(&mut self.0)
     }
 
-    /// The slots kept whole for a class that takes them up again, in its
-    /// change's keep phase ([`crate::memory::ledger::Keeping::keep`]):
-    /// none, every slot left idle, where an earlier claim took any of them.
-    fn reclaim(&mut self, keeping: &crate::memory::ledger::Keeping) -> Option<Vec<crate::memory::ledger::Claim>> {
-        match keeping.keep(self.release(), crate::memory::ledger::CommittedKind::GroupClass) {
+    /// The slots kept whole, committed of `kind`, for a class that takes
+    /// them up again, in its change's keep phase
+    /// ([`crate::memory::ledger::Keeping::keep`]): none, every slot left
+    /// idle, where an earlier claim took any of them.
+    fn reclaim(&mut self, keeping: &crate::memory::ledger::Keeping, kind: crate::memory::ledger::CommittedKind) -> Option<Vec<crate::memory::ledger::Claim>> {
+        match keeping.keep(self.release(), kind) {
             Ok(claims) => Some(claims),
             Err(idle) => {
                 self.0 = idle;
@@ -1363,6 +1471,19 @@ impl IdleClass {
             }
         }
     }
+}
+
+/// The export readout's slots' claims (`AllocatedResources::readout_pool`),
+/// as a prompt group's class holds its places': committed while a launch
+/// that exports logits holds the slots, from its reservation
+/// ([`ExecutorDomain::provision_export`]), and idle as the ledger's cache
+/// once none does ([`ExecutorDomain::idle_export`]), taken up again by the
+/// next such launch, and freed only as the ledger takes them
+/// (`ExecutorDomain::release_yielded`). At most one of the two holds any.
+#[derive(Default)]
+pub(super) struct ExportClass {
+    held: Vec<crate::memory::ledger::Claim>,
+    pub(super) idle: IdleClass,
 }
 
 /// A prompt group's class held beyond one place ([`ExecutorDomain::open_group`]):

@@ -918,8 +918,10 @@ impl NativeTargetProgram {
         // Projected outputs, the selected ones first and in selection order:
         // shaping and sampling read the leading selected logits rows.
         let mut projected_output_rows = Vec::new();
-        // Whether a selected row also reads its logits on the host.
-        let mut selection_reads_logits = false;
+        // Whether a row reads its logits on the host: only then does the
+        // launch export them, through a `Logits` class, whatever its load
+        // exports.
+        let mut exports = false;
         // Whether a row demands features: only then does a tapped load's
         // readout fuse its draft's taps (`BoundTargetReadoutGraphs::class`).
         let mut features = false;
@@ -937,7 +939,7 @@ impl NativeTargetProgram {
                 .and_then(|bits| Demand::from_bits(*bits))
                 .ok_or_else(|| invalid("readout demand is absent or invalid"))?;
             let selected = projected_output_rows[..actual_selected].contains(&output_index);
-            selection_reads_logits |= selected && demand.contains(Demand::LOGITS);
+            exports |= demand.contains(Demand::LOGITS);
             features |= demand.computes_features();
             if demand.computes_logits() && !selected {
                 projected_output_rows.push(output_index);
@@ -958,23 +960,32 @@ impl NativeTargetProgram {
             magnitude_batching::row_class(actual_projected)
                 .ok_or_else(|| invalid("readout projected rows have no class"))?
         };
-        // A selection the certified readout serves: every selected row
-        // samples or takes its largest admitted logit at a temperature at
-        // most, none reads its logits, and nothing else projects.
-        let certified = actual_projected == actual_selected
-            && self
-                .readout_graphs
-                .prepared
-                .certifies(projected_class as u64)
-            && !selection_reads_logits
-            && batch.shaping[..actual_selected].iter().all(certifies);
-        let kind = if actual_selected > 0 {
-            ReadoutKind::Selection {
-                shaped: batch.shaping[..actual_selected].iter().any(shapes),
-                certified,
+        let shaping = &batch.shaping[..actual_selected];
+        let kind = if exports {
+            // Reservation admits no shaping beside an export
+            // (`ExecutorDomain::admit_selection`): shaping would rewrite
+            // the logits exported.
+            if shaping.iter().any(shapes) {
+                return Err(invalid("a readout exporting logits selects shaped"));
             }
-        } else if actual_projected > 0 {
             ReadoutKind::Logits
+        } else if actual_selected > 0 {
+            // A served selection projects exactly the rows it selects: a
+            // row demanding a selection is one (`magnitude_batching`), and
+            // any other projected row demands logits. The certified readout
+            // serves it where every selected row samples or takes its
+            // largest admitted logit at a temperature at most.
+            if actual_projected != actual_selected {
+                return Err(invalid("a served selection projects only its selected rows"));
+            }
+            ReadoutKind::Selection {
+                shaped: shaping.iter().any(shapes),
+                certified: self
+                    .readout_graphs
+                    .prepared
+                    .certifies(projected_class as u64)
+                    && shaping.iter().all(certifies),
+            }
         } else {
             ReadoutKind::Features
         };

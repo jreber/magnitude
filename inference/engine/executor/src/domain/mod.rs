@@ -500,9 +500,9 @@ pub struct DomainRequirements {
     /// drafter entry where its chunk primes one).
     head_demand: Vec<RowDemand>,
     head_banks: usize,
-    /// The logits rows a target launch projects (`projected_rows`): the
-    /// readout slot class it takes.
-    projected: usize,
+    /// What a target launch reads out (`launch_readout`): the readout pool
+    /// it takes its slots from.
+    readout: crate::resources::LaunchReadout,
     /// The operations claim the front queued step: nothing is reserved.
     claim: bool,
 }
@@ -524,6 +524,18 @@ impl DomainRequirements {
 pub struct DomainReservation {
     requirements: DomainRequirements,
     resources: ReservedResources,
+}
+
+/// What a target launch of `operations` reads out: the rows it projects
+/// ([`projected_rows`]), and whether it exports their logits, which it does
+/// exactly when a forward demands `Demand::LOGITS`.
+pub(super) fn launch_readout(operations: &[Operation]) -> crate::resources::LaunchReadout {
+    crate::resources::LaunchReadout {
+        projected: projected_rows(operations),
+        exports: operations
+            .iter()
+            .any(|operation| matches!(operation, Operation::Forward { demand, .. } if demand.contains(Demand::LOGITS))),
+    }
 }
 
 /// The logits rows a target launch of `operations` projects: a forward's
@@ -866,6 +878,9 @@ pub struct ExecutorDomain<F: ProgramFamily = NativeFamily> {
     /// class takes the slots again ([`Self::open_group`]). What claims took
     /// of it in process releases until then ([`state::IdleClass::taken`]).
     idle_class: state::IdleClass,
+    /// The export readout's slots' claims, held or idle
+    /// ([`state::ExportClass`]).
+    export_class: state::ExportClass,
 
     /// Identity of the next target flight.
     next_flight: u64,
@@ -2252,10 +2267,12 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     }
 
     /// Refuse a launch whose vocabulary work the load did not plan: more
-    /// selected target rows or drafting requests than the selection bound,
-    /// logits a served load does not export, more exported rows than a
-    /// diagnostic load exports, or shaping in a launch whose logits are
-    /// exported (shaping rewrites the logits in place).
+    /// selected target rows or drafting requests than the selection bound;
+    /// and where a row demands logits, so the launch runs an export class
+    /// (`readout::ReadoutKind::Logits`), logits from a load that exports
+    /// none, shaping (shaping rewrites the logits in place), or more
+    /// projected rows than the load exports. A launch none of whose rows
+    /// demands logits runs the load's served classes, whatever it exports.
     fn admit_selection(
         &self,
         lane: ReservationLane,
@@ -2265,14 +2282,9 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         match lane {
             ReservationLane::Target => {
                 let forwards = operations.iter().filter_map(|operation| match operation {
-                    Operation::Forward {
-                        kind,
-                        tokens,
-                        demand,
-                        select,
-                        front,
-                        ..
-                    } => Some((kind, tokens, demand, select.iter().chain(front.iter().map(|front| &front.select)))),
+                    Operation::Forward { demand, select, front, .. } => {
+                        Some((demand, select.iter().chain(front.iter().map(|front| &front.select))))
+                    }
                     Operation::Head { .. } | Operation::Encode { .. } => None,
                 });
                 let selected = operations.iter().map(Operation::selected_rows).sum::<usize>();
@@ -2282,19 +2294,16 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                         limits.max_selected_rows
                     )));
                 }
-                if !readout::exports_logits(limits) {
-                    if forwards
-                        .clone()
-                        .any(|(_, _, demand, _)| demand.contains(Demand::LOGITS))
-                    {
-                        return Err(DomainError::Input(
-                            "launch demands logits from a load that exports none".into(),
-                        ));
-                    }
+                let readout = launch_readout(operations);
+                if !readout.exports {
                     return Ok(());
                 }
-                let projected = projected_rows(operations);
-                for (_, _, _, select) in forwards {
+                if !readout::exports_logits(limits) {
+                    return Err(DomainError::Input(
+                        "launch demands logits from a load that exports none".into(),
+                    ));
+                }
+                for (_, select) in forwards {
                     for spec in select {
                         let params = target::select_row(spec)
                             .shaping
@@ -2302,15 +2311,15 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                             .map_err(|error| DomainError::Input(error.to_string()))?;
                         if readout::shapes(&params) {
                             return Err(DomainError::Input(
-                                "a load that exports logits selects unshaped".into(),
+                                "a launch that exports logits selects unshaped".into(),
                             ));
                         }
                     }
                 }
-                if projected > limits.exported_logits_rows {
+                if readout.projected > limits.exported_logits_rows {
                     return Err(DomainError::Input(format!(
-                        "launch projects {projected} logits rows; the load exports {}",
-                        limits.exported_logits_rows
+                        "launch projects {} logits rows; the load exports {}",
+                        readout.projected, limits.exported_logits_rows
                     )));
                 }
             }
@@ -2343,7 +2352,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 head_launches: 0,
                 head_demand: Vec::new(),
                 head_banks: 0,
-                projected: projected_rows(operations),
+                readout: launch_readout(operations),
                 claim: true,
             });
         }
@@ -2611,7 +2620,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             head_launches,
             head_demand,
             head_banks,
-            projected: projected_rows(operations),
+            readout: launch_readout(operations),
             claim: false,
         })
     }
@@ -2647,7 +2656,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                         },
                     ));
                 }
-                let readout = self.resources.target_readout_graph(requirements.projected);
+                let readout = self.resources.target_readout_graph(requirements.readout);
                 available(
                     Some(readout.available_workspace()),
                     Some(readout.available_output()),
@@ -2929,7 +2938,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                         .unwrap_or_else(|error| invariant("target graph output", error))
                 };
                 let (graph_output, spare_output) = (output(), output());
-                let readout = self.resources.target_readout_graph(requirements.projected);
+                let readout = self.resources.target_readout_graph(requirements.readout);
                 let readout_workspace = readout
                     .acquire_workspace()
                     .unwrap_or_else(|error| invariant("target readout workspace", error));
@@ -3191,6 +3200,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             measurement_claim: None,
             group_class: None,
             idle_class: state::IdleClass::default(),
+            export_class: state::ExportClass::default(),
             answered: RefCell::default(),
             next_flight: 0,
             host_turn: None,
@@ -3212,6 +3222,14 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
 
     pub fn resource_identity(&self) -> &ResourceDomainId {
         self.domain.id()
+    }
+    /// The service bounds the load was planned for.
+    pub fn limits(&self) -> crate::ResourceLimits {
+        self.execution.policy().limits()
+    }
+    /// The model the load serves, at the context it was planned for.
+    pub fn definition(&self) -> &ModelDefinition {
+        &self.definition
     }
     pub fn execution_path(&self) -> crate::ExecutionPath {
         self.execution.policy().path()

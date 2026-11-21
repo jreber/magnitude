@@ -15,11 +15,11 @@ use super::transport::{MessageReceiver, MessageSender, TransportError};
 use super::WorkerExit;
 use crate::census::AllocationCensus;
 use crate::error::{RequestError, UnloadCause};
-use magnitude_executor::RequestId;
+use magnitude_executor::{RequestId, TokenId};
 use magnitude_family_contracts::ModelDefinition;
 use magnitude_scheduler::{
     owner::Status,
-    protocol::{AdmitRequest, RequestSnapshot, RoomAnswer, RoomGrant, WorkerCommand, WorkerReply},
+    protocol::{AdmitRequest, RequestSnapshot, RoomAnswer, RoomGrant, ScoreRequest, WorkerCommand, WorkerReply},
     publication::{Publication, PublicationReceiver, Retirement},
     worker::{Call, CallError, Client, DispatchError, Worker},
 };
@@ -204,6 +204,9 @@ pub(crate) struct Session {
     statuses: Vec<(HostRequestId, Call<UnloadCause>)>,
     observations: Vec<Call<UnloadCause>>,
     throughputs: Vec<Call<UnloadCause>>,
+    /// Score commands awaiting queueing; the outcome itself reaches the host
+    /// through the command's callback.
+    scores: Vec<(HostRequestId, Call<UnloadCause>)>,
     /// The model stopped serving; the session ends once every open request
     /// has delivered its terminal outcome.
     unloading: Option<UnloadCause>,
@@ -233,6 +236,7 @@ impl Session {
             statuses: Vec::new(),
             observations: Vec::new(),
             throughputs: Vec::new(),
+            scores: Vec::new(),
             unloading,
         }
     }
@@ -278,6 +282,7 @@ impl Session {
         self.statuses.clear();
         self.observations.clear();
         self.throughputs.clear();
+        self.scores.clear();
         self.loaded.execution.stop();
         let exit = match exit {
             WorkerExit::Shutdown => match self.send(WorkerMessage::Unloaded { cause: UnloadCause::Shutdown }) {
@@ -355,6 +360,12 @@ impl Session {
                     progress: None,
                 })?,
             },
+            HostMessage::Score {
+                request_id,
+                tokens,
+                top,
+                next,
+            } => self.score(request_id, tokens, top, next)?,
             HostMessage::Observe => match self.dispatch(WorkerCommand::Observe) {
                 Ok(call) => self.observations.push(call),
                 Err(error) => self.send(WorkerMessage::Observed { observation: Err(undispatched(error)) })?,
@@ -397,6 +408,47 @@ impl Session {
                 undispatched(error)
             ),
         }
+    }
+
+    /// Forward a scoring request to the execution owner. Its callback runs on
+    /// the execution thread and answers the host through `Outbound`; a
+    /// request that never reaches the owner fails here.
+    fn score(
+        &mut self,
+        request_id: HostRequestId,
+        tokens: Vec<TokenId>,
+        top: bool,
+        next: bool,
+    ) -> Result<(), TransportError> {
+        let outbound = self.outbound.clone();
+        let command = WorkerCommand::Score(ScoreRequest {
+            tokens,
+            top,
+            next,
+            done: Box::new(move |outcome| {
+                let message = match outcome {
+                    Ok(outcome) => WorkerMessage::Scored {
+                        request_id,
+                        outcome,
+                    },
+                    Err(error) => WorkerMessage::ScoreFailed {
+                        request_id,
+                        error: error.into(),
+                    },
+                };
+                // A lost transport ends the session, which fails the request
+                // on the host; there is nobody to tell here.
+                let _ = outbound.lock().unwrap().send(message);
+            }),
+        });
+        match self.dispatch(command) {
+            Ok(call) => self.scores.push((request_id, call)),
+            Err(error) => self.send(WorkerMessage::ScoreFailed {
+                request_id,
+                error: undispatched(error),
+            })?,
+        }
+        Ok(())
     }
 
     fn admit(&mut self, admission: Admission) -> Result<(), TransportError> {
@@ -579,6 +631,28 @@ impl Session {
                 }
                 None => {}
             }
+        }
+        let mut index = 0;
+        while index < self.scores.len() {
+            let Poll::Ready(reply) = Self::poll_call(&waker, &mut self.scores[index].1) else {
+                index += 1;
+                continue;
+            };
+            let (request_id, _) = self.scores.swap_remove(index);
+            // Queued: the callback answers. An owner that fails the command
+            // instead never calls it, so the failure is reported here.
+            let error = match reply {
+                Ok(WorkerReply::Acknowledged) => continue,
+                Ok(_) => {
+                    tracing::error!(
+                        "execution owner answered a score with a reply other than Acknowledged"
+                    );
+                    RequestError::internal("execution owner returned an invalid score reply")
+                }
+                Err(CallError::Refused(reason)) => RequestError::internal(reason),
+                Err(CallError::Stopped(cause)) => RequestError::ModelUnloaded { cause },
+            };
+            self.send(WorkerMessage::ScoreFailed { request_id, error })?;
         }
         let mut index = 0;
         while index < self.statuses.len() {

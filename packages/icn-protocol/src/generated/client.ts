@@ -46,6 +46,8 @@ export const makeIcnApiClient = (options: GeneratedClientOptions) =>
       },
       chat: {
         applyChatTemplate: makeHttpOperation(http, options, Operations.applyChatTemplateOperation),
+        createCompletion: makeHttpOperation(http, options, Operations.createCompletionOperation),
+        tokenize: makeHttpOperation(http, options, Operations.tokenizeOperation),
         createChatCompletion: makeStreamOperation(http, options, Operations.createChatCompletionOperation),
         createChatCompletionHttp: makeHttpOperation(http, options, Operations.createChatCompletionHttpOperation),
       },

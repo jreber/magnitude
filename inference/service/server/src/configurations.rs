@@ -414,11 +414,9 @@ mod tests {
         }
     }
 
-    /// Every configuration, so every preview and load, is on exactly the serving device.
-    #[test]
-    fn a_configuration_is_on_the_serving_device() {
-        let serving = ServingDevice::of(seismic::ExecutorSelector::HostCpu);
-        let configuration = engine_configuration(
+    /// The configuration of a plain standalone bundle on `serving`.
+    fn standalone(serving: ServingDevice) -> EngineConfiguration {
+        engine_configuration(
             ModelPackagePaths {
                 target_shards: vec![PathBuf::from("target.gguf")],
                 projector: None,
@@ -431,8 +429,24 @@ mod tests {
             LoadBounds::default(),
             0,
             None,
-        );
-        assert_eq!(configuration.device, serving.request());
+        )
+    }
+
+    /// Every configuration, so every preview and load, is on exactly the serving device.
+    #[test]
+    fn a_configuration_is_on_the_serving_device() {
+        let serving = ServingDevice::of(seismic::ExecutorSelector::HostCpu);
+        assert_eq!(standalone(serving).device, serving.request());
+    }
+
+    /// Every configuration, so every load, scores prompts as well as generating: it exports the
+    /// rows of logits a scoring flight of its service reads.
+    #[test]
+    fn a_configuration_exports_the_rows_it_scores_with() {
+        let configuration = standalone(ServingDevice::of(seismic::ExecutorSelector::HostCpu));
+        let rows = magnitude_engine::composition::scoring_rows(&configuration.service);
+        assert!(rows > 0);
+        assert_eq!(configuration.model.exported_logits_rows, rows);
     }
 
     fn key(index: usize) -> ServableModelBundleKey {

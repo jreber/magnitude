@@ -30,6 +30,8 @@ pub use preparation::{
     AcquiredDevice, ChildTransport, Preparation, PricedError, PricedFailure, WorkerEnd,
     WorkerProcess, WorkerReport,
 };
+// What `EngineClient::score` returns.
+pub use magnitude_scheduler::scoring::{ScoreOutcome, ScoredPosition, TopToken};
 
 use crate::census::AllocationCensus;
 use crate::execution::LoadAttempt;

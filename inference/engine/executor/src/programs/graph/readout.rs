@@ -77,11 +77,19 @@ fn norm_element(norm: Option<&crate::WeightPlan>) -> Element {
     norm.map_or(Element::f32(), |norm| norm.resident)
 }
 
+/// What a readout class computes beyond its features. Export is the
+/// class's: a launch with a row demanding logits runs a `Logits` class, any
+/// other launch a `Features` or `Selection` one, whatever its load exports.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum ReadoutKind {
     Features,
+    /// The projected rows' logits, exported, and the sampling of the leading
+    /// selected of them (none or more) as projected: unshaped, since
+    /// shaping must not rewrite the logits it exports, and uncertified,
+    /// since a certified projection computes no logits to export.
     Logits,
-    /// Sampling of the leading selected logits rows; `shaped` graphs run
+    /// Sampling of the leading selected logits rows, graph locals it
+    /// consumes, none exported; `shaped` graphs run
     /// `shape_rows` first, the others sample the logits as projected.
     /// `certified` graphs project a progressive head through its certified
     /// levels (`readout_top_rows`, `readout_refine_rows`,
@@ -395,14 +403,6 @@ pub(crate) struct ReadoutClass {
     pub kind: ReadoutKind,
 }
 
-/// What a readout class's graph exports beside its result: its logits (a
-/// diagnostic load's), and a selecting class's token rows.
-#[derive(Clone, Copy)]
-struct ReadoutExports {
-    logits: bool,
-    token_rows: bool,
-}
-
 /// Where a readout's features come from.
 #[derive(Clone, Copy)]
 enum FeatureSource<'p> {
@@ -527,7 +527,7 @@ pub(crate) struct PreparedProjection {
     pub head: ProjectionPorts,
     /// Hidden rows of the projected outputs, selected outputs first.
     pub logit_rows: NativePort,
-    /// The exported logits of a diagnostic load's projecting class.
+    /// The exported logits of a `Logits` class.
     pub logits: Option<WorkflowTensor>,
     /// Present in selecting classes (`ReadoutKind::Selection`).
     pub selection: Option<PreparedSelection>,
@@ -566,11 +566,16 @@ pub struct PreparedTargetReadoutGraphs {
     classes: BTreeMap<(bool, ReadoutClass), PreparedTargetReadoutGraph>,
     /// Whether the load's own feature source fuses a separate draft's taps.
     fuses: bool,
-    /// Every class: any launch's readout runs in its slots.
+    /// Every served class ([`ReadoutFamily::Launch`]): any launch's readout
+    /// that exports nothing runs in its slots.
     family: NativeGraphFamily,
-    /// The classes a prompt chunk's readout runs ([`chunk_holds`]), whose
-    /// slots hold no more than it exports.
+    /// The served classes a prompt chunk's readout runs
+    /// ([`ReadoutFamily::Chunk`]), whose slots hold no more than it exports.
     chunk_family: NativeGraphFamily,
+    /// The export classes, in a load that exports logits
+    /// ([`ReadoutFamily::Export`]): a launch that exports runs its readout
+    /// in their slots, claimed as it reserves.
+    export_family: Option<NativeGraphFamily>,
     max_projected_rows: usize,
     certified_classes: Vec<u64>,
 }
@@ -592,33 +597,54 @@ pub(crate) fn chunk_holds(projected: u64) -> bool {
     projected <= 1
 }
 
-/// Whether the load's projecting readout classes export their logits: only
-/// a diagnostic load, which declares rows to export, does. A served load's
-/// logits are graph locals its selection consumes.
+/// The families a load's readout classes run in, each the slots of a pool
+/// of its own (`AllocatedResources::readout_pool`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReadoutFamily {
+    /// Every served class: any launch's readout that exports nothing runs
+    /// in its slots, the floor's among them.
+    Launch,
+    /// The served classes a prompt chunk's readout runs ([`chunk_holds`]).
+    Chunk,
+    /// The export classes ([`ReadoutKind::Logits`]), which only a launch
+    /// that exports runs: their slots are claimed as such a launch
+    /// reserves, none at load, so a served launch's slots and the floor
+    /// are a load's that exports none.
+    Export,
+}
+
+impl ReadoutFamily {
+    const ALL: [Self; 3] = [Self::Launch, Self::Chunk, Self::Export];
+
+    fn holds(self, class: ReadoutClass) -> bool {
+        let exports = class.kind == ReadoutKind::Logits;
+        match self {
+            Self::Launch => !exports,
+            Self::Chunk => !exports && chunk_holds(class.projected),
+            Self::Export => exports,
+        }
+    }
+
+    /// Whether the family keeps `class`'s graphs live for each launch in
+    /// flight: a class a decode step's launch reads out
+    /// ([`readout_decodes`]), but none of the export family's, whose graphs
+    /// each claimed activation charges and records at first use.
+    fn pins(self, class: ReadoutClass, limits: ResourceLimits) -> bool {
+        self != Self::Export && readout_decodes(class, limits)
+    }
+}
+
+/// Whether the load has export classes ([`ReadoutKind::Logits`]): it
+/// declares rows to export. Only its launches with a row demanding logits
+/// run them; its others run the classes a load exporting none has.
 pub(crate) fn exports_logits(limits: ResourceLimits) -> bool {
     limits.exported_logits_rows > 0
 }
 
-/// The most rows one readout projects: the exported rows of a diagnostic
-/// load, otherwise the selection bound, since a served load projects exactly
-/// the rows it selects.
+/// The most rows one readout projects: a selection projects exactly the
+/// rows it selects, an export at most the load's exported rows.
 pub(crate) fn max_projected_rows(limits: ResourceLimits) -> usize {
-    if exports_logits(limits) {
-        limits.exported_logits_rows
-    } else {
-        limits.max_selected_rows
-    }
-}
-
-/// The most selected rows a load's certified selection classes serve: the
-/// head's for a served load, none for a diagnostic load, whose selections
-/// read the logits it exports.
-fn load_certified_rows(limits: ResourceLimits, head: HeadPlans<'_>) -> u64 {
-    if exports_logits(limits) {
-        0
-    } else {
-        head.certified_rows()
-    }
+    limits.max_selected_rows.max(limits.exported_logits_rows)
 }
 
 fn qualified_readout_classes(
@@ -626,7 +652,7 @@ fn qualified_readout_classes(
     head: HeadPlans<'_>,
 ) -> Result<Vec<ReadoutClass>, String> {
     Ok(
-        readout_classes(limits, load_certified_rows(limits, head))?
+        readout_classes(limits, head.certified_rows())?
             .into_iter()
             .filter(|class| {
                 !matches!(
@@ -641,12 +667,12 @@ fn qualified_readout_classes(
     )
 }
 
-/// A served load's classes are its features and its selections, whose
-/// projected rows are their selected rows. A diagnostic load's projecting
-/// classes export their logits: a logits class per exported row count, and
-/// unshaped selection of its leading rows, since shaping must not rewrite
-/// the logits it exports. A served load also has certified selections of up
-/// to `certified_rows` rows.
+/// Every load's classes are its features and its selections, whose
+/// projected rows are their selected rows, shaped or not, and certified up
+/// to `certified_rows` rows. A load that exports logits also has its export
+/// classes ([`ReadoutKind::Logits`]): the logits of each projected row
+/// count up to its exported rows, each alone and with the selection of its
+/// leading rows.
 fn readout_classes(
     limits: ResourceLimits,
     certified_rows: u64,
@@ -676,45 +702,34 @@ fn readout_classes(
                 selected: 0,
                 kind: ReadoutKind::Features,
             });
-            if exports_logits(limits) {
-                for projected in ladder((outputs as usize).min(limits.exported_logits_rows)) {
+            for selected in ladder((outputs as usize).min(limits.max_selected_rows)) {
+                let certifying = selected <= certified_rows;
+                for certified in [false, true] {
+                    if certified && !certifying {
+                        continue;
+                    }
+                    for shaped in [false, true] {
+                        classes.push(ReadoutClass {
+                            rows,
+                            outputs,
+                            projected: selected,
+                            selected,
+                            kind: ReadoutKind::Selection { shaped, certified },
+                        });
+                    }
+                }
+            }
+            // None without exported rows (an empty ladder).
+            for projected in ladder((outputs as usize).min(limits.exported_logits_rows)) {
+                let selections = ladder((projected as usize).min(limits.max_selected_rows));
+                for selected in std::iter::once(0).chain(selections) {
                     classes.push(ReadoutClass {
                         rows,
                         outputs,
                         projected,
-                        selected: 0,
+                        selected,
                         kind: ReadoutKind::Logits,
                     });
-                    for selected in ladder((projected as usize).min(limits.max_selected_rows)) {
-                        classes.push(ReadoutClass {
-                            rows,
-                            outputs,
-                            projected,
-                            selected,
-                            kind: ReadoutKind::Selection {
-                                shaped: false,
-                                certified: false,
-                            },
-                        });
-                    }
-                }
-            } else {
-                for selected in ladder((outputs as usize).min(limits.max_selected_rows)) {
-                    let certifying = selected <= certified_rows;
-                    for certified in [false, true] {
-                        if certified && !certifying {
-                            continue;
-                        }
-                        for shaped in [false, true] {
-                            classes.push(ReadoutClass {
-                                rows,
-                                outputs,
-                                projected: selected,
-                                selected,
-                                kind: ReadoutKind::Selection { shaped, certified },
-                            });
-                        }
-                    }
                 }
             }
         }
@@ -734,8 +749,7 @@ impl PreparedTargetReadoutGraphs {
         let head = HeadPlans::for_recipe(load, WeightScope::Target, WeightScope::Target, false)?;
         let (regimes, qualified) = load_readout_regimes::<NativeGraphLayout>(device.backend(), load, geometry, norm, head, limits).map_err(error)?;
         let mut classes = BTreeMap::new();
-        let mut plans = Vec::new();
-        let mut chunk_plans = Vec::new();
+        let mut plans = ReadoutFamily::ALL.map(|_| Vec::new());
         for &(source, class) in &qualified {
             let layout = regimes
                 .get(&(source.fuses, readout_regime(class)))
@@ -748,34 +762,42 @@ impl PreparedTargetReadoutGraphs {
                 (head, load),
                 source.features,
                 class,
-                exports_logits(limits),
                 source.token_rows,
                 layout,
             )?;
-            plans.push((readout_decodes(class, limits), variant.plan.clone()));
-            if chunk_holds(class.projected) {
-                chunk_plans.push((readout_decodes(class, limits), variant.plan.clone()));
+            for (family, plans) in ReadoutFamily::ALL.into_iter().zip(&mut plans) {
+                if family.holds(class) {
+                    plans.push((family.pins(class, limits), variant.plan.clone()));
+                }
             }
             classes.insert((source.fuses, class), variant);
         }
-        let family = super::serial_family("readout", plans, &readout_graphs(&regimes, &qualified, limits, false).map_err(error)?)
-            .map_err(|error| error.to_string())?;
-        let family_storage = regimes
-            .values()
-            .map(Certified::storage_bytes)
-            .reduce(NativeGraphStorageBytes::most)
-            .ok_or("readout graph family has no classes")?;
-        super::assert_storage_eq("readout", &family, family_storage);
-        let chunk_family = super::serial_family("chunk readout", chunk_plans, &readout_graphs(&regimes, &qualified, limits, true).map_err(error)?)
-            .map_err(|error| error.to_string())?;
-        if let Some(chunk_storage) = qualified
-            .iter()
-            .filter(|(_, class)| chunk_holds(class.projected))
-            .filter_map(|(source, class)| regimes.get(&(source.fuses, readout_regime(*class))))
-            .map(Certified::storage_bytes)
-            .reduce(NativeGraphStorageBytes::most)
-        {
+        // Each family's slots hold its widest regime's graph.
+        let storage = |family: ReadoutFamily| {
+            qualified
+                .iter()
+                .filter(|(_, class)| family.holds(*class))
+                .filter_map(|(source, class)| regimes.get(&(source.fuses, readout_regime(*class))))
+                .map(Certified::storage_bytes)
+                .reduce(NativeGraphStorageBytes::most)
+        };
+        let [launch, chunk, export] = plans;
+        let sealed = |name: &str, family, plans| {
+            super::serial_family(name, plans, &readout_graphs(&regimes, &qualified, limits, family).map_err(error)?)
+                .map_err(|error| error.to_string())
+        };
+        let family = sealed("readout", ReadoutFamily::Launch, launch)?;
+        super::assert_storage_eq("readout", &family, storage(ReadoutFamily::Launch).ok_or("readout graph family has no classes")?);
+        let chunk_family = sealed("chunk readout", ReadoutFamily::Chunk, chunk)?;
+        if let Some(chunk_storage) = storage(ReadoutFamily::Chunk) {
             super::assert_storage_eq("chunk readout", &chunk_family, chunk_storage);
+        }
+        let export_family = match export.is_empty() {
+            true => None,
+            false => Some(sealed("export readout", ReadoutFamily::Export, export)?),
+        };
+        if let (Some(family), Some(export_storage)) = (&export_family, storage(ReadoutFamily::Export)) {
+            super::assert_storage_eq("export readout", family, export_storage);
         }
         Ok(Self {
             residual_width: load.residual_conditioning(),
@@ -783,11 +805,12 @@ impl PreparedTargetReadoutGraphs {
             fuses: qualified.iter().any(|(source, _)| source.fuses),
             family,
             chunk_family,
+            export_family,
             max_projected_rows: max_projected_rows(limits),
             certified_classes: magnitude_batching::row_classes(limits.max_selected_rows)
                 .into_iter()
                 .map(|rows| rows as u64)
-                .filter(|&rows| head.certifies(rows) && !exports_logits(limits))
+                .filter(|&rows| head.certifies(rows))
                 .collect(),
         })
     }
@@ -799,6 +822,11 @@ impl PreparedTargetReadoutGraphs {
     /// ([`chunk_holds`]).
     pub fn chunk_family(&self) -> &NativeGraphFamily {
         &self.chunk_family
+    }
+    /// The family of the export classes a launch that exports runs, in a
+    /// load that exports logits ([`ReadoutFamily::Export`]).
+    pub fn export_family(&self) -> Option<&NativeGraphFamily> {
+        self.export_family.as_ref()
     }
     pub fn workspace_bytes(&self) -> u64 {
         self.family.workspace_bytes()
@@ -962,7 +990,6 @@ impl PreparedTargetReadoutGraph {
         (head_plans, weights): (HeadPlans<'_>, &(impl PlannedWeights + ?Sized)),
         source: FeatureSource<'_>,
         class: ReadoutClass,
-        export: bool,
         token_rows: bool,
         layout: &NativeGraphLayout,
     ) -> Result<Self, String> {
@@ -1044,7 +1071,6 @@ impl PreparedTargetReadoutGraph {
                 geometry,
                 (stored, weights),
                 class,
-                export,
                 final_rows,
             )
             .map_err(error)?;
@@ -1709,10 +1735,10 @@ struct Projected<G> {
 }
 
 /// The projection of the class's projected rows (the head as placed, or a
-/// certified class's levels over the progressive planes), then its
-/// selection. The logits are exported only by a diagnostic load (`export`);
-/// otherwise they are a graph local its selection consumes (and shaping
-/// rewrites in place).
+/// certified class's levels over the progressive planes), then the
+/// selection of its leading selected rows, if any. A `Logits` class exports
+/// the logits; any other class's are a graph local its selection consumes
+/// (and shaping rewrites in place).
 #[allow(clippy::too_many_arguments)]
 fn head_topology<'a, G: GraphDraft + 'a>(
     mut graph: G,
@@ -1725,7 +1751,6 @@ fn head_topology<'a, G: GraphDraft + 'a>(
     geometry: &Decoder,
     (plans, weights): (StoredHead, &(impl PlannedWeights + ?Sized)),
     class: ReadoutClass,
-    export: bool,
     final_rows: FinalRowPorts,
 ) -> Result<Projected<G>, GraphError> {
     let (hidden, norm) = (&final_rows.hidden, &final_rows.norm);
@@ -1817,11 +1842,12 @@ fn head_topology<'a, G: GraphDraft + 'a>(
         Some(sampler),
         &mut Vec::new(),
     )?;
+    let export = class.kind == ReadoutKind::Logits;
     if export {
         graph.export(&logits)?;
     }
     let exported = export.then(|| logits.clone());
-    let ReadoutKind::Selection { shaped, .. } = class.kind else {
+    if class.selected == 0 {
         return Ok(Projected {
             graph,
             projection: PreparedProjection {
@@ -1832,7 +1858,8 @@ fn head_topology<'a, G: GraphDraft + 'a>(
                 selection: None,
             },
         });
-    };
+    }
+    let shaped = matches!(class.kind, ReadoutKind::Selection { shaped: true, .. });
     let inputs = match certified {
         Some(certified) => certified.selecting,
         None => selection_inputs(&mut graph, sampler, &selected, &vocabulary)?,
@@ -1917,7 +1944,6 @@ fn checked_readout_class_storage<W: PlannedWeights + ?Sized>(
     norm_plan: Option<&crate::WeightPlan>,
     head: (HeadPlans<'_>, &W),
     class: ReadoutClass,
-    export: bool,
 ) -> Result<NativeGraphStorageBytes, GraphError> {
     Ok(checked_readout_class_draft(
         NativeGraphMetadata::new(backend),
@@ -1926,7 +1952,7 @@ fn checked_readout_class_storage<W: PlannedWeights + ?Sized>(
         head,
         FeatureSource::Output,
         class,
-        ReadoutExports { logits: export, token_rows: false },
+        false,
     )?
     .seal()?)
 }
@@ -1972,7 +1998,7 @@ fn checked_readout_class_draft<G: ElementBoundDraft, W: PlannedWeights + ?Sized>
     (head, weights): (HeadPlans<'_>, &W),
     source: FeatureSource<'_>,
     class: ReadoutClass,
-    ReadoutExports { logits: export, token_rows }: ReadoutExports,
+    token_rows: bool,
 ) -> Result<G, GraphError> {
     let mut prefix = checked_feature_prefix(graph, geometry, norm_plan, source, class)?;
     if class.kind == ReadoutKind::Features {
@@ -2014,7 +2040,6 @@ fn checked_readout_class_draft<G: ElementBoundDraft, W: PlannedWeights + ?Sized>
         geometry,
         (head, weights),
         class,
-        export,
         final_rows,
     )?
     .graph)
@@ -2042,7 +2067,6 @@ pub(crate) fn checked_projected_graph_storage(
             selected: 0,
             kind: ReadoutKind::Logits,
         },
-        true,
     )
 }
 
@@ -2073,7 +2097,6 @@ pub(crate) fn checked_selection_graph_storage(
                 certified: false,
             },
         },
-        false,
     )
 }
 
@@ -2090,8 +2113,10 @@ pub(crate) fn checked_readout_family_storage(
 
 /// The readout family's storage ([`checked_readout_family_storage`]) and
 /// what its graphs hold ([`readout_graphs`]): what a load commits of its
-/// readout. A prompt chunk's family is charged by the class a group claims
-/// as it opens, from the pools themselves, never here.
+/// readout, its served classes' alone ([`ReadoutFamily::Launch`]). A prompt
+/// chunk's family is charged by the class a group claims as it opens, and
+/// the export family by a launch that exports as it reserves, from the
+/// pools themselves, never here.
 #[cfg(test)]
 pub(crate) fn checked_readout_storage(
     backend: BackendName,
@@ -2221,7 +2246,13 @@ fn summarize_readout_regimes(
     let most = |layouts: &mut dyn Iterator<Item = &SizingOutline>| {
         layouts.map(Certified::storage_bytes).reduce(NativeGraphStorageBytes::most)
     };
-    let family = most(&mut regimes.values()).ok_or("readout graph family has no classes")?;
+    let served = classes
+        .iter()
+        .filter(|(_, class)| ReadoutFamily::Launch.holds(*class))
+        .map(|(source, class)| (source.fuses, readout_regime(*class)))
+        .collect::<std::collections::BTreeSet<_>>();
+    let family = most(&mut served.iter().filter_map(|regime| regimes.get(regime)))
+        .ok_or("readout graph family has no classes")?;
     let mut census = super::sizing::ReadoutSizingCensus::default();
     for outline in regimes.values() {
         census.kernels.extend(outline.kernels().iter().cloned());
@@ -2246,7 +2277,7 @@ fn summarize_readout_regimes(
     if let Some(outline) = decode_outline {
         census.decode_calls = outline.launches().to_vec();
     }
-    let graphs = readout_graphs(regimes, classes, limits, false)?;
+    let graphs = readout_graphs(regimes, classes, limits, ReadoutFamily::Launch)?;
     Ok((family, graphs, census))
 }
 
@@ -2358,11 +2389,13 @@ fn load_readout_sizing_regimes<'p>(
     Ok((regimes, classes, drafts))
 }
 
-/// The structure a readout class selects: its kind; for a selection, the
-/// selected-row count its sampling view is built from; and whether it is a
-/// prompt chunk's class ([`chunk_holds`]). A regime's classes share the
-/// layout of its widest, so a chunk's classes form regimes of their own:
-/// the chunk family's slots hold what a chunk exports.
+/// The structure a readout class selects: its kind, which says whether it
+/// exports its logits, so an export class and a served one never share a
+/// regime; the selected-row count its sampling view is built from (none
+/// where it selects nothing); and whether it is a prompt chunk's class
+/// ([`chunk_holds`]). A regime's classes share the layout of its widest, so
+/// a chunk's classes form regimes of their own: the chunk family's slots
+/// hold what a chunk exports.
 type ReadoutRegime = (ReadoutKind, u64, bool);
 
 /// Whether a decode step's launch may read out `class`: one of no more than
@@ -2371,31 +2404,30 @@ fn readout_decodes(class: ReadoutClass, limits: ResourceLimits) -> bool {
     class.rows <= limits.decode_rows()
 }
 
-/// What the readout family of `classes` holds (`seismic::LaunchGraphs::of`),
-/// each launch one run of its class's regime's graph, those of a class a
-/// decode step's launch reads out ([`readout_decodes`]) kept live; or, with
-/// `chunk`, the chunk family's, of its classes ([`chunk_holds`]), whose
-/// slots a decode step's readout of one row takes where they are free
-/// (`AllocatedResources::readout_pool`).
+/// What `family`'s slots hold of the readout graphs of `classes`
+/// (`seismic::LaunchGraphs::of`), each launch one run of its class's
+/// regime's graph, those the family pins ([`ReadoutFamily::pins`]) kept
+/// live: the chunk family's slots a decode step's readout of one row takes
+/// where they are free (`AllocatedResources::readout_pool`).
 fn readout_graphs(
     regimes: &BTreeMap<SourcedRegime, impl Certified>,
     classes: &[(ReadoutSource<'_>, ReadoutClass)],
     limits: ResourceLimits,
-    chunk: bool,
+    family: ReadoutFamily,
 ) -> Result<LaunchGraphs, GraphError> {
-    readout_graphs_by(regimes, classes, limits, chunk, |regime| regime)
+    readout_graphs_by(regimes, classes, limits, family, |regime| regime)
 }
 
 fn readout_graphs_by<K: Ord>(
     regimes: &BTreeMap<K, impl Certified>,
     classes: &[(ReadoutSource<'_>, ReadoutClass)],
     limits: ResourceLimits,
-    chunk: bool,
+    family: ReadoutFamily,
     key: impl Fn(SourcedRegime) -> K,
 ) -> Result<LaunchGraphs, GraphError> {
     let mut decodes = BTreeMap::<SourcedRegime, bool>::new();
-    for &(source, class) in classes.iter().filter(|(_, class)| !chunk || chunk_holds(class.projected)) {
-        *decodes.entry((source.fuses, readout_regime(class))).or_default() |= readout_decodes(class, limits);
+    for &(source, class) in classes.iter().filter(|(_, class)| family.holds(*class)) {
+        *decodes.entry((source.fuses, readout_regime(class))).or_default() |= family.pins(class, limits);
     }
     let graphs = decodes
         .into_iter()
@@ -2408,11 +2440,7 @@ fn readout_graphs_by<K: Ord>(
 }
 
 fn readout_regime(class: ReadoutClass) -> ReadoutRegime {
-    let chunk = chunk_holds(class.projected);
-    match class.kind {
-        ReadoutKind::Selection { .. } => (class.kind, class.selected, chunk),
-        kind => (kind, 0, chunk),
-    }
+    (class.kind, class.selected, chunk_holds(class.projected))
 }
 
 /// The layouts of the classes a readout prepares from `source`, by regime.
@@ -2477,10 +2505,6 @@ fn certify_readout_regimes_by<K: Ord, L: Certified>(
     for &class in source_classes {
         regimes.entry(key(class)).or_default().push(class);
     }
-    let exports = ReadoutExports {
-        logits: exports_logits(limits),
-        token_rows: source.token_rows,
-    };
     regimes
         .into_iter()
         .map(|(regime, classes)| {
@@ -2492,7 +2516,7 @@ fn certify_readout_regimes_by<K: Ord, L: Certified>(
                     (head, weights),
                     source.features,
                     class,
-                    exports,
+                    source.token_rows,
                 )?;
                 Ok((draft, ()))
             })?;
@@ -2917,7 +2941,7 @@ mod resource_regime_tests {
             (selecting, &load),
             FeatureSource::Output,
             uncertified,
-            ReadoutExports { logits: false, token_rows: load.fronts() },
+            load.fronts(),
         )
         .unwrap();
         // Top-p, and a repetition penalty, at a sampling temperature.
@@ -3074,9 +3098,8 @@ mod resource_regime_tests {
             assert!(load.planned_output(WeightScope::Target).is_some());
             let norm = target_readout_norm(&load, &definition.decoder).unwrap();
             for limits in [served, diagnostic] {
-                let classes =
-                    readout_classes(limits, load_certified_rows(limits, head)).unwrap();
-                // A diagnostic load's selections read the logits it exports.
+                let classes = readout_classes(limits, head.certified_rows()).unwrap();
+                // A load that exports logits keeps its certified selections.
                 assert_eq!(
                     classes.iter().any(|class| matches!(
                         class.kind,
@@ -3085,7 +3108,7 @@ mod resource_regime_tests {
                             ..
                         }
                     )),
-                    progressive && !exports_logits(limits),
+                    progressive,
                     "{backend:?}"
                 );
                 let regimes = certify_readout_regimes::<NativeGraphLayout>(
@@ -3106,7 +3129,7 @@ mod resource_regime_tests {
                         (head, &load),
                         FeatureSource::Output,
                         class,
-                        ReadoutExports { logits: exports_logits(limits), token_rows: load.fronts() },
+                        load.fronts(),
                     )
                     .unwrap()
                     .seal_with_layout(layout)
@@ -3193,9 +3216,7 @@ mod resource_regime_tests {
                 limits,
             )
             .unwrap();
-            for class in
-                readout_classes(limits, load_certified_rows(limits, head)).unwrap()
-            {
+            for class in readout_classes(limits, head.certified_rows()).unwrap() {
                 let layout = &regimes[&readout_regime(class)];
                 let bytes = checked_readout_class_draft(
                     NativeGraphMetadata::new(backend),
@@ -3204,7 +3225,7 @@ mod resource_regime_tests {
                     (head, &load),
                     FeatureSource::Output,
                     class,
-                    ReadoutExports { logits: false, token_rows: load.fronts() },
+                    load.fronts(),
                 )
                 .unwrap()
                 .seal_with_layout(layout)
@@ -3256,7 +3277,7 @@ mod resource_regime_tests {
                 }
             ) || class.selected <= 4
         }));
-        let diagnostic = readout_classes(
+        let exporting = readout_classes(
             ResourceLimits {
                 exported_logits_rows: 64,
                 ..limits
@@ -3264,17 +3285,11 @@ mod resource_regime_tests {
             4,
         )
         .unwrap();
-        // A diagnostic load exports logits, so it neither shapes nor
-        // certifies.
-        assert!(diagnostic.iter().all(|class| !matches!(
-            class.kind,
-            ReadoutKind::Selection { shaped: true, .. }
-                | ReadoutKind::Selection {
-                    certified: true,
-                    ..
-                }
-        )));
-        assert!(diagnostic.iter().all(|class| class.projected <= 64));
+        // A load that exports logits exports them alone, of at most its
+        // exported rows, selecting within the bound.
+        assert!(exporting.iter().all(|class| class.kind == ReadoutKind::Logits
+            || class.projected == class.selected));
+        assert!(exporting.iter().all(|class| class.projected <= 64 && class.selected <= 32));
     }
 
     #[test]
@@ -3290,9 +3305,10 @@ mod resource_regime_tests {
             let (regimes, classes) =
                 load_readout_regimes::<SizingOutline>(backend, load, geometry, norm, head, limits)
                     .unwrap();
-            let family = regimes
-                .values()
-                .map(Certified::storage_bytes)
+            let family = classes
+                .iter()
+                .filter(|(_, class)| ReadoutFamily::Launch.holds(*class))
+                .map(|(source, class)| regimes[&(source.fuses, readout_regime(*class))].storage_bytes())
                 .reduce(NativeGraphStorageBytes::most)
                 .unwrap();
             let mut census = crate::programs::graph::sizing::ReadoutSizingCensus::default();
@@ -3326,7 +3342,7 @@ mod resource_regime_tests {
             if let Some(outline) = decode_outline {
                 census.decode_calls = outline.launches().to_vec();
             }
-            let graphs = readout_graphs(&regimes, &classes, limits, false).unwrap();
+            let graphs = readout_graphs(&regimes, &classes, limits, ReadoutFamily::Launch).unwrap();
             (family, graphs, census, regimes.len())
         };
 
@@ -3448,6 +3464,193 @@ mod resource_regime_tests {
             for (tag, limits) in [("tapped/served", served), ("tapped/diagnostic", diagnostic)] {
                 check(tag, backend, &tapped, &tapped_definition.decoder, limits);
             }
+        }
+    }
+
+    /// The fixture's load on `backend` with a Q8_0 head: where the backend
+    /// reads progressive heads it is stored as planes, whose target reader
+    /// certifies the selection classes of `certified` rows.
+    fn q8_head_load(
+        backend: BackendName,
+        certified: &[u64],
+    ) -> (magnitude_family_contracts::ModelDefinition, ModelLoadPlan) {
+        let definition = crate::planning::fixtures::fixture_definition();
+        let mut manifest = crate::planning::fixtures::fixture_manifest(&definition);
+        let output = manifest
+            .target
+            .tensors
+            .iter_mut()
+            .find(|tensor| tensor.name == definition.decoder.exit.output.name)
+            .unwrap();
+        output.encoding = magnitude_artifacts::gguf::Encoding::Q8_0;
+        output.nbytes = output.shape.iter().product::<u64>() / 32 * 34;
+        let load = ModelLoadPlan::derive(
+            &manifest,
+            &definition,
+            ComponentSelection { head: false, vision: false },
+            crate::planning::resident_layout(crate::ExecutionPath::Native, backend),
+            crate::PlannedMethod::Plain,
+            crate::planning::fixtures::LIMITS,
+        )
+        .unwrap();
+        let load = match reads_progressive_heads(backend).unwrap() {
+            true => load
+                .with_readout_candidates(&definition)
+                .unwrap()
+                .finalize_readout(&[crate::planning::ReadoutClassChoice {
+                    scope: WeightScope::Target,
+                    norm_scope: WeightScope::Target,
+                    prepared: false,
+                    rows: certified.to_vec(),
+                }])
+                .unwrap(),
+            false => load,
+        };
+        (definition, load)
+    }
+
+    /// A load of up to 512 rows, selecting up to 32, exporting `exported`
+    /// rows of logits.
+    fn limits_exporting(exported: usize) -> ResourceLimits {
+        ResourceLimits {
+            max_launch_rows: 512,
+            max_launch_slots: 512,
+            max_selected_rows: 32,
+            max_drafting_slots: 32,
+            exported_logits_rows: exported,
+            max_images_per_request: 0,
+            max_image_cells: 0,
+            lookahead: false,
+            chain_capacity: std::num::NonZeroUsize::MIN,
+            conversations: std::num::NonZeroUsize::MIN,
+        }
+    }
+
+    /// A load that exports logits keeps every class a load exporting none
+    /// has, its shaped and certified selections among them, and adds only
+    /// its export classes: the logits of up to its exported rows, and
+    /// unshaped selections of their leading rows. A regime holds export
+    /// classes or served ones, never both, so the two share no graph and no
+    /// layout.
+    #[test]
+    fn an_exporting_load_keeps_its_served_classes_and_adds_its_export_classes() {
+        let (_, load) = q8_head_load(BackendName::Metal, &[1]);
+        let head =
+            HeadPlans::for_recipe(&load, WeightScope::Target, WeightScope::Target, false).unwrap();
+        assert!(head.certifies(1));
+        let served = qualified_readout_classes(limits_exporting(0), head).unwrap();
+        let classes = qualified_readout_classes(limits_exporting(256), head).unwrap();
+        for kind in [
+            ReadoutKind::Selection { shaped: true, certified: false },
+            ReadoutKind::Selection { shaped: true, certified: true },
+            ReadoutKind::Selection { shaped: false, certified: true },
+        ] {
+            assert!(served.iter().any(|class| class.kind == kind), "{kind:?}");
+        }
+        for class in &served {
+            assert!(classes.contains(class), "the exporting load lost {class:?}");
+        }
+        let added = classes.iter().filter(|class| !served.contains(class)).collect::<Vec<_>>();
+        for class in &added {
+            assert_eq!(class.kind, ReadoutKind::Logits, "{class:?}");
+            assert!(class.projected <= 256 && class.selected <= class.projected.min(32), "{class:?}");
+        }
+        assert!(added.iter().any(|class| class.projected == 256 && class.selected == 0));
+        assert!(added.iter().any(|class| class.projected == 256 && class.selected == 32));
+        let mut regimes = BTreeMap::new();
+        for class in &classes {
+            let exports = class.kind == ReadoutKind::Logits;
+            assert_eq!(
+                *regimes.entry(readout_regime(*class)).or_insert(exports),
+                exports,
+                "{class:?} shares a regime with classes that export otherwise"
+            );
+        }
+    }
+
+    /// Strict upgrade: a load exporting no logits plans the classes a load
+    /// planned before a launch's export was its own (its features, and its
+    /// selections of their projected rows, shaped or not, certified up to
+    /// its head's rows), and a load exporting logits seals its served
+    /// classes into the same layouts as one exporting none.
+    #[test]
+    fn a_load_exporting_nothing_plans_what_it_did_before() {
+        let served_branch = |limits: ResourceLimits, certified_rows: u64| {
+            let ladder = |bound: usize| {
+                magnitude_batching::row_classes(bound).into_iter().map(|rows| rows as u64).collect::<Vec<_>>()
+            };
+            let mut classes = Vec::new();
+            for rows in ladder(limits.max_launch_rows) {
+                for outputs in ladder(rows as usize) {
+                    classes.push(ReadoutClass { rows, outputs, projected: 0, selected: 0, kind: ReadoutKind::Features });
+                    for selected in ladder((outputs as usize).min(limits.max_selected_rows)) {
+                        for certified in [false, true].into_iter().filter(|&certified| !certified || selected <= certified_rows) {
+                            for shaped in [false, true] {
+                                classes.push(ReadoutClass {
+                                    rows,
+                                    outputs,
+                                    projected: selected,
+                                    selected,
+                                    kind: ReadoutKind::Selection { shaped, certified },
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            classes
+        };
+        for certified_rows in [0, 1, 4] {
+            assert_eq!(readout_classes(limits_exporting(0), certified_rows).unwrap(), served_branch(limits_exporting(0), certified_rows));
+        }
+        for backend in [BackendName::Cpu, BackendName::Metal, BackendName::Cuda, BackendName::Vulkan] {
+            let (definition, load) = q8_head_load(backend, &[1]);
+            let head =
+                HeadPlans::for_recipe(&load, WeightScope::Target, WeightScope::Target, false).unwrap();
+            let norm = target_readout_norm(&load, &definition.decoder).unwrap();
+            let regimes = |limits| {
+                certify_readout_regimes::<NativeGraphLayout>(
+                    backend,
+                    &definition.decoder,
+                    norm,
+                    (head, &load),
+                    ReadoutSource::whole(FeatureSource::Output, false),
+                    limits,
+                )
+                .unwrap()
+            };
+            let (served, exported) = (regimes(limits_exporting(0)), regimes(limits_exporting(256)));
+            for (regime, layout) in &served {
+                let exporting = exported
+                    .get(regime)
+                    .unwrap_or_else(|| panic!("{backend:?}: the exporting load has no regime {regime:?}"));
+                assert_eq!(exporting.storage_bytes(), layout.storage_bytes(), "{backend:?} {regime:?}");
+            }
+        }
+    }
+
+    /// A load that exports logits plans and charges exactly the readout a
+    /// load exporting none does, the slots' storage and the graphs its
+    /// family keeps live alike: its export classes are a family of their
+    /// own, charged as a launch that exports claims it, never at load.
+    #[test]
+    fn an_exporting_load_plans_the_readout_of_a_load_exporting_none() {
+        for backend in [BackendName::Cpu, BackendName::Metal, BackendName::Cuda, BackendName::Vulkan] {
+            let (definition, load) = q8_head_load(backend, &[1]);
+            let planned = |exported| checked_readout_storage(backend, &load, &definition.decoder, limits_exporting(exported)).unwrap();
+            let (served, exporting) = (planned(0), planned(256));
+            assert_eq!(exporting.0, served.0, "{backend:?}: the readout slots' storage");
+            assert_eq!(exporting.1, served.1, "{backend:?}: the readout family's graphs");
+            // The export family keeps none of its graphs live: each claimed
+            // activation charges them, recorded at first use.
+            let head = HeadPlans::for_recipe(&load, WeightScope::Target, WeightScope::Target, false).unwrap();
+            let norm = target_readout_norm(&load, &definition.decoder).unwrap();
+            let limits = limits_exporting(256);
+            let (regimes, classes) =
+                load_readout_regimes::<SizingOutline>(backend, &load, &definition.decoder, norm, head, limits).unwrap();
+            let export = readout_graphs(&regimes, &classes, limits, ReadoutFamily::Export).unwrap();
+            assert_eq!(export.pinned, seismic::GraphCensus::default(), "{backend:?}");
+            assert!(export.union.graphs > 0, "{backend:?}");
         }
     }
 }

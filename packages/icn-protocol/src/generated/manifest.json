@@ -1,7 +1,7 @@
 {
   "generator": "@magnitudedev/openapi-effect",
   "generatorVersion": "0.0.1",
-  "protocolHash": "15f9af0bafb9dbac38d5f0bba4b1c2409708d1a10a725825931001e9b70b9f9d",
+  "protocolHash": "999ec8352f462d1aec91cf22fb924aa1137922766cddf6c5d1f9ec9a29f0b461",
   "configHash": "35eaa09ad05c284228c67845b4e6f4db4aa545ca4a74ee0d812d04c6af53ee75",
   "files": [
     "api.ts",
@@ -24,6 +24,7 @@
     "countAnthropicMessageTokens",
     "createAnthropicMessage",
     "createChatCompletion",
+    "createCompletion",
     "createResponse",
     "ensureModelInstance",
     "getCatalogInstallation",
@@ -55,6 +56,7 @@
     "startModelDownload",
     "stopModelInstance",
     "streamModelCandidateInspection",
+    "tokenize",
     "watchInferenceEvents"
   ]
 }

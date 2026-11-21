@@ -1378,6 +1378,12 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
             self.state = state;
             return;
         };
+        tracing::info!(
+            model.id = %ready.instance.model_id,
+            model.instance.id = %ready.instance.id.0,
+            residency.release.reason = ?reason,
+            "model release begins"
+        );
         let stopping = ready.stopping(reason);
         if reason == ModelReleaseReason::UserStop || ready.resources.leases.is_empty() {
             let control = self.controller.start_worker_release(
@@ -3005,4 +3011,25 @@ mod tests {
         }
     }
 
+    /// A chat and a score of one model lease one instance: both resolve the model's one target
+    /// (`controller::residency_target`), so with the chat's lease held a score of the same model
+    /// is granted by the instance serving the chat, which nothing replaces or loads beside.
+    #[tokio::test(start_paused = true)]
+    async fn a_chat_and_a_score_of_one_model_lease_one_instance() {
+        let (client, mut loads, _, actor) = test_residency(true);
+        let model_id: ModelId = "model-a:gguf:test".parse().expect("valid test model ID");
+        let target = || controller::residency_target(model_id.clone(), test_configuration("model-a"));
+        let lease = |grant| match grant {
+            ResidencyGrant::Lease(lease) => lease,
+            ResidencyGrant::Ready(_) => panic!("an inference acquisition is granted with a lease"),
+        };
+        let inference = || ResidencyAcquisition::Inference { progress: None };
+        let chat = lease(client.acquire(target(), inference()).await.expect("the chat's lease"));
+        let (_, loaded) = loads.recv().await.expect("the chat's load");
+        assert_eq!(loaded, "model-a:gguf:test");
+        let score = lease(client.acquire(target(), inference()).await.expect("the score's lease"));
+        assert_eq!(score.instance_id(), chat.instance_id(), "the score is served by the chat's instance");
+        assert!(loads.try_recv().is_err(), "the score loaded another instance");
+        actor.abort();
+    }
 }

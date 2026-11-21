@@ -29,7 +29,7 @@ use crate::chat::{
 use crate::error::{ModelUnavailable, ServingError};
 use crate::source::{
     GenerationEvent, GenerationStream, HostChat, LoadProgress, ModelInvocation, ModelLoadProgress,
-    ModelLoadStage, ServedModels,
+    ModelLoadStage, PositionScore, PromptScore, ServedModels, TokenizeInput, TopScore,
 };
 use crate::{Serving, anthropic, responses, router};
 
@@ -116,6 +116,9 @@ struct Observed {
     invocations: AtomicUsize,
     requests: Mutex<Vec<(String, GenerationRequest)>>,
     counted: Mutex<Vec<ChatInput>>,
+    tokenized: Mutex<Vec<TokenizeInput>>,
+    /// Each score call: model, tokens, top, next.
+    scored: Mutex<Vec<(String, Vec<u32>, bool, bool)>>,
     /// Set when a consumer dropped a live generation.
     cancelled: AtomicBool,
     /// Set when a pending model binding was dropped.
@@ -130,6 +133,11 @@ struct Scripted {
     pending: bool,
     binding_failure: Option<ServingError>,
     observed: Arc<Observed>,
+    /// What the host tokenizer returns for any input.
+    tokens: Vec<u32>,
+    /// The prompt length the model's load takes.
+    context_limit: u64,
+    scoring: Result<PromptScore, ServingError>,
 }
 
 impl Scripted {
@@ -140,6 +148,12 @@ impl Scripted {
             pending: false,
             binding_failure: None,
             observed: Arc::default(),
+            tokens: vec![10, 11, 12],
+            context_limit: 4096,
+            scoring: Ok(PromptScore {
+                positions: Vec::new(),
+                next: None,
+            }),
         }
     }
 }
@@ -259,6 +273,8 @@ impl ServedModels for Scripted {
         let result = if model == self.model {
             Ok(Arc::new(ScriptedHost {
                 observed: self.observed.clone(),
+                tokens: self.tokens.clone(),
+                context_limit: self.context_limit,
             }) as Arc<dyn HostChat>)
         } else {
             Err(ServingError::Model(ModelUnavailable::NotFound(format!(
@@ -267,10 +283,34 @@ impl ServedModels for Scripted {
         };
         Box::pin(std::future::ready(result))
     }
+
+    fn score(
+        &self,
+        model: &str,
+        tokens: Vec<u32>,
+        top: bool,
+        next: bool,
+    ) -> BoxFuture<'_, Result<PromptScore, ServingError>> {
+        self.observed
+            .scored
+            .lock()
+            .unwrap()
+            .push((model.to_owned(), tokens, top, next));
+        let result = if model == self.model {
+            self.scoring.clone()
+        } else {
+            Err(ServingError::Model(ModelUnavailable::NotFound(format!(
+                "model `{model}` is not served"
+            ))))
+        };
+        Box::pin(std::future::ready(result))
+    }
 }
 
 struct ScriptedHost {
     observed: Arc<Observed>,
+    tokens: Vec<u32>,
+    context_limit: u64,
 }
 
 fn toggle_profile() -> ReasoningProfile {
@@ -314,6 +354,19 @@ impl HostChat for ScriptedHost {
             thinking_end_tag: Some("</think>".into()),
             template_fingerprint: "fingerprint".into(),
         })
+    }
+
+    fn tokenize(&self, input: &TokenizeInput) -> Result<Vec<u32>, ServingError> {
+        self.observed.tokenized.lock().unwrap().push(input.clone());
+        Ok(self.tokens.clone())
+    }
+
+    fn decode_token(&self, token: u32) -> Result<String, ServingError> {
+        Ok(format!("<{token}>"))
+    }
+
+    fn context_limit(&self) -> u64 {
+        self.context_limit
     }
 
     fn properties(&self) -> Result<ModelProperties, ServingError> {
@@ -2701,4 +2754,333 @@ async fn responses_end_a_call_cut_off_by_the_output_limit_incomplete_in_both_mod
         Value::Array(stream.concluded.await.unwrap()),
         terminal["output"]
     );
+}
+
+// ---------------------------------------------------------------------------
+// /tokenize and /v1/completions (teacher-forced scoring)
+
+async fn post_to(source: Scripted, path: &str, request: Value) -> Reply {
+    send(app(source), path, &[], request).await
+}
+
+fn json_body(reply: &Reply) -> Value {
+    serde_json::from_str(&reply.body).expect("reply must be JSON")
+}
+
+fn scored(positions: Vec<PositionScore>, next: Option<u32>) -> Scripted {
+    let mut source = Scripted::new(Script::text("unused"));
+    source.scoring = Ok(PromptScore { positions, next });
+    source
+}
+
+fn position(logprob: f64, rank: u32, top: Option<(u32, f64)>) -> PositionScore {
+    PositionScore {
+        logprob,
+        rank,
+        top: top.map(|(token, logprob)| TopScore { token, logprob }),
+    }
+}
+
+fn two_positions() -> Vec<PositionScore> {
+    vec![position(-1.25, 4, Some((99, -0.5))), position(-0.125, 1, None)]
+}
+
+fn score_request(extra: Value) -> Value {
+    let mut request = json!({
+        "model": "test-model",
+        "prompt": "hello",
+        "prompt_logprobs": 1,
+    });
+    for (key, value) in extra.as_object().unwrap() {
+        request[key] = value.clone();
+    }
+    request
+}
+
+#[tokio::test]
+async fn tokenize_plain_returns_the_host_tokens_count_and_context() {
+    let source = Scripted::new(Script::text("unused"));
+    let observed = source.observed.clone();
+    let reply = post_to(
+        source,
+        "/tokenize",
+        json!({"model": "test-model", "prompt": "hi", "add_special_tokens": false}),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+    assert_eq!(
+        json_body(&reply),
+        json!({"count": 3, "max_model_len": 4096, "tokens": [10, 11, 12]})
+    );
+    assert_eq!(
+        *observed.tokenized.lock().unwrap(),
+        vec![TokenizeInput::Text {
+            text: "hi".into(),
+            add_special_tokens: false
+        }]
+    );
+}
+
+#[tokio::test]
+async fn tokenize_plain_adds_special_tokens_by_default() {
+    let source = Scripted::new(Script::text("unused"));
+    let observed = source.observed.clone();
+    let reply = post_to(source, "/tokenize", json!({"model": "test-model", "prompt": "hi"})).await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+    assert!(matches!(
+        observed.tokenized.lock().unwrap()[0],
+        TokenizeInput::Text { add_special_tokens: true, .. }
+    ));
+}
+
+#[tokio::test]
+async fn tokenize_chat_reaches_the_host_with_its_template_arguments() {
+    let source = Scripted::new(Script::text("unused"));
+    let observed = source.observed.clone();
+    let reply = post_to(
+        source,
+        "/tokenize",
+        json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "ping"}],
+            "add_generation_prompt": true,
+            "add_special_tokens": false,
+            "chat_template_kwargs": {"enable_thinking": false}
+        }),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+    let tokenized = observed.tokenized.lock().unwrap();
+    let TokenizeInput::Chat {
+        input,
+        add_generation_prompt,
+        add_special_tokens,
+    } = &tokenized[0]
+    else {
+        panic!("expected the chat form, got {:?}", tokenized[0]);
+    };
+    assert!(*add_generation_prompt);
+    assert!(!*add_special_tokens);
+    assert_eq!(input.template_arguments["enable_thinking"], json!(false));
+    assert_eq!(input.conversation.entries().len(), 1);
+}
+
+#[tokio::test]
+async fn tokenize_chat_defaults_match_vllm() {
+    let source = Scripted::new(Script::text("unused"));
+    let observed = source.observed.clone();
+    let reply = post_to(
+        source,
+        "/tokenize",
+        json!({"model": "test-model", "messages": [{"role": "user", "content": "ping"}]}),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+    assert!(matches!(
+        observed.tokenized.lock().unwrap()[0],
+        TokenizeInput::Chat {
+            add_generation_prompt: true,
+            add_special_tokens: false,
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn tokenize_refuses_malformed_requests() {
+    let messages = json!([{"role": "user", "content": "hi"}]);
+    let cases = [
+        ("both forms", json!({"model": "test-model", "prompt": "hi", "messages": messages}), "exclusive"),
+        ("neither form", json!({"model": "test-model"}), "required"),
+        ("an unknown field", json!({"model": "test-model", "prompt": "hi", "truncate": 5}), "truncate"),
+        (
+            "chat-only field on plain",
+            json!({"model": "test-model", "prompt": "hi", "chat_template_kwargs": {}}),
+            "chat_template_kwargs",
+        ),
+        (
+            "chat-only field on plain",
+            json!({"model": "test-model", "prompt": "hi", "add_generation_prompt": true}),
+            "add_generation_prompt",
+        ),
+    ];
+    for (what, body, names) in cases {
+        let reply = post_to(Scripted::new(Script::text("unused")), "/tokenize", body).await;
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{what}: {}", reply.body);
+        assert!(reply.body.contains(names), "{what} must name {names}: {}", reply.body);
+    }
+}
+
+#[tokio::test]
+async fn tokenize_answers_an_unknown_model_as_chat_does() {
+    let tokenize = post_to(
+        Scripted::new(Script::text("unused")),
+        "/tokenize",
+        json!({"model": "nope", "prompt": "hi"}),
+    )
+    .await;
+    let chat = post_to(
+        Scripted::new(Script::text("unused")),
+        "/v1/chat/completions",
+        json!({"model": "nope", "messages": [{"role": "user", "content": "hi"}], "stream": false}),
+    )
+    .await;
+    assert_eq!(tokenize.status, StatusCode::NOT_FOUND);
+    assert_eq!(tokenize.status, chat.status);
+    assert_eq!(json_body(&tokenize)["error"]["type"], json_body(&chat)["error"]["type"]);
+    assert_eq!(json_body(&tokenize)["error"]["code"], json_body(&chat)["error"]["code"]);
+    assert_eq!(json_body(&tokenize)["error"]["param"], "model");
+}
+
+#[tokio::test]
+async fn completions_reply_carries_prompt_logprobs_in_vllms_shape() {
+    let source = scored(two_positions(), None);
+    let observed = source.observed.clone();
+    let reply = post_to(source, "/v1/completions", score_request(json!({"max_tokens": 0}))).await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+    let body = json_body(&reply);
+    assert_eq!(
+        body["choices"][0]["prompt_logprobs"],
+        json!([
+            null,
+            {
+                "11": {"logprob": -1.25, "rank": 4, "decoded_token": "<11>"},
+                "99": {"logprob": -0.5, "rank": 1, "decoded_token": "<99>"}
+            },
+            {"12": {"logprob": -0.125, "rank": 1, "decoded_token": "<12>"}}
+        ])
+    );
+    assert_eq!(body["object"], "text_completion");
+    assert_eq!(body["model"], "test-model");
+    assert!(body["id"].as_str().unwrap().starts_with("cmpl-"));
+    assert!(body["created"].is_u64());
+    assert_eq!(body["choices"][0]["index"], 0);
+    assert_eq!(body["choices"][0]["text"], "");
+    assert_eq!(body["choices"][0]["logprobs"], Value::Null);
+    assert_eq!(body["choices"][0]["finish_reason"], "length");
+    assert_eq!(
+        body["usage"],
+        json!({"prompt_tokens": 3, "completion_tokens": 0, "total_tokens": 3})
+    );
+    assert_eq!(
+        *observed.scored.lock().unwrap(),
+        vec![("test-model".to_owned(), vec![10, 11, 12], true, false)]
+    );
+    assert!(matches!(
+        observed.tokenized.lock().unwrap()[0],
+        TokenizeInput::Text { add_special_tokens: true, .. }
+    ));
+}
+
+#[tokio::test]
+async fn completions_asks_for_no_top_token_at_prompt_logprobs_zero() {
+    let source = scored(vec![position(-1.0, 1, None), position(-2.0, 1, None)], None);
+    let observed = source.observed.clone();
+    let reply = post_to(source, "/v1/completions", score_request(json!({"prompt_logprobs": 0}))).await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+    assert_eq!(observed.scored.lock().unwrap()[0].2, false);
+}
+
+#[tokio::test]
+async fn completions_returns_the_greedy_next_token_at_max_tokens_one() {
+    let source = scored(two_positions(), Some(77));
+    let observed = source.observed.clone();
+    let reply = post_to(
+        source,
+        "/v1/completions",
+        score_request(json!({"max_tokens": 1, "temperature": 0, "echo": false})),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+    let body = json_body(&reply);
+    assert_eq!(body["choices"][0]["text"], "<77>");
+    assert_eq!(
+        body["usage"],
+        json!({"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4})
+    );
+    assert!(observed.scored.lock().unwrap()[0].3);
+}
+
+#[tokio::test]
+async fn completions_refuses_what_it_cannot_honor_naming_the_field() {
+    let cases = [
+        ("stream", json!({"stream": true})),
+        ("n", json!({"n": 2})),
+        ("logprobs", json!({"logprobs": 1})),
+        ("max_tokens", json!({"max_tokens": 2})),
+        ("prompt_logprobs", json!({"prompt_logprobs": 2})),
+        ("temperature", json!({"max_tokens": 1, "temperature": 0.7})),
+        ("temperature", json!({"max_tokens": 1})),
+        ("echo", json!({"echo": true})),
+        ("prompt", json!({"prompt": ["a", "b"]})),
+        ("prompt", json!({"prompt": [1, 2, 3]})),
+    ];
+    for (field, extra) in cases {
+        let source = scored(two_positions(), Some(1));
+        let observed = source.observed.clone();
+        let reply = post_to(source, "/v1/completions", score_request(extra.clone())).await;
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{extra}: {}", reply.body);
+        assert!(reply.body.contains(field), "{extra} must name {field}: {}", reply.body);
+        assert!(observed.scored.lock().unwrap().is_empty(), "{extra} must not reach score");
+    }
+    let source = scored(two_positions(), None);
+    let reply = post_to(
+        source,
+        "/v1/completions",
+        json!({"model": "test-model", "prompt": "hello"}),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.body);
+    assert!(reply.body.contains("prompt_logprobs"), "{}", reply.body);
+}
+
+#[tokio::test]
+async fn completions_refuses_a_prompt_over_the_context_before_scoring() {
+    let mut source = scored(two_positions(), None);
+    source.context_limit = 2;
+    let observed = source.observed.clone();
+    let reply = post_to(source, "/v1/completions", score_request(json!({}))).await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.body);
+    assert_eq!(
+        json_body(&reply)["error"],
+        json!({
+            "message": "prompt is too long: 3 tokens exceed the loaded 2-token context",
+            "type": "invalid_request_error",
+            "param": "prompt",
+            "code": "context_length_exceeded"
+        })
+    );
+    assert!(observed.scored.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn completions_answers_an_unknown_model_as_chat_does() {
+    let reply = post_to(
+        scored(two_positions(), None),
+        "/v1/completions",
+        score_request(json!({"model": "nope"})),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::NOT_FOUND, "{}", reply.body);
+    assert_eq!(json_body(&reply)["error"]["param"], "model");
+}
+
+#[tokio::test]
+async fn completions_surfaces_the_sources_scoring_error() {
+    let mut source = scored(Vec::new(), None);
+    source.scoring = Err(ServingError::Model(ModelUnavailable::Unsupported(
+        "this engine cannot score".into(),
+    )));
+    let reply = post_to(source, "/v1/completions", score_request(json!({}))).await;
+    assert_eq!(reply.status, StatusCode::CONFLICT, "{}", reply.body);
+    let body = json_body(&reply);
+    assert!(body["error"]["message"].as_str().unwrap().contains("this engine cannot score"));
+    assert!(body["error"]["param"].is_null(), "a scoring failure names no field: {body}");
+}
+
+#[tokio::test]
+async fn completions_refuses_a_score_that_does_not_match_the_prompt() {
+    let source = scored(vec![position(-1.0, 1, None)], None);
+    let reply = post_to(source, "/v1/completions", score_request(json!({}))).await;
+    assert_eq!(reply.status, StatusCode::INTERNAL_SERVER_ERROR, "{}", reply.body);
 }

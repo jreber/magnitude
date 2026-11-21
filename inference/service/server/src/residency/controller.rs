@@ -240,7 +240,8 @@ impl ModelInstances {
         })
     }
 
-    /// Lease `model_id` for inference, loading it if needed.
+    /// Lease `model_id` for inference, loading it if needed: a generation or a score, which one
+    /// instance of the model serves alike.
     pub async fn acquire_for_inference(
         &self,
         model_id: &str,
@@ -568,7 +569,7 @@ fn memory_size(bytes: u64) -> String {
 
 /// Instance equality: the serving configuration fingerprint (bundle identity and serving
 /// profile). The engine policy is the service's single serving policy.
-fn residency_target(
+pub(super) fn residency_target(
     model_id: ModelId,
     configuration: ModelServingConfiguration,
 ) -> ResolvedResidencyTarget {

@@ -3,7 +3,7 @@
 //! first work. Test-only: what tests of real steps, and an owner over a
 //! real domain, run on.
 // Most of it is the executor's own tests'; the `fixtures` feature serves
-// only [`drafted`], [`plain`] and [`chaining`] above.
+// only [`MTP`], [`drafted`], [`plain`], [`chaining`] and [`exporting`] above.
 #![cfg_attr(not(test), allow(dead_code))]
 
 use crate::planning::fixtures::{qwen4exp_fixture_definition, stored_table_manifest};
@@ -17,13 +17,22 @@ use magnitude_state::KvCodec;
 use std::rc::Rc;
 use std::sync::Arc;
 
-/// A drafting load (an MTP head over the planning fixture's decoder) on
-/// the CPU, its memory read as the fixture's alone
-/// (`Machine::Still`), its drafter unbound until its first work: the
-/// directory its GGUF was written to, for the test to remove once the
-/// domain is dropped, the definition, the domain and its bindings.
+/// The method a [`drafted`] load drafts by: its MTP head, up to two
+/// proposals a round, greedy or sampled.
+pub const MTP: PlannedMethod = PlannedMethod::Mtp { greedy_proposals: 2, sampled_proposals: 2, widths: crate::DraftWidths::Adaptive };
+
+/// A load of the planning fixture's decoder with an MTP head on the CPU,
+/// served by `method` (drafting by its head, [`MTP`], its drafter unbound
+/// until its first work; or plain, the head never bound) and exporting up
+/// to `logits` rows of logits a launch, its memory read as the fixture's
+/// alone (`Machine::Still`): the directory its GGUF was written to, for
+/// the test to remove once the domain is dropped, the definition, the
+/// domain and its bindings. Loads of one model whatever their method: the
+/// GGUF holds the head's weights either way.
 pub fn drafted(
     test: &str,
+    method: PlannedMethod,
+    logits: usize,
 ) -> (
     std::path::PathBuf,
     Rc<ModelDefinition>,
@@ -33,13 +42,12 @@ pub fn drafted(
     let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
     let mtp = crate::planning::fixtures::with_mtp_head(crate::planning::fixtures::fixture_definition());
     let (directory, definition, package) = fixture_with(test, mtp, crate::planning::fixtures::fixture_manifest);
-    let method = PlannedMethod::Mtp { greedy_proposals: 2, sampled_proposals: 2, widths: crate::DraftWidths::Adaptive };
     let (domain, bindings, _, _) = load_read(&LoadRequest {
         catalog: &catalog,
         definition: &definition,
         package: &package,
         backend: seismic::BackendName::Cpu,
-        limits: limits(4, false, 1, 0),
+        limits: limits(4, false, 1, logits),
         banked: Banked::Resident,
         method,
         codec: KvCodec::Dense,
@@ -77,6 +85,22 @@ pub fn chaining(
     Box<ExecutorDomain>,
     crate::StateBindings,
 ) {
+    exporting(test, context, chain_capacity, 0)
+}
+
+/// [`chaining`], exporting up to `logits` rows of logits a launch: what an
+/// owner's tests of scoring beside generation run on.
+pub fn exporting(
+    test: &str,
+    context: u64,
+    chain_capacity: usize,
+    logits: usize,
+) -> (
+    std::path::PathBuf,
+    Rc<ModelDefinition>,
+    Box<ExecutorDomain>,
+    crate::StateBindings,
+) {
     let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
     let mut definition = crate::planning::fixtures::fixture_definition();
     definition.decoder.context_limit = context;
@@ -86,7 +110,7 @@ pub fn chaining(
         definition: &definition,
         package: &package,
         backend: seismic::BackendName::Cpu,
-        limits: limits(4, false, chain_capacity, 0),
+        limits: limits(4, false, chain_capacity, logits),
         banked: Banked::Resident,
         method: PlannedMethod::Plain,
         codec: KvCodec::Dense,

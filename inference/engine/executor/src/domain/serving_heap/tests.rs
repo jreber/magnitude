@@ -214,7 +214,11 @@ fn holding_an_idle_drafter(
     Ledger,
 ) {
     use crate::memory::ledger::CacheKind;
-    let (directory, _, mut domain, mut bindings) = crate::domain::fixtures::loaded::drafted(test);
+    let (directory, _, mut domain, mut bindings) = crate::domain::fixtures::loaded::drafted(
+        test,
+        crate::PlannedMethod::Mtp { greedy_proposals: 2, sampled_proposals: 2, widths: crate::DraftWidths::Adaptive },
+        0,
+    );
     for request in [crate::RequestId(1), crate::RequestId(2)] {
         domain.install_input(request, magnitude_family_contracts::PreparedModelInput::continuation_only()).unwrap();
     }

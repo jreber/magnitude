@@ -459,7 +459,7 @@ impl fmt::Display for RequestError {
             Self::InvalidRequest { reason } => write!(formatter, "invalid request: {reason}"),
             Self::ContextLengthExceeded { required, limit } => write!(
                 formatter,
-                "the input requires {required} tokens but the loaded context is {limit}"
+                "prompt is too long: {required} tokens exceed the loaded {limit}-token context"
             ),
             Self::InsufficientMemory(memory) => memory.fmt(formatter),
             Self::ContextExceedsMemory(memory) => write!(

@@ -174,8 +174,10 @@ pub struct ModelPolicy {
     /// Queue each plain decode step's successor on the device before the
     /// step completes (cross-step pipelining).
     pub lookahead: bool,
-    /// Rows one launch may export full logits for: zero for serving, which
-    /// never reads them; set by diagnostics that do.
+    /// Rows one launch may export full logits for, which only a launch
+    /// with a row demanding them does: a scoring flight's for a load that
+    /// scores prompts ([`crate::composition::scoring_rows`]), what
+    /// diagnostics read, or zero for a load that never reads them.
     pub exported_logits_rows: usize,
     /// The caller's numerical requirement (α and the allowed deviation
     /// classes); the engine's standard profile when absent.
@@ -833,7 +835,7 @@ pub(crate) mod tests {
         }
     }
 
-    fn definition(with_head: bool) -> ModelDefinition {
+    pub(crate) fn definition(with_head: bool) -> ModelDefinition {
         let head = with_head.then(|| Head {
             blocks: vec![HeadBlock {
                 residual: magnitude_family_contracts::ResidualForm::Single,

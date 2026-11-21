@@ -25,7 +25,8 @@ use magnitude_executor::platform::{DeviceRequest, ReleaseRate};
 use magnitude_executor::{ExecutionPath, WeightBound, TuningSettings};
 use magnitude_serving::engine::{EngineHost, EngineInvocation};
 use magnitude_serving::{
-    HostChat, LoadProgress, ModelInvocation, ServedModels, Serving, ServingError,
+    HostChat, LoadProgress, ModelInvocation, ModelUnavailable, PromptScore, ServedModels, Serving,
+    ServingError,
 };
 use magnitude_state::KvCodec;
 use serde_json::json;
@@ -263,6 +264,20 @@ impl ServedModels for Standalone {
         Box::pin(async move {
             let invocation = self.engine.resolve(&model).await?;
             Ok(Arc::new(EngineHost::new(invocation.host)) as Arc<dyn HostChat>)
+        })
+    }
+
+    fn score(
+        &self,
+        _model: &str,
+        _tokens: Vec<u32>,
+        _top: bool,
+        _next: bool,
+    ) -> BoxFuture<'_, Result<PromptScore, ServingError>> {
+        Box::pin(async {
+            Err(ServingError::Model(ModelUnavailable::Unsupported(
+                "the standalone engine does not score; serve scoring through the service".to_owned(),
+            )))
         })
     }
 }
