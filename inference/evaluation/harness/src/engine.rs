@@ -101,7 +101,7 @@ pub fn configuration(
     let release = ReleaseRate::of_machine(options.cache_dir.as_deref().zip(topology.as_deref()));
     let mut resolved = EngineConfiguration {
         package: PackageOptions {
-            target: artifacts.target.clone(),
+            target_shards: vec![artifacts.target.clone()],
             projector: ProjectorSelection::Disabled,
             draft,
         },

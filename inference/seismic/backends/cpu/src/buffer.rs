@@ -29,9 +29,10 @@ use std::collections::HashMap;
 use std::ptr::NonNull;
 use std::sync::{Arc, Mutex, OnceLock};
 
-/// The pages a [`Carver`] block holds at least: what an entry's small
-/// buffers share before it fills another.
-const CARVED_BLOCK_PAGES: u64 = 16;
+/// The bytes a [`Carver`] block holds at least, in whole host pages: what an
+/// entry's small buffers share before it fills another. A size in bytes, not
+/// pages, so a host's page size (4 KiB, 16 KiB) does not change it.
+const CARVED_BLOCK_BYTES: u64 = 64 << 10;
 
 // The largest buffer carved from an entry's held block; a larger one takes
 // pages of its own (the charge rule's, `seismic_compiler::charge`).
@@ -191,7 +192,7 @@ impl Carver {
 
     /// `bytes` (at most [`CARVED_LIMIT`], at least one byte's room) at
     /// `alignment` from `entry`'s filling block, a new one (of the larger of
-    /// the request's whole pages and [`CARVED_BLOCK_PAGES`]) when it has no
+    /// the request's whole pages and [`CARVED_BLOCK_BYTES`]) when it has no
     /// room. Where buffers keep the filling block, it stays the entry's
     /// filling block unless the new one has more room left, so a block a
     /// buffer fills alone never retires the room of one whose buffers keep
@@ -215,7 +216,7 @@ impl Carver {
                 return Ok(PageRange { block: Some(current.block.clone()), offset, bytes });
             }
         }
-        let pages = bytes.max(1).div_ceil(page).max(CARVED_BLOCK_PAGES);
+        let pages = bytes.max(1).max(CARVED_BLOCK_BYTES).div_ceil(page);
         let block = PageBlock::allocate(pages * page, entry)?;
         let room = |held: &Filling| held.block.bytes() - held.used;
         let fresh = Filling { block: block.clone(), used: bytes };
@@ -404,7 +405,7 @@ impl Buffer {
 
 #[cfg(test)]
 mod tests {
-    use super::{Buffer, Entry, ExecutionError, WritableBuffer, CARVED_BLOCK_PAGES, CARVED_LIMIT, LEAST_ALIGNMENT};
+    use super::{Buffer, Entry, ExecutionError, WritableBuffer, CARVED_BLOCK_BYTES, CARVED_LIMIT, LEAST_ALIGNMENT};
     use seismic_memory::entry::{Change, Refused, Tally, Wiring};
     use seismic_topology::StoreIdentity;
     use std::sync::Arc;
@@ -508,7 +509,7 @@ mod tests {
         let pointer = buffer.data_pointer() as usize;
         assert_ne!(pointer, 0);
         assert_eq!(pointer % 64, 0);
-        assert_eq!(tally.held(), CARVED_BLOCK_PAGES * page);
+        assert_eq!(tally.held(), CARVED_BLOCK_BYTES.next_multiple_of(page));
     }
 
     /// Sub-page requests lie one after another, at the least alignment
@@ -520,7 +521,7 @@ mod tests {
         let page = seismic_memory::host_page().unwrap();
         let tally = Tally::unbounded(StoreIdentity::HostRam);
         let entry: Arc<dyn Entry> = Arc::new(tally.clone());
-        let block = CARVED_BLOCK_PAGES * page;
+        let block = CARVED_BLOCK_BYTES.next_multiple_of(page);
         let sizes = [1, 8, 100, page / 2, page - 1];
         let mut buffers = Vec::new();
         for &bytes in &sizes {
@@ -552,9 +553,9 @@ mod tests {
         let page = seismic_memory::host_page().unwrap();
         let tally = Tally::unbounded(StoreIdentity::HostRam);
         let entry: Arc<dyn Entry> = Arc::new(tally.clone());
-        let block = CARVED_BLOCK_PAGES * page;
+        let block = CARVED_BLOCK_BYTES.next_multiple_of(page);
         let first = WritableBuffer::new(page - 1, 1, &entry).expect("buffer");
-        let filler = (1..CARVED_BLOCK_PAGES)
+        let filler = (1..block / page)
             .map(|_| WritableBuffer::new(page - 1, 1, &entry).expect("buffer"))
             .collect::<Vec<_>>();
         assert_eq!(tally.held(), block);

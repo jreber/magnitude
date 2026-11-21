@@ -656,7 +656,7 @@ mod tests {
             std::path::PathBuf::from(std::env::var_os(name).unwrap_or_else(|| panic!("set {name}")))
         };
         let host = HostArtifacts::open(&PackageOptions {
-            target: variable("MAGNITUDE_TEST_GGUF"),
+            target_shards: vec![variable("MAGNITUDE_TEST_GGUF")],
             projector: ProjectorSelection::Disabled,
             draft: None,
         })

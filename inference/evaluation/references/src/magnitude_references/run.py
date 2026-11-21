@@ -21,7 +21,6 @@ import sys
 import torch
 
 from magnitude_references import digest, record
-from magnitude_rig import store
 from magnitude_references.contract import (LOGITS, LogitsWriter, RenderedFixture, check_match, read_artifacts,
                                            read_rendered)
 from magnitude_references.checks import device_of
@@ -122,5 +121,7 @@ def build_reference(rendered_path: Path, artifacts_path: Path, output: Path, opt
 
 
 def default_output(rendered_digest: str) -> Path:
-    """A new run directory in the repository's results store (`magnitude_rig.store`)."""
+    """A new run directory in the repository's results store (`magnitude_rig.store`), imported here: a rig host
+    puts only the rig's host package on the path (`--output` given), which holds no store."""
+    from magnitude_rig import store
     return store.results() / f"{record.utc_stamp()}-reference-{rendered_digest[:8]}"

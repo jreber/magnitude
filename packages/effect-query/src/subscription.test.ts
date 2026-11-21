@@ -12,6 +12,8 @@ import * as Stream from "effect/Stream"
 import { describe, expect, it } from "vitest"
 import { Client, Key, Query, QueryClient, Subscription } from "./index.js"
 
+class TestError extends Data.TaggedError("TestError")<{ readonly message: string }> {}
+
 const sleep = (millis: number) => Effect.runPromise(Effect.sleep(`${millis} millis`))
 
 /** The QueryClient owned by this Client's runtime in this registry. */
@@ -84,7 +86,7 @@ describe("Subscription", () => {
       stream: () => Stream.suspend(() => {
         attempts += 1
         return attempts < 3
-          ? Stream.fail(new Error(`attempt ${attempts}`))
+          ? Stream.fail(new TestError({ message: `attempt ${attempts}` }))
           : Stream.make("ok").pipe(Stream.concat(Stream.never))
       }),
       reconnect: Schedule.spaced("1 millis")
@@ -106,7 +108,7 @@ describe("Subscription", () => {
     const client = Client.make(Layer.empty)
     const broken = Subscription.make("Broken", {
       key: (_: void) => "broken",
-      stream: () => Stream.fail(new Error("down")),
+      stream: () => Stream.fail(new TestError({ message: "down" })),
       reconnect: Schedule.recurs(1)
     })
     const atom = client.subscription(broken, undefined)
@@ -204,7 +206,7 @@ describe("Query.fromStream", () => {
     const totals = Query.fromStream("FailingTotals", {
       key: (_: void) => "failing",
       stream: () => Stream.fromQueue(queue).pipe(
-        Stream.mapEffect((value) => value < 0 ? Effect.fail(new Error("negative")) : Effect.succeed(value))
+        Stream.mapEffect((value) => value < 0 ? Effect.fail(new TestError({ message: "negative" })) : Effect.succeed(value))
       ),
       reduce: (previous: Option.Option<number>, event: number) => Option.getOrElse(previous, () => 0) + event
     })

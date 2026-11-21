@@ -19,7 +19,9 @@
 //! its file imports it from (or re-exports it through). A field whose
 //! `serialize_with` and `deserialize_with` name both sides' functions is
 //! those functions': each body is judged as a hand-written impl is (that
-//! each writes what the other reads is the crate's own tests' to show).
+//! each writes what the other reads is the crate's own tests' to show). A
+//! `with` naming a module rather than a remote derive is that module's
+//! functions', judged the same way.
 //! Impls a `macro_rules!` body writes for one of its arguments are
 //! the hand-written impls of the type each invocation names. A type
 //! argument the named type holds only in `PhantomData` is never on the wire
@@ -162,6 +164,9 @@ struct Index {
     /// Every free function: its tokens, for a `serialize_with` or
     /// `deserialize_with` naming it.
     functions: Named<String>,
+    /// Every inline module: its tokens, for a `with` naming a module of
+    /// `serialize` and `deserialize` functions rather than a remote derive.
+    modules: Named<String>,
     /// Every struct, enum and alias, serde-derived or not: whether each of its
     /// generic parameters (types and consts, in order) is a type it holds
     /// outside `PhantomData`.
@@ -225,6 +230,7 @@ impl Index {
                 }
                 syn::Item::Mod(module) if !tested(&module.attrs) => {
                     if let Some((_, items)) = &module.content {
+                        self.modules.entry(module.ident.to_string()).or_default().push((scope.clone(), tokens(module)));
                         self.items(scope, items);
                     }
                 }
@@ -721,9 +727,17 @@ fn wire_types_carry_no_serde_form_postcard_cannot_read() {
         if STD.contains(&name.as_str()) {
             continue;
         }
-        let (definitions, impls) = index.lookup(&name, crates);
+        let (definitions, impls) = index.lookup(&name, crates.clone());
         if definitions.is_empty() && impls.is_empty() {
-            unfound.push(format!("{} in {from}", mention.path.join("::")));
+            // A `with` may name a module of `serialize` and `deserialize`
+            // functions: those are judged as a hand-written impl is.
+            let modules = index.nearest(&index.modules, &name, crates);
+            if modules.is_empty() {
+                unfound.push(format!("{} in {from}", mention.path.join("::")));
+            }
+            for (of, tokens) in modules {
+                judge(of, tokens, format!("{name}'s functions"), &mut offenders);
+            }
             continue;
         }
         for (of, tokens) in &impls {

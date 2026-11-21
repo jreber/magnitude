@@ -388,7 +388,7 @@ fn configured(
 ) -> Result<ResolvedEngineConfiguration, String> {
     EngineConfiguration {
         package: PackageOptions {
-            target: target.to_path_buf(),
+            target_shards: vec![target.to_path_buf()],
             projector: ProjectorSelection::Disabled,
             draft: None,
         },

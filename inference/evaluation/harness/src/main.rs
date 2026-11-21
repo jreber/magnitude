@@ -310,7 +310,7 @@ struct RunArgs {
 /// The model's host artifacts, opened for rendering as the target serves.
 fn host(artifacts: &ArtifactsFile) -> Result<HostArtifacts, String> {
     HostArtifacts::open(&PackageOptions {
-        target: artifacts.artifacts.target.clone(),
+        target_shards: vec![artifacts.artifacts.target.clone()],
         projector: ProjectorSelection::Disabled,
         draft: None,
     })
