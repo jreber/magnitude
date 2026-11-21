@@ -4812,13 +4812,18 @@ mod claim_tests {
         fresh_by(vocabulary, MethodChoice::Plain)
     }
 
-    /// [`fresh`], generating by `method`: plain, or MTP by its own method.
-    fn fresh_by(vocabulary: usize, method: MethodChoice) -> Generation {
-        let factory: Arc<dyn magnitude_generation::Method> = match method {
+    /// What generates by `method`: plain, or MTP by its own method.
+    pub(super) fn method_of(method: MethodChoice) -> Arc<dyn magnitude_generation::Method> {
+        match method {
             MethodChoice::Plain => Arc::new(magnitude_generation::Plain),
             MethodChoice::Mtp { proposals } => Arc::new(magnitude_generation::Mtp::new("fixture", proposals.into()).unwrap()),
             other => unreachable!("the owner's tests generate by no {other:?}"),
-        };
+        }
+    }
+
+    /// [`fresh`], generating by `method` ([`method_of`]).
+    fn fresh_by(vocabulary: usize, method: MethodChoice) -> Generation {
+        let factory = method_of(method);
         Generation::new_with_method(
             vec![TokenId(1), TokenId(2), TokenId(3), TokenId(4)],
             InputLayout::new(4, vec![]).unwrap(),
@@ -4994,7 +4999,7 @@ let Ok(residency) = service.make_resident(id, &mut record, generation, bindings)
     #[test]
     fn a_drafter_reload_refused_for_memory_fails_its_request_alone() {
         use std::task::{Context, Poll, Waker};
-        let (directory, definition, domain, bindings) = fixtures::loaded::drafted("refused-drafter-reload");
+        let (directory, definition, domain, bindings) = fixtures::loaded::drafted("refused-drafter-reload", fixtures::loaded::MTP, 0);
         let vocabulary = definition.decoder.vocabulary as usize;
         let mut owner = Some(Owner::new(domain, bindings, limits(), Arc::new(NoWakes)).unwrap());
         // The service clock, a millisecond a run.
@@ -5166,11 +5171,11 @@ let Ok(residency) = service.make_resident(id, &mut record, generation, bindings)
 
 #[cfg(test)]
 mod scoring_tests {
-    use super::claim_tests::{NoWakes, leave_room, limits, take_room};
+    use super::claim_tests::{NoWakes, leave_room, limits, method_of, take_room};
     use super::*;
     use crate::publication::Publication;
     use crate::scoring::{SCORING_SEQUENCES, SCORING_WIDTH};
-    use magnitude_executor::fixtures;
+    use magnitude_executor::{PlannedMethod, fixtures};
     use magnitude_generation::{EndOfGeneration, MethodChoice, Options, Sampling, Shaping, TokenId};
     use std::sync::{Mutex, mpsc};
     use std::task::{Context, Poll, Waker};
@@ -5190,6 +5195,8 @@ mod scoring_tests {
         now: u64,
         directory: PathBuf,
         vocabulary: usize,
+        /// The method its generations take: the load's.
+        method: MethodChoice,
     }
 
     impl Served {
@@ -5202,9 +5209,32 @@ mod scoring_tests {
         /// [`Self::new`], its prompt groups chaining up to `chain_capacity`
         /// chunks.
         fn chaining(test: &str, chain_capacity: usize, exported: usize) -> Self {
-            let (directory, definition, domain, bindings) = fixtures::loaded::exporting(test, CONTEXT, chain_capacity, exported);
+            Self::over(fixtures::loaded::exporting(test, CONTEXT, chain_capacity, exported), MethodChoice::Plain)
+        }
+
+        /// An owner over the planning fixture's decoder with an MTP head,
+        /// served by `method` ([`fixtures::loaded::drafted`]) and exporting
+        /// up to `exported` rows of logits a launch; its generations draft
+        /// as the load does.
+        fn drafted(test: &str, method: PlannedMethod, exported: usize) -> Self {
+            let generates = match method {
+                PlannedMethod::Plain => MethodChoice::Plain,
+                PlannedMethod::Mtp { greedy_proposals, sampled_proposals, .. } => {
+                    assert_eq!(greedy_proposals, sampled_proposals, "the fixture's generations draft one width");
+                    MethodChoice::Mtp { proposals: greedy_proposals }
+                }
+                PlannedMethod::DFlash { .. } => unreachable!("the drafted fixture drafts by its head"),
+            };
+            Self::over(fixtures::loaded::drafted(test, method, exported), generates)
+        }
+
+        /// An owner over a loaded fixture, its generations taking `method`.
+        fn over(
+            (directory, definition, domain, bindings): (PathBuf, Rc<magnitude_family_contracts::ModelDefinition>, Box<ExecutorDomain>, StateBindings),
+            method: MethodChoice,
+        ) -> Self {
             let owner = Owner::new(domain, bindings, limits(), Arc::new(NoWakes)).unwrap();
-            Self { owner: Some(owner), now: 0, directory, vocabulary: definition.decoder.vocabulary as usize }
+            Self { owner: Some(owner), now: 0, directory, vocabulary: definition.decoder.vocabulary as usize, method }
         }
 
         fn owner(&mut self) -> &mut Owner {
@@ -5260,7 +5290,7 @@ mod scoring_tests {
 
         /// Admit a generation of `GENERATED` tokens after a prompt of
         /// `prompt` tokens, greedy, or sampled at temperature 1 within the
-        /// top 0.9.
+        /// top 0.9, by the load's method.
         fn admit(&mut self, prompt: usize, sampled: bool) -> Stream {
             let (sampling, shaping) = match sampled {
                 false => (Sampling::Greedy, Shaping { temperature: 0.0, ..Default::default() }),
@@ -5278,17 +5308,18 @@ mod scoring_tests {
                 shaping,
                 seed: 7,
                 forced_quantum: 0,
-                method: MethodChoice::Plain,
+                method: self.method,
                 end_of_generation: EndOfGeneration::Stop,
                 reasoning_budget: None,
             };
-            let generation = Generation::new(prompt.clone(), InputLayout::new(prompt.len(), vec![]).unwrap(), options, None).unwrap();
+            let layout = InputLayout::new(prompt.len(), vec![]).unwrap();
+            let generation = Generation::new_with_method(prompt.clone(), layout, options, None, method_of(self.method)).unwrap();
             let now = self.now;
             let (_, receiver) = self
                 .owner()
                 .admit(generation, PreparedModelInput::continuation_only(), PrefixRetention::Transient, GENERATED, now)
                 .unwrap();
-            Stream { prompt, receiver, tokens: Vec::new(), end: None }
+            Stream { prompt, receiver, tokens: Vec::new(), end: None, drafted: 0 }
         }
     }
 
@@ -5326,12 +5357,14 @@ mod scoring_tests {
         }
     }
 
-    /// A generation's prompt, the tokens its stream published, and its end.
+    /// A generation's prompt, the tokens its stream published, its end and
+    /// the tokens it drafted, once completed.
     struct Stream {
         prompt: Vec<TokenId>,
         receiver: PublicationReceiver,
         tokens: Vec<TokenId>,
         end: Option<Result<FinishReason, RequestError>>,
+        drafted: usize,
     }
 
     impl Stream {
@@ -5340,7 +5373,10 @@ mod scoring_tests {
             while self.end.is_none() {
                 match self.receiver.poll_next(&mut Context::from_waker(Waker::noop())) {
                     Poll::Ready(Some(Publication::Output(output))) => self.tokens.extend(output.iter().map(|output| output.token)),
-                    Poll::Ready(Some(Publication::Completed { finish, .. })) => self.end = Some(Ok(finish)),
+                    Poll::Ready(Some(Publication::Completed { finish, usage, .. })) => {
+                        self.end = Some(Ok(finish));
+                        self.drafted = usage.draft_n;
+                    }
                     Poll::Ready(Some(Publication::Failed(error))) => self.end = Some(Err(error)),
                     Poll::Ready(None) => panic!("a stream ends with a terminal publication"),
                     Poll::Pending => break,
@@ -5425,6 +5461,55 @@ mod scoring_tests {
         }
     }
 
+    /// A drafting load (an MTP head over the decoder, as the service's
+    /// `Auto` serves a model with one) scores as a plain load of the same
+    /// model does: alone, and beside MTP generation, greedy and sampled,
+    /// whose tokens are those it generates alone. Each walk's sequence
+    /// closes with its head's state.
+    #[test]
+    fn scores_on_a_drafting_load_are_a_plain_loads() {
+        let mut plain = Served::drafted("scores-on-the-model-plain", PlannedMethod::Plain, EXPORTED);
+        let mut drafting = Served::drafted("scores-on-a-drafting-load", fixtures::loaded::MTP, EXPORTED);
+        let width = drafting.walks().shape.width;
+        // Two walks, one over several flights: flights of both, then of one.
+        let tokens = [drafting.tokens(2 * width + 3, 6), drafting.tokens(5, 7)];
+        let scored = |served: &mut Served| tokens.clone().map(|tokens| served.score(&tokens, true, true)).map(|answer| served.answered(answer));
+        let occupied = |served: &mut Served| {
+            let bytes = served.owner().state_bytes();
+            (bytes.target.occupied, bytes.head.map(|head| head.occupied))
+        };
+        let reference = scored(&mut plain);
+        let idle = occupied(&mut drafting);
+        assert!(idle.1.is_some(), "the drafting load keeps its head's history");
+        assert_eq!(scored(&mut drafting), reference, "scores alone on the drafting load");
+        assert_eq!(occupied(&mut drafting), idle, "the walks' sequences closed with their heads' state");
+        for sampled in [false, true] {
+            let mut alone = drafting.admit(5, sampled);
+            drafting.until(|_| alone.poll());
+            assert_eq!(alone.end, Some(Ok(FinishReason::Length)));
+            assert_eq!(alone.tokens.len(), GENERATED);
+            let mut beside = drafting.admit(5, sampled);
+            drafting.until(|_| {
+                beside.poll();
+                !beside.tokens.is_empty()
+            });
+            assert!(beside.end.is_none(), "the request drafts as the scores arrive");
+            let mut answers = tokens.clone().map(|tokens| drafting.score(&tokens, true, true));
+            let mut scored_beside = false;
+            drafting.until(|served| {
+                let ended = beside.poll();
+                scored_beside |= !ended && matches!(served.owner().pipeline, Pipeline::Scoring(_));
+                ended & answers.iter_mut().all(Answer::poll)
+            });
+            assert!(scored_beside, "sampled {sampled}: a scoring flight runs while the request drafts");
+            assert_eq!(beside.end, Some(Ok(FinishReason::Length)));
+            assert!(alone.drafted > 0 && beside.drafted > 0, "sampled {sampled}: each generation drafts by the head");
+            assert_eq!(beside.tokens, alone.tokens, "sampled {sampled}: drafting beside scores is unchanged");
+            assert_eq!(answers.map(Answer::outcome), reference, "sampled {sampled}: scores beside drafting");
+        }
+        assert_eq!(occupied(&mut drafting), idle, "every sequence closed with its head's state");
+    }
+
     /// More scores than a flight walks wait in arrival order and complete,
     /// each answered once; scores of equal length are answered as they
     /// arrived, and no more walks than a flight's are ever open.
@@ -5501,6 +5586,72 @@ mod scoring_tests {
         }
         served.until(|served| !served.run().in_flight);
         served.run();
+        let closed = served.owner().inspect_domain(|domain| Ok(!domain.holds_state_beside(&BTreeSet::new()))).unwrap();
+        assert!(closed, "every walk's sequence closed");
+        assert!(served.walks().unclosed.is_empty());
+    }
+
+    /// A memory-pressure unload (the host's, as the memory step makes it on
+    /// a shortage that persists) while a scoring flight is out answers every
+    /// open and waiting score once, with the unload's error. Drained as the
+    /// worker drains an unloading owner, until no flight is out, the owner
+    /// reconciles the flight and closes every walk's sequence.
+    #[test]
+    fn a_memory_pressure_unload_answers_every_score_once() {
+        let mut served = Served::new("unload-answers-scores", EXPORTED);
+        let shape = served.walks().shape;
+        let answers = (0..shape.sequences + 2)
+            .map(|index| {
+                let tokens = served.tokens(3 * shape.width + 1, index);
+                served.score(&tokens, false, false)
+            })
+            .collect::<Vec<_>>();
+        assert!(served.run().in_flight && matches!(served.owner().pipeline, Pipeline::Scoring(_)), "a scoring flight is out");
+        assert_eq!((served.walks().active.len(), served.walks().waiting.len()), (shape.sequences, 2));
+        MemoryHost::unload(&mut served.owner().service);
+        let unloaded = RequestError::ModelUnloaded { cause: ModelUnloadCause::MemoryPressure };
+        for answer in answers {
+            assert_eq!(answer.result(), Err(unloaded.clone()));
+        }
+        let mut ran = served.run();
+        assert!(ran.unload, "the run reports the unload");
+        while ran.in_flight {
+            ran = served.run();
+        }
+        let closed = served.owner().inspect_domain(|domain| Ok(!domain.holds_state_beside(&BTreeSet::new()))).unwrap();
+        assert!(closed, "every walk's sequence closed");
+        assert!(served.walks().active.is_empty() && served.walks().waiting.is_empty() && served.walks().unclosed.is_empty());
+    }
+
+    /// Termination between scoring flights, a chat's round in flight beside
+    /// open walks, answers every open and waiting score once with its error,
+    /// and fails the chat with it. No flight holds the walks' sequences:
+    /// they close at the owner's next idle boundary.
+    #[test]
+    fn terminate_all_between_scoring_flights_answers_each_score_once() {
+        let mut served = Served::new("terminate-between-scoring-flights", EXPORTED);
+        let shape = served.walks().shape;
+        let mut chat = served.admit(5, false);
+        served.until(|_| {
+            chat.poll();
+            !chat.tokens.is_empty()
+        });
+        let answers = (0..shape.sequences + 1)
+            .map(|index| {
+                let tokens = served.tokens(3 * shape.width + 1, index);
+                served.score(&tokens, false, false)
+            })
+            .collect::<Vec<_>>();
+        served.until(|served| matches!(served.owner().pipeline, Pipeline::Round(..)) && !served.walks().active.is_empty());
+        assert!(chat.end.is_none() && !served.walks().waiting.is_empty(), "walks open and wait beside the chat's round");
+        served.owner().terminate_all(RequestError::WorkerClosed);
+        for answer in answers {
+            assert_eq!(answer.result(), Err(RequestError::WorkerClosed));
+        }
+        assert!(!served.walks().unclosed.is_empty(), "the open walks' sequences close at the next idle boundary");
+        served.until(|served| !served.run().in_flight);
+        assert!(chat.poll());
+        assert_eq!(chat.end, Some(Err(RequestError::WorkerClosed)));
         let closed = served.owner().inspect_domain(|domain| Ok(!domain.holds_state_beside(&BTreeSet::new()))).unwrap();
         assert!(closed, "every walk's sequence closed");
         assert!(served.walks().unclosed.is_empty());
