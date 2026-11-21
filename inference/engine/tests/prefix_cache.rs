@@ -18,7 +18,7 @@ use magnitude_engine::{
     build_native_domain,
     composition::{EngineConfiguration, ResolvedEngineConfiguration},
     host::HostArtifacts,
-    options::{ModelMethod, ModelPolicy, PackageOptions, ProjectorSelection, Serve},
+    options::{ModelMethod, ModelPolicy, PackageOptions, ProjectorSelection},
 };
 use magnitude_executor::{
     platform::{DeviceRequest, ReleaseRate},
@@ -84,7 +84,6 @@ fn resolved_ctx(projector: bool, context_tokens: usize) -> ResolvedEngineConfigu
         kernel_cache: Some(model_load::kernel_cache()),
         release: ReleaseRate::of_machine(None),
         model_sha256: None,
-        serve: Serve::Generation,
     })
 }
 

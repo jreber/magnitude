@@ -137,7 +137,6 @@ impl RoomGrant {
         (RoomGranter(Some(state.clone())), Self(state))
     }
 
-    /// The grant of a claim no owner holds: released at once.
     /// A grant answered at once with `decided`, the owner's answer where
     /// nothing is left to wait for.
     pub fn decided(decided: Result<(), RoomRefusal>) -> Self {
@@ -146,6 +145,7 @@ impl RoomGrant {
         grant
     }
 
+    /// The grant of a claim no owner holds: released at once.
     pub fn released() -> Self {
         Self::new().1
     }

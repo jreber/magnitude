@@ -14,7 +14,6 @@ use magnitude_engine::{
     composition::{start_in_process, EngineConfiguration, ReadyEngine},
     options::{
         standard_service_limits, ModelPolicy, PackageOptions, ProjectorSelection, ResolvedMethod,
-        Serve,
     },
     worker::{
         connect_worker,
@@ -93,7 +92,6 @@ fn configuration(arguments: &Arguments) -> EngineConfiguration {
         kernel_cache: arguments.cache_dir.clone(),
         release: ReleaseRate::of_machine(None),
         model_sha256: None,
-        serve: Serve::Generation,
     }
 }
 

@@ -19,7 +19,6 @@ use magnitude_engine::{
     composition::{start_in_process, EngineConfiguration, ReadyEngine},
     options::{
         standard_service_limits, ModelPolicy, PackageOptions, ProjectorSelection, ResolvedMethod,
-        Serve,
     },
     worker::{serve_worker, transport::stdio_worker_transport, RequestEvent, RequestOptions},
 };
@@ -184,7 +183,6 @@ fn run(arguments: &Arguments) -> Result<(), String> {
         kernel_cache: arguments.cache_dir.clone(),
         release: ReleaseRate::of_machine(None),
         model_sha256: None,
-        serve: Serve::Generation,
     }
     .resolve()
     .map_err(|error| error.to_string())?;

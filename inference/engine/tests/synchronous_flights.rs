@@ -9,7 +9,7 @@
 use magnitude_engine::{
     build_native_domain,
     composition::EngineConfiguration,
-    options::{ModelMethod, ModelPolicy, PackageOptions, ProjectorSelection, Serve},
+    options::{ModelMethod, ModelPolicy, PackageOptions, ProjectorSelection},
 };
 use magnitude_executor::{
     platform::{DeviceRequest, ReleaseRate},
@@ -59,7 +59,6 @@ fn each_run_reconciles_at_most_one_cpu_flight() {
         kernel_cache: std::env::var_os("MAGNITUDE_TEST_KERNEL_CACHE").map(PathBuf::from),
         release: ReleaseRate::of_machine(None),
         model_sha256: None,
-        serve: Serve::Generation,
     }
     .resolve()
     .unwrap();

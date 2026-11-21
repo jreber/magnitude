@@ -133,7 +133,7 @@ struct Scripted {
     observed: Arc<Observed>,
     /// What the host tokenizer returns for any input.
     tokens: Vec<u32>,
-    /// The prompt length the scoring load takes.
+    /// The prompt length the model's load takes.
     context_limit: u64,
     scoring: Result<PromptScore, ServingError>,
 }

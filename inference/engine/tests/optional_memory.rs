@@ -8,7 +8,7 @@ use magnitude_chat::{ByteBpeTokenizer, SpecialTokens};
 use magnitude_engine::{
     build_native_domain,
     composition::EngineConfiguration,
-    options::{ModelMethod, ModelPolicy, PackageOptions, ProjectorSelection, Serve},
+    options::{ModelMethod, ModelPolicy, PackageOptions, ProjectorSelection},
 };
 use magnitude_executor::{
     platform::{DeviceRequest, ReleaseRate},
@@ -60,7 +60,6 @@ fn plain_owner(
         kernel_cache: std::env::var_os("MAGNITUDE_TEST_KERNEL_CACHE").map(PathBuf::from),
         release: ReleaseRate::of_machine(None),
         model_sha256: None,
-        serve: Serve::Generation,
     }
     .resolve()
     .unwrap();
@@ -315,7 +314,6 @@ fn mtp_head_charge_releases_and_reloads_after_idle() {
         kernel_cache: std::env::var_os("MAGNITUDE_TEST_KERNEL_CACHE").map(PathBuf::from),
         release: ReleaseRate::of_machine(None),
         model_sha256: None,
-        serve: Serve::Generation,
     }
     .resolve()
     .unwrap();
@@ -434,7 +432,6 @@ fn concurrent_mtp_first_head_bind_reconciles_memory() {
         kernel_cache: std::env::var_os("MAGNITUDE_TEST_KERNEL_CACHE").map(PathBuf::from),
         release: ReleaseRate::of_machine(None),
         model_sha256: None,
-        serve: Serve::Generation,
     }
     .resolve()
     .unwrap();
@@ -520,7 +517,6 @@ fn admission_reclaims_under_a_real_process_limit() {
         kernel_cache: std::env::var_os("MAGNITUDE_TEST_KERNEL_CACHE").map(PathBuf::from),
         release: ReleaseRate::of_machine(None),
         model_sha256: None,
-        serve: Serve::Generation,
     }
     .resolve()
     .unwrap();

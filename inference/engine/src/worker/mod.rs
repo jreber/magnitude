@@ -18,7 +18,6 @@ mod execution;
 pub mod measure;
 mod preparation;
 pub mod protocol;
-mod scoring;
 mod session;
 pub mod transport;
 
@@ -37,7 +36,7 @@ use crate::census::AllocationCensus;
 use crate::execution::LoadAttempt;
 use magnitude_executor::UnpreparedUnits;
 use crate::error::{ArtifactError, LoadError, UnloadCause};
-use crate::options::{ExecutionManifest, InputModalities, ReadyInfo, ResolvedModelPolicy, ResourcePlanSummary, Serve};
+use crate::options::{ExecutionManifest, InputModalities, ReadyInfo, ResolvedModelPolicy, ResourcePlanSummary};
 use execution::ExecutionOwner;
 use magnitude_artifacts::Package;
 use magnitude_chat::{
@@ -48,11 +47,9 @@ use magnitude_grammar::CacheLimits;
 use magnitude_scheduler::{
     cold_tier::EntryKey,
     owner::Owner,
-    serving::ServingCensus,
     worker::{Driven, SpawnError, Wakes, Worker, WorkerWakeHandle},
 };
 use protocol::{EngineBuild, HostMessage, WorkerMessage};
-use scoring::ScoringOwner;
 use session::{Loaded, Outbound, Session, Signal};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
@@ -314,9 +311,8 @@ struct ChatIdentity {
     modalities: InputModalities,
 }
 
-/// Build the execution owner of the manifest's purpose on its own thread
-/// while this thread prepares the worker's tokenizer, constraint vocabulary
-/// and chat identity.
+/// Build the execution owner on its own thread while this thread prepares
+/// the worker's tokenizer, constraint vocabulary and chat identity.
 fn load(
     manifest: ExecutionManifest,
     unprepared: UnpreparedUnits,
@@ -377,6 +373,9 @@ fn load(
             LoadAttempt::Unprepared => return Err(Stopped::Unprepared),
         };
         let model = manifest.model.clone();
+        let method = model
+            .factory(&manifest.package.identity.to_string())
+            .map_err(internal)?;
         if built.domain.execution_path() != manifest.path {
             return Err(
                 internal("executor domain differs from the planned execution path").into(),
@@ -384,60 +383,28 @@ fn load(
         }
         let backend = built.domain.execution_backend();
         let resources = ResourcePlanSummary::from_plan(&built.plan).map_err(internal)?;
-        // The owner of the load's purpose, and the census it reports at
-        // readiness.
-        let (owner, census): (Box<dyn Driven<Stopped = UnloadCause>>, _) = match manifest.serve {
-            Serve::Generation => {
-                let method = model
-                    .factory(&manifest.package.identity.to_string())
-                    .map_err(internal)?;
-                // The identity the host resolved onto the manifest; `None`
-                // keys no disk state, and an identity that no longer parses
-                // disables the tier with a warning rather than failing the
-                // load.
-                let cold_identity = match manifest.state_cache_identity.as_deref() {
-                    None => None,
-                    Some(hex) => EntryKey::from_hex(hex).map(|key| key.bytes()).or_else(|| {
-                        tracing::warn!(
-                            "invalid state-cache identity {hex}; SSD state cache disabled"
-                        );
-                        None
-                    }),
-                };
-                let owner = Owner::with_resource_plan(
-                    built.domain,
-                    built.bindings,
-                    manifest.service.clone(),
-                    &built.plan,
-                    Arc::new(wakes) as Arc<dyn Wakes>,
-                    cold_identity,
-                    manifest.state_cache.clone(),
-                    manifest.state_cache_budget_bytes,
-                )
-                .map_err(internal)?;
-                let census = AllocationCensus {
-                    stores: owner.store_allocations(),
-                    serving: owner.serving_census().map_err(internal)?,
-                };
-                (Box::new(ExecutionOwner::new(owner, method, built.pricing, owner_census)), census)
-            }
-            Serve::Scoring => {
-                // A scoring load retains no prefix: its census is the
-                // domain's own.
-                let census = AllocationCensus {
-                    stores: built.domain.store_allocations(),
-                    serving: ServingCensus::of(&*built.domain).map_err(internal)?,
-                };
-                let owner = ScoringOwner::new(
-                    *built.domain,
-                    built.bindings,
-                    &manifest.definition,
-                    Arc::new(wakes) as Arc<dyn Wakes>,
-                )
-                .map_err(internal)?;
-                (Box::new(owner), census)
-            }
+        // The identity the host resolved onto the manifest; `None` keys no
+        // disk state, and an identity that no longer parses disables the
+        // tier with a warning rather than failing the load.
+        let cold_identity = match manifest.state_cache_identity.as_deref() {
+            None => None,
+            Some(hex) => EntryKey::from_hex(hex).map(|key| key.bytes()).or_else(|| {
+                tracing::warn!("invalid state-cache identity {hex}; SSD state cache disabled");
+                None
+            }),
         };
+        let owner = Owner::with_resource_plan(
+            built.domain,
+            built.bindings,
+            manifest.service.clone(),
+            &built.plan,
+            Arc::new(wakes) as Arc<dyn Wakes>,
+            cold_identity,
+            manifest.state_cache.clone(),
+            manifest.state_cache_budget_bytes,
+        )
+        .map_err(internal)?;
+        let census = AllocationCensus { stores: owner.store_allocations(), serving: owner.serving_census().map_err(internal)? };
         let ready = ExecutionReady {
             model,
             resources,
@@ -445,7 +412,10 @@ fn load(
             backend,
             census,
         };
-        Ok((owner, ready))
+        Ok((
+            Box::new(ExecutionOwner::new(owner, method, built.pricing, owner_census)) as Box<dyn Driven<Stopped = UnloadCause>>,
+            ready,
+        ))
     };
     let host = move || -> Result<(GenerationBinding, ChatIdentity), Stopped> {
         use crate::error::UnsupportedModel;

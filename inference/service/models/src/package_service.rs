@@ -268,19 +268,13 @@ pub fn canonical_package_id(
 
 /// Private implementation fingerprint for an exact derived serving configuration.
 /// This is never a model identity and must not cross the ICN boundary.
-///
-/// `purpose` is the engine's `Serve` as a stable byte (0 generation, 1 scoring): this crate does
-/// not depend on the engine, so the service converts at its one call site. A scoring load is a
-/// different load of the same bundle, so it has its own key.
 pub fn serving_configuration_fingerprint(
     bundle_key: &ServableModelBundleKey,
     profile: &ServingProfile,
-    purpose: u8,
 ) -> String {
     let mut digest = Sha256::new();
     digest.update(bundle_key.0.as_bytes());
     digest.update(profile.context_length.to_le_bytes());
-    digest.update([purpose]);
     format!("{:x}", digest.finalize())
 }
 
@@ -1584,19 +1578,9 @@ mod tests {
     };
 
     use super::{
-        ServableModelBundleKey, ServingProfile, package_relationship, package_validation_for,
-        serving_configuration_fingerprint, shard_count, speculative_servable_model_bundle_key,
+        package_relationship, package_validation_for, shard_count,
+        speculative_servable_model_bundle_key,
     };
-
-    #[test]
-    fn the_two_purposes_of_one_configuration_have_different_keys() {
-        let key = ServableModelBundleKey("bundle_fixed".to_owned());
-        let profile = ServingProfile { context_length: 4096 };
-        assert_ne!(
-            serving_configuration_fingerprint(&key, &profile, 0),
-            serving_configuration_fingerprint(&key, &profile, 1)
-        );
-    }
 
     fn inspected_resolved_model(components: Vec<ModelComponent>) -> ResolvedModel {
         let resolved = components

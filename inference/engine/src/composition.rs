@@ -6,8 +6,7 @@
 use crate::error::{ArtifactError, LoadError, ResolveError, UnsupportedModel};
 use crate::host::HostArtifacts;
 use crate::options::{
-    cache_identity, ExecutionManifest, InputModalities, ModelMethod, ModelPolicy, PackageOptions,
-    ProjectorSelection, ReadyInfo, Serve, SCORING_SEQUENCES, SCORING_WIDTH,
+    cache_identity, ExecutionManifest, InputModalities, ModelPolicy, PackageOptions, ReadyInfo,
 };
 use crate::execution::LoadAttempt;
 use crate::preview::{now, priced};
@@ -23,7 +22,7 @@ use magnitude_executor::{
     platform::{DeviceRequest, ReleaseRate},
     ExecutionPath,
 };
-use magnitude_scheduler::ServiceLimits;
+use magnitude_scheduler::{scoring::SCORING_ROWS, ServiceLimits};
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -55,9 +54,6 @@ pub struct EngineConfiguration {
     /// content-derived identity, which changes exactly when its content does.
     /// `None` names no model, so no disk-cached state is keyed to one.
     pub model_sha256: Option<String>,
-    /// What the load serves, carried into its manifest
-    /// ([`scoring_configuration`] makes a scoring load).
-    pub serve: Serve,
 }
 
 /// The two authorities produced by host resolution: host artifacts (chat
@@ -104,7 +100,6 @@ impl EngineConfiguration {
             self.service,
             self.path,
             self.device,
-            self.serve,
             self.kernel_cache,
             Some(host.package().store().to_path_buf()),
             self.release,
@@ -152,45 +147,13 @@ impl EngineConfiguration {
     }
 }
 
-/// The fewest rows a logits-exporting load exports: a prefill chunk's, as
-/// `magnitude-harness logits` sets it.
-const EXPORTED_LOGITS_ROWS: usize = 512;
-
-/// The engine configuration of a scoring load of `base`: target only, plain method, no lookahead, the
-/// base's KV codec and context, logits exported for max(S·W, 512) rows, S conversations.
-///
-/// The KV codec and the numerical profile stay the base's, so scores see the
-/// arithmetic the base's samples were drawn with. A step of S walks W rows
-/// wide is one decode allowance: it selects a token at each of its rows. The
-/// exported rows must fit a launch: planning refuses a load whose launch
-/// rows, the larger of its allowances, are fewer (`LogitsRows`). The S
-/// conversations are the scoring owner's bound: a load's state grows per
-/// request, and its launch slots are its launch rows.
-pub fn scoring_configuration(base: EngineConfiguration) -> EngineConfiguration {
-    let step = SCORING_SEQUENCES * SCORING_WIDTH;
-    EngineConfiguration {
-        package: PackageOptions {
-            target_shards: base.package.target_shards,
-            projector: ProjectorSelection::Disabled,
-            draft: None,
-        },
-        // The KV codec, the numerical profile and the weight bound stay the
-        // base's.
-        model: ModelPolicy {
-            draft_policy: None,
-            method: ModelMethod::Plain,
-            mtp_proposals: None,
-            lookahead: false,
-            exported_logits_rows: step.max(EXPORTED_LOGITS_ROWS),
-            ..base.model
-        },
-        service: ServiceLimits {
-            decode_tokens: step,
-            ..base.service
-        },
-        serve: Serve::Scoring,
-        ..base
-    }
+/// The rows of logits a load of `service` exports so that it scores prompts
+/// as well as generating: a scoring flight's ([`SCORING_ROWS`]), within the
+/// rows one of its launches carries, as planning refuses a wider export
+/// (`LogitsRows`). A load whose launches carry fewer walks narrower flights
+/// (`magnitude_scheduler::scoring`).
+pub fn scoring_rows(service: &ServiceLimits) -> usize {
+    SCORING_ROWS.min(service.launch_rows())
 }
 
 /// A loaded engine: the host's chat semantics plus a client of its worker.
@@ -469,23 +432,25 @@ pub fn start_in_process(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::options::{standard_service_limits, DraftPolicy, ResolvedMethod};
-    use crate::planning::{resource_limits, ExecutionPlanningError};
+    use crate::options::{standard_service_limits, ModelMethod, ProjectorSelection, ResolvedMethod};
+    use crate::planning::resource_limits;
+    use magnitude_executor::{
+        fixtures, Demand, Operation, RequestId, ResourceLimits, Sampling, SelectSpec, Shaping,
+        TokenId, WorkKind,
+    };
+    use magnitude_family_contracts::PreparedModelInput;
     use magnitude_state::KvCodec;
 
-    /// A generation load's configuration with every option a scoring load
-    /// must override set the other way.
+    /// A plain generation load's configuration that exports no logits.
     fn generation_configuration() -> EngineConfiguration {
         EngineConfiguration {
             package: PackageOptions {
                 target_shards: vec![PathBuf::from("/models/target.gguf")],
                 projector: ProjectorSelection::Explicit(PathBuf::from("/models/projector.gguf")),
-                draft: Some(PathBuf::from("/models/draft.gguf")),
+                draft: None,
             },
             model: ModelPolicy {
-                draft_policy: Some(DraftPolicy::Adaptive),
-                method: ModelMethod::DFlash,
-                mtp_proposals: Some(4),
+                method: ModelMethod::Plain,
                 kv_codec: Some(KvCodec::RotatedK4V4),
                 lookahead: true,
                 exported_logits_rows: 0,
@@ -498,78 +463,128 @@ mod tests {
             kernel_cache: Some(PathBuf::from("/cache/kernels")),
             release: ReleaseRate::of_machine(None),
             model_sha256: Some("e3b0c442".into()),
-            serve: Serve::Generation,
+        }
+    }
+
+    /// `configuration` exporting the rows a load of its service scores with.
+    fn scoring(configuration: EngineConfiguration) -> EngineConfiguration {
+        EngineConfiguration {
+            model: ModelPolicy {
+                exported_logits_rows: scoring_rows(&configuration.service),
+                ..configuration.model.clone()
+            },
+            ..configuration
         }
     }
 
     /// The resource limits a load of `configuration` plans on `backend`.
-    fn limits(
-        configuration: &EngineConfiguration,
-        backend: seismic::BackendName,
-    ) -> Result<magnitude_executor::ResourceLimits, ExecutionPlanningError> {
+    fn limits(configuration: &EngineConfiguration, backend: seismic::BackendName) -> ResourceLimits {
         let definition = crate::options::tests::definition(true);
         let model = configuration.model.resolve(&definition).unwrap();
         assert_eq!(model.method, ResolvedMethod::Plain);
-        resource_limits(&configuration.service, &model, 0, backend)
+        resource_limits(&configuration.service, &model, 0, backend).unwrap()
     }
 
-    #[test]
-    fn a_scoring_load_is_the_plain_target_exporting_every_row_it_walks() {
-        let base = generation_configuration();
-        let scoring = scoring_configuration(base.clone());
-        assert_eq!(scoring.serve, Serve::Scoring);
-        assert_eq!(scoring.package.target_shards, base.package.target_shards);
-        assert_eq!(scoring.package.projector, ProjectorSelection::Disabled);
-        assert_eq!(scoring.package.draft, None);
-        assert_eq!(scoring.model.method, ModelMethod::Plain);
-        assert_eq!(scoring.model.draft_policy, None);
-        assert_eq!(scoring.model.mtp_proposals, None);
-        assert!(!scoring.model.lookahead);
-        assert_eq!(scoring.model.kv_codec, base.model.kv_codec);
-        assert_eq!(scoring.context_tokens, base.context_tokens);
-        assert_eq!(scoring.model.exported_logits_rows, 512);
-        // The manifest admits the service limits, and the load's plan
-        // selects and exports every row of a step of S walks W rows wide.
-        scoring.service.validate().unwrap();
-        let limits = limits(&scoring, seismic::BackendName::Metal).unwrap();
-        let step = SCORING_SEQUENCES * SCORING_WIDTH;
-        assert!(limits.max_launch_rows >= step);
-        assert!(limits.max_launch_slots >= SCORING_SEQUENCES);
-        assert!(limits.max_selected_rows >= step);
-        assert_eq!(limits.exported_logits_rows, 512);
-        assert!(limits.exported_logits_rows <= limits.max_launch_rows);
-        assert!(!limits.lookahead);
+    /// A one-row decode of `request` sampling its next token under
+    /// `shaping`, its row demanding no logits.
+    fn sampled(request: RequestId, shaping: Shaping) -> Operation {
+        Operation::Forward {
+            request,
+            kind: WorkKind::Decode,
+            tokens: vec![TokenId(1)],
+            position: 0,
+            conditioning: None,
+            demand: Demand::SELECT,
+            select: vec![SelectSpec {
+                sampling: Sampling::Categorical,
+                seed: 1,
+                position: 0,
+                domain: 0,
+                mask: None,
+                shaping,
+                history: None,
+            }],
+            committed: 1,
+            prime: None,
+        }
     }
 
-    /// The exported rows are max(S·W, 512) whatever the base's prefill
-    /// allowance; a base whose launches cannot carry them is refused.
+    /// A decode of `rows` rows of `request`, each demanding its logits and
+    /// none selecting: a score walk's forward.
+    fn exported(request: RequestId, rows: usize) -> Operation {
+        Operation::Forward {
+            request,
+            kind: WorkKind::Decode,
+            tokens: vec![TokenId(1); rows],
+            position: 0,
+            conditioning: None,
+            demand: Demand::LOGITS,
+            select: Vec::new(),
+            committed: rows,
+            prime: None,
+        }
+    }
+
+    /// One load serves generation and scoring: a generation load exports a
+    /// scoring flight's rows of logits and plans otherwise what it plans
+    /// exporting none, and its launches decide per launch (the executor's
+    /// rule), so one whose rows demand no logits still samples shaped and
+    /// one exporting every row the load exports is admitted.
     #[test]
-    fn a_scoring_load_exports_its_rows_within_the_bases_launch() {
-        let wide = scoring_configuration(EngineConfiguration {
-            service: ServiceLimits {
-                prefill_tokens: 1024,
-                ..standard_service_limits()
-            },
-            ..generation_configuration()
-        });
-        assert_eq!(wide.model.exported_logits_rows, 512);
-        let planned = limits(&wide, seismic::BackendName::Cuda).unwrap();
-        assert_eq!(planned.exported_logits_rows, 512);
-        assert_eq!(planned.max_launch_rows, 1024);
-        let narrow = scoring_configuration(EngineConfiguration {
-            service: ServiceLimits {
-                prefill_tokens: 128,
-                ..standard_service_limits()
-            },
-            ..generation_configuration()
-        });
-        assert_eq!(narrow.model.exported_logits_rows, 512);
-        assert_eq!(
-            limits(&narrow, seismic::BackendName::Metal),
-            Err(ExecutionPlanningError::LogitsRows {
-                required: 512,
-                admitted: SCORING_SEQUENCES * SCORING_WIDTH,
-            })
+    fn a_generation_load_exports_a_scoring_flight_and_still_samples_shaped() {
+        let backend = seismic::BackendName::Cpu;
+        let serving = limits(&generation_configuration(), backend);
+        let exporting = limits(&scoring(generation_configuration()), backend);
+        assert_eq!(exporting.exported_logits_rows, SCORING_ROWS);
+        assert_eq!(ResourceLimits { exported_logits_rows: 0, ..exporting }, serving);
+        // A controlled domain of these limits, its context holding a whole
+        // export of one walk.
+        let mut definition = fixtures::tiny_definition();
+        definition.decoder.context_limit = SCORING_ROWS as u64;
+        let (mut domain, mut bindings) = fixtures::fixture_of(
+            definition,
+            exporting,
+            None,
+            false,
+            DeviceRequest::Backend(backend),
         );
+        let (generating, walking) = (RequestId(1), RequestId(2));
+        for request in [generating, walking] {
+            domain.install_input(request, PreparedModelInput::continuation_only()).unwrap();
+            assert!(domain.open_served(&mut bindings, request, None).unwrap().is_empty());
+        }
+        let shaped = Shaping {
+            temperature: 0.7,
+            top_k: 2,
+            ..Shaping::default()
+        };
+        if let Err(error) = domain.reserve(&mut bindings, &[sampled(generating, shaped)]) {
+            panic!("a launch demanding no logits samples shaped: {error:?}");
+        }
+        if let Err(error) = domain.reserve(&mut bindings, &[exported(walking, SCORING_ROWS)]) {
+            panic!("a launch exports every row the load exports: {error:?}");
+        }
+    }
+
+    /// A load whose launches carry fewer rows than a scoring flight exports
+    /// the rows they carry, and still plans: planning refuses an export wider
+    /// than a launch (`LogitsRows`).
+    #[test]
+    fn a_load_with_narrower_launches_exports_the_rows_they_carry() {
+        assert_eq!(scoring_rows(&standard_service_limits()), SCORING_ROWS);
+        let narrow = ServiceLimits {
+            prefill_tokens: 128,
+            ..standard_service_limits()
+        };
+        assert!(narrow.launch_rows() < SCORING_ROWS);
+        let configuration = scoring(EngineConfiguration {
+            service: narrow,
+            ..generation_configuration()
+        });
+        assert_eq!(configuration.model.exported_logits_rows, 128);
+        for backend in [seismic::BackendName::Metal, seismic::BackendName::Cuda] {
+            let planned = limits(&configuration, backend);
+            assert_eq!((planned.max_launch_rows, planned.exported_logits_rows), (128, 128));
+        }
     }
 }

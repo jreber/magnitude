@@ -1,7 +1,7 @@
-//! The service's models for the protocol handlers (integration spec §8.2, §8.5). A generation
-//! resolves the canonical model, ensures its instance and holds the instance lease until the
-//! generation ends; host-only operations read the shared resolved configuration and never lease
-//! or load.
+//! The service's models for the protocol handlers (integration spec §8.2, §8.5). A generation or
+//! a score resolves the canonical model, ensures its one instance and holds the instance lease
+//! until it ends; host-only operations read the shared resolved configuration and never lease or
+//! load.
 
 use std::sync::Arc;
 
@@ -88,11 +88,11 @@ impl ServedModels for ServiceModels {
     ) -> BoxFuture<'_, Result<PromptScore, ServingError>> {
         let model = model.to_owned();
         Box::pin(async move {
-            // The scoring load is a different instance from the generating one. The lease is
-            // held until the score returns, then dropped with this future's scope.
+            // The instance that generates scores too. The lease is held until the score
+            // returns, then dropped with this future's scope.
             let lease = self
                 .instances
-                .acquire_for_scoring(&model, None)
+                .acquire_for_inference(&model, None)
                 .await
                 .map_err(unavailable)?;
             let tokens = tokens.into_iter().map(TokenId).collect();

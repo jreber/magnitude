@@ -1,26 +1,25 @@
-//! Real-device check of a scoring load: a continuation a generation load of
-//! the same model wrote greedily is, token by token, the scoring load's most
-//! likely token, a score is reproducible, scores walked together (as the
-//! service's concurrent requests are, a single-row decode among verification
-//! forwards) match the same scores walked alone within rounding, and each
-//! load refuses the other purpose's requests.
+//! Real-device check of one load serving both generation and scoring: a
+//! continuation the load wrote greedily is, token by token, the same load's
+//! most likely token, a score is reproducible, scores walked together (as
+//! the service's concurrent requests are, a single-row decode beside wider
+//! ones in one scoring flight) match the same scores walked alone within
+//! rounding, and the load writes the same continuation after scoring as
+//! before.
 //!
 //! `MAGNITUDE_TEST_GGUF=M.gguf [MAGNITUDE_TEST_KERNEL_CACHE=DIR] cargo test
 //! --release -p magnitude-engine --test scoring -- --ignored --nocapture`,
-//! on any supported model. Both loads run their worker on a thread of this
+//! on any supported model. The load runs its worker on a thread of this
 //! process over the channel transport, serving canonical defaults for
-//! tuning units the kernel cache holds no record of, and load as a load in
-//! its own process does, one at a time ([`model_load`]): the prices their
-//! plan waits on are measured into the kernel cache first, once per
-//! machine.
+//! tuning units the kernel cache holds no record of, and loads as a load in
+//! its own process does ([`model_load`]): the prices its plan waits on are
+//! measured into the kernel cache first, once per machine.
 
 use magnitude_engine::{
-    composition::{scoring_configuration, EngineConfiguration, ReadyEngine},
+    composition::{scoring_rows, EngineConfiguration, ReadyEngine},
     error::RequestError,
     inputs::SpecialTokens,
     options::{
         standard_service_limits, ModelMethod, ModelPolicy, PackageOptions, ProjectorSelection,
-        Serve, SCORING_WIDTH,
     },
     worker::{
         connect_worker, run_worker, transport::channel_pair, RequestEvent, RequestOptions,
@@ -33,7 +32,10 @@ use magnitude_executor::{
     ExecutionPath, UnpreparedUnits,
 };
 use magnitude_generation::{EndOfGeneration, MethodChoice, Options, Sampling, Shaping, TokenId};
-use magnitude_scheduler::prefix_cache::PrefixRetention;
+use magnitude_scheduler::{
+    prefix_cache::PrefixRetention,
+    scoring::{SCORING_ROWS, SCORING_WIDTH},
+};
 use std::{
     future::Future,
     path::PathBuf,
@@ -81,10 +83,11 @@ lighthouse in several languages, including French, Italian, Spanish and Portugue
 /// their own size.
 const TOGETHER_TOLERANCE: f64 = 0.5;
 
-/// A plain generation load of the test's model: the base a scoring load is
-/// made from, and the load that writes the continuation.
+/// A plain load of the test's model, exporting the logits rows its service
+/// scores with: the one load that writes the continuation and scores it.
 fn generation() -> EngineConfiguration {
     let model = std::env::var_os("MAGNITUDE_TEST_GGUF").expect("set MAGNITUDE_TEST_GGUF");
+    let service = standard_service_limits();
     EngineConfiguration {
         package: PackageOptions {
             target_shards: vec![PathBuf::from(model)],
@@ -93,16 +96,16 @@ fn generation() -> EngineConfiguration {
         },
         model: ModelPolicy {
             method: ModelMethod::Plain,
+            exported_logits_rows: scoring_rows(&service),
             ..ModelPolicy::default()
         },
         context_tokens: Some(4096),
-        service: standard_service_limits(),
+        service,
         path: ExecutionPath::Native,
         device: DeviceRequest::Automatic,
         kernel_cache: Some(model_load::kernel_cache()),
         release: ReleaseRate::of_machine(None),
         model_sha256: None,
-        serve: Serve::Generation,
     }
 }
 
@@ -146,7 +149,7 @@ fn block_on<T>(future: impl Future<Output = T>) -> T {
 
 /// Score `prompts` together on `engine`, with the top-1 token at each
 /// position: every request is sent before any is awaited, so the walks share
-/// the scoring load's steps.
+/// the load's scoring flights.
 fn score_together(engine: &ReadyEngine, prompts: &[Vec<TokenId>]) -> Vec<ScoreOutcome> {
     let mut scores: Vec<_> = prompts
         .iter()
@@ -171,17 +174,17 @@ fn score_together(engine: &ReadyEngine, prompts: &[Vec<TokenId>]) -> Vec<ScoreOu
     outcomes.into_iter().map(Option::unwrap).collect()
 }
 
-/// Each of `prompts` scored together on `scoring` matches its score alone
+/// Each of `prompts` scored together on `engine` matches its score alone
 /// within [`TOGETHER_TOLERANCE`] on average over its positions. Single
 /// positions and ranks are not compared: rounding may route a row
 /// otherwise, and a token within rounding of its neighbours trades places
 /// with them.
-fn assert_together_matches_alone(scoring: &ReadyEngine, prompts: &[Vec<TokenId>]) {
+fn assert_together_matches_alone(engine: &ReadyEngine, prompts: &[Vec<TokenId>]) {
     let alone: Vec<_> = prompts
         .iter()
-        .map(|tokens| block_on(scoring.client().score(tokens.clone(), true, false)).unwrap())
+        .map(|tokens| block_on(engine.client().score(tokens.clone(), true, false)).unwrap())
         .collect();
-    let together = score_together(scoring, prompts);
+    let together = score_together(engine, prompts);
     for (prompt, (alone, together)) in alone.iter().zip(&together).enumerate() {
         assert_eq!(alone.positions.len(), prompts[prompt].len() - 1);
         assert_eq!(together.positions.len(), alone.positions.len());
@@ -258,26 +261,19 @@ fn continue_greedily(engine: &ReadyEngine, prompt: &[TokenId]) -> Result<Vec<Tok
 
 #[test]
 #[ignore = "needs a model on a device: set MAGNITUDE_TEST_GGUF"]
-fn a_greedy_continuation_scores_rank_one_and_scores_repeat_alone_and_together() {
-    let (generating, worker) = start(generation());
-    let prompt = generating
+fn one_load_scores_its_greedy_continuation_rank_one_and_scores_repeat_alone_and_together() {
+    let (engine, worker) = start(generation());
+    assert_eq!(engine.ready_info().model.exported_logits_rows, SCORING_ROWS);
+    let prompt = engine
         .host()
         .tokenizer()
         .encode(PROMPT, SpecialTokens::Recognize)
         .unwrap();
-    let continuation = continue_greedily(&generating, &prompt).unwrap();
+    let continuation = continue_greedily(&engine, &prompt).unwrap();
     assert_eq!(continuation.len(), CONTINUATION);
-    let refused = block_on(generating.client().score(prompt.clone(), false, false));
-    assert!(
-        matches!(refused, Err(RequestError::InvalidRequest { .. })),
-        "a generation load refuses a score: {refused:?}"
-    );
-    drop(generating);
-    eprintln!("generation worker: {:?}", worker.join().unwrap());
 
-    let (scoring, worker) = start(scoring_configuration(generation()));
     let tokens = [prompt.as_slice(), continuation.as_slice()].concat();
-    let first = block_on(scoring.client().score(tokens.clone(), true, true)).unwrap();
+    let first = block_on(engine.client().score(tokens.clone(), true, true)).unwrap();
     assert_eq!(first.positions.len(), tokens.len() - 1);
     assert!(first.next.is_some(), "the next token was asked for");
     for (index, position) in first.positions.iter().enumerate() {
@@ -291,11 +287,11 @@ fn a_greedy_continuation_scores_rank_one_and_scores_repeat_alone_and_together() 
         assert_eq!(
             (position.rank, position.top),
             (1, None),
-            "continuation token {offset} ({:?}) is not the scoring load's greedy choice",
+            "continuation token {offset} ({:?}) is not the load's greedy choice",
             continuation[offset]
         );
     }
-    let second = block_on(scoring.client().score(tokens.clone(), true, true)).unwrap();
+    let second = block_on(engine.client().score(tokens.clone(), true, true)).unwrap();
     let logprobs = |outcome: &ScoreOutcome| {
         outcome
             .positions
@@ -318,10 +314,10 @@ fn a_greedy_continuation_scores_rank_one_and_scores_repeat_alone_and_together() 
             .sum::<f64>()
     );
 
-    // Three walks in one scoring load's steps. One is 2W + 1 tokens long, so
-    // its third step is a single-row decode; the longest is then still
-    // forwarding W rows, a verification forward in the same step.
-    let passage = scoring
+    // Three walks in the load's scoring flights. One is 2W + 1 tokens long,
+    // so its third flight forwards a single row; the longest then still
+    // forwards W rows, in the same flight.
+    let passage = engine
         .host()
         .tokenizer()
         .encode(PASSAGE, SpecialTokens::Recognize)
@@ -340,20 +336,21 @@ fn a_greedy_continuation_scores_rank_one_and_scores_repeat_alone_and_together() 
         decoding,
         passage[offset..offset + longest].to_vec(),
     ];
-    assert_together_matches_alone(&scoring, &prompts);
+    assert_together_matches_alone(&engine, &prompts);
 
-    let empty = block_on(scoring.client().score(Vec::new(), false, false));
+    let empty = block_on(engine.client().score(Vec::new(), false, false));
     assert!(
         matches!(empty, Err(RequestError::InvalidRequest { .. })),
         "a score of no tokens is refused: {empty:?}"
     );
-    let admitted = continue_greedily(&scoring, &prompt);
-    assert!(
-        admitted
-            .as_ref()
-            .is_err_and(|error| error.contains("scoring")),
-        "a scoring load refuses generation: {admitted:?}"
+    // The load that scored still generates, as it did before it scored: one
+    // instance served both, and no other was loaded.
+    assert_eq!(
+        continue_greedily(&engine, &prompt).unwrap(),
+        continuation,
+        "the load writes the same continuation after scoring"
     );
-    drop(scoring);
-    eprintln!("scoring worker: {:?}", worker.join().unwrap());
+    assert!(!worker.is_finished(), "the one worker served every request");
+    drop(engine);
+    eprintln!("worker: {:?}", worker.join().unwrap());
 }

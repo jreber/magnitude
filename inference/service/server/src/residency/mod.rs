@@ -12,7 +12,6 @@ pub mod worker;
 use std::sync::Arc;
 
 use std::time::Duration;
-use magnitude_engine::options::Serve;
 use magnitude_serving::source::ModelLoadDetails;
 
 use magnitude_service_contracts::InventoryError;
@@ -120,8 +119,6 @@ pub struct ResolvedResidencyTarget {
     pub configuration: ModelServingConfiguration,
     /// The serving configuration fingerprint: instance equality.
     pub configuration_key: String,
-    /// What the instance is loaded for; the key names it.
-    pub purpose: Serve,
 }
 
 /// The process that holds a resident model.
@@ -181,7 +178,6 @@ struct LoadingResidency<R> {
     instance: ModelInstance,
     configuration: ModelServingConfiguration,
     configuration_key: String,
-    purpose: Serve,
     operation: tokio::task::JoinHandle<()>,
     gate: LoadGate,
     worker: Option<Arc<dyn ResidencyWorker>>,
@@ -191,7 +187,6 @@ struct LoadingResidency<R> {
 struct ReadyResidency<R> {
     instance: ModelInstance,
     configuration_key: String,
-    purpose: Serve,
     resources: ResidentResources<R>,
     /// The later of the last grant and the last lease release.
     last_activity: tokio::time::Instant,
@@ -1023,7 +1018,6 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
             instance,
             configuration: first.target.configuration.clone(),
             configuration_key: first.target.configuration_key.clone(),
-            purpose: first.target.purpose,
             operation,
             gate,
             worker: None,
@@ -1036,7 +1030,6 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
                 model_id: loading.instance.model_id.clone(),
                 configuration: loading.configuration.clone(),
                 configuration_key: loading.configuration_key.clone(),
-                purpose: loading.purpose,
             },
             _ => unreachable!(),
         };
@@ -1177,7 +1170,6 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
         tracing::info!(
             model.id = %loading.instance.model_id,
             model.instance.id = %loading.instance.id.0,
-            residency.purpose = ?loading.purpose,
             "model release begins: the load is stopped"
         );
         let notifier = self.controller.client().notifier();
@@ -1320,7 +1312,6 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
                 let mut ready = ReadyResidency {
                     instance,
                     configuration_key: loading.configuration_key,
-                    purpose: loading.purpose,
                     resources: ResidentResources {
                         package_ids: prepared.package_ids,
                         worker: prepared.worker,
@@ -1366,7 +1357,6 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
         tracing::info!(
             model.id = %ready.instance.model_id,
             model.instance.id = %ready.instance.id.0,
-            residency.purpose = ?ready.purpose,
             residency.release.reason = ?reason,
             "model release begins"
         );
@@ -1701,7 +1691,6 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
                 model.id = %loading.instance.model_id,
                 model.instance.id = %loading.instance.id.0,
                 residency.state = "loading",
-                residency.purpose = ?loading.purpose,
                 residency.revision = self.revision,
                 "model residency transitioned"
             ),
@@ -2401,7 +2390,6 @@ mod tests {
                 .expect("valid test model ID"),
             configuration: test_configuration(model_id),
             configuration_key: configuration_key.to_owned(),
-            purpose: Serve::Generation,
         }
     }
 
@@ -3426,4 +3414,37 @@ mod tests {
         actor.abort();
     }
 
+    /// An inference lease on `target`, granted without waiting.
+    async fn granted(
+        client: &ResidencyClient<TestResident>,
+        target: ResolvedResidencyTarget,
+    ) -> ResidencyLease<TestResident> {
+        match tokio::time::timeout(Duration::from_secs(1), client.acquire(target, inference()))
+            .await
+            .expect("the request is granted without waiting")
+            .expect("inference acquisition")
+        {
+            ResidencyGrant::Lease(lease) => lease,
+            ResidencyGrant::Ready(_) => panic!("inference acquisition returned warm result"),
+        }
+    }
+
+    /// A chat and a score of one model lease one instance: with the chat's lease held, a score
+    /// of the same model is granted at once by the instance serving the chat, which nothing
+    /// replaces or loads beside.
+    #[tokio::test(start_paused = true)]
+    async fn a_chat_and_a_score_of_one_model_lease_one_instance() {
+        let (client, mut loads, _, actor) = test_residency_with_replacement_wait(LINGER, MAX_WAIT);
+        let model_id: ModelId = "model-a:gguf:test".parse().expect("valid test model ID");
+        // What a chat and a score each lease: the model's one target.
+        let target = || controller::residency_target(model_id.clone(), test_configuration("model-a"));
+        let chat = granted(&client, target()).await;
+        let (_, loaded) = loads.recv().await.expect("the chat's load");
+        assert_eq!(loaded, "model-a:gguf:test");
+        let score = granted(&client, target()).await;
+        assert_eq!(score.instance_id(), chat.instance_id(), "the score is served by the chat's instance");
+        assert!(loads.try_recv().is_err(), "the score loaded another instance");
+        assert!(matches!(current_lifecycle(&client).await, ModelInstanceLifecycle::Ready { .. }));
+        actor.abort();
+    }
 }

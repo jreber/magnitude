@@ -8,7 +8,7 @@ use magnitude_executor::ProgramFamily;
 use magnitude_generation::Method;
 use magnitude_scheduler::{
     owner::{AdmissionError, Owner, Ran},
-    protocol::{AdmitRequest, RoomGrant, ScoreRequest, WorkerCommand, WorkerReply},
+    protocol::{AdmitRequest, RoomGrant, WorkerCommand, WorkerReply},
     publication::{ModelUnloadCause, RequestError},
     worker::{Driven, Event, Reread},
 };
@@ -113,25 +113,25 @@ impl<F: ProgramFamily> ExecutionOwner<F> {
     }
 }
 
-/// The admission refusal of an execution that is draining or stopped.
-fn unloaded(cause: &UnloadCause) -> AdmissionError {
+/// The error a request meets in an execution that is draining or stopped.
+fn unloaded(cause: &UnloadCause) -> RequestError {
     match cause {
-        UnloadCause::MemoryPressure => AdmissionError::ModelUnloaded {
+        UnloadCause::MemoryPressure => RequestError::ModelUnloaded {
             cause: ModelUnloadCause::MemoryPressure,
         },
         UnloadCause::Shutdown | UnloadCause::DeviceLost { .. } | UnloadCause::Internal { .. } => {
-            AdmissionError::Refused(RequestError::WorkerClosed)
+            RequestError::WorkerClosed
         }
     }
 }
 
-/// The generation owner does not score: it answers the request's callback
-/// with the refusal and acknowledges the command.
-fn refuse_scoring(request: ScoreRequest) -> WorkerReply {
-    (request.done)(Err(RequestError::Input(
-        "this load serves generation, not scoring".into(),
-    )));
-    WorkerReply::Acknowledged
+/// The admission refusal of an execution that is draining or stopped: the
+/// error its requests meet ([`unloaded`]).
+fn refused(cause: &UnloadCause) -> AdmissionError {
+    match unloaded(cause) {
+        RequestError::ModelUnloaded { cause } => AdmissionError::ModelUnloaded { cause },
+        error => AdmissionError::Refused(error),
+    }
 }
 
 impl<F: ProgramFamily> Driven for ExecutionOwner<F> {
@@ -155,10 +155,20 @@ impl<F: ProgramFamily> Driven for ExecutionOwner<F> {
                     )
                 }
                 Execution::Draining(_, cause) | Execution::Stopped(cause) => {
-                    Ok(WorkerReply::AdmissionRefused(unloaded(cause)))
+                    Ok(WorkerReply::AdmissionRefused(refused(cause)))
                 }
             },
-            WorkerCommand::Score(request) => Ok(refuse_scoring(request)),
+            WorkerCommand::Score(request) => {
+                match &mut self.execution {
+                    Execution::Serving(owner) => owner.score(request, now),
+                    // A score is refused as an admission is then: its walk
+                    // would keep a drain in flight.
+                    Execution::Draining(_, cause) | Execution::Stopped(cause) => {
+                        (request.done)(Err(unloaded(cause)))
+                    }
+                }
+                Ok(WorkerReply::Acknowledged)
+            }
             WorkerCommand::Stop { request } => {
                 if let Execution::Serving(owner) | Execution::Draining(owner, _) =
                     &mut self.execution
@@ -425,26 +435,67 @@ mod tests {
     }
 
     use magnitude_executor::TokenId;
+    use magnitude_scheduler::protocol::ScoreRequest;
     use std::sync::mpsc;
 
-    #[test]
-    fn the_generation_owner_refuses_scoring_and_acknowledges() {
+    /// Send a score of two tokens to `execution`: its reply, and what its
+    /// callback was called with, each call.
+    fn score<F: ProgramFamily>(
+        execution: &mut ExecutionOwner<F>,
+    ) -> (Result<WorkerReply, String>, Vec<Result<magnitude_scheduler::scoring::ScoreOutcome, RequestError>>) {
         let (sender, receiver) = mpsc::channel();
-        let reply = refuse_scoring(ScoreRequest {
-            tokens: vec![TokenId(1)],
-            top: false,
-            next: false,
-            done: Box::new(move |outcome| sender.send(outcome).unwrap()),
-        });
-        assert!(matches!(reply, WorkerReply::Acknowledged));
-        let error = receiver.try_recv().unwrap().unwrap_err();
-        assert_eq!(
-            error,
-            RequestError::Input("this load serves generation, not scoring".into())
+        let reply = execution.command(
+            WorkerCommand::Score(ScoreRequest {
+                tokens: vec![TokenId(1), TokenId(2)],
+                top: false,
+                next: false,
+                done: Box::new(move |outcome| sender.send(outcome).unwrap()),
+            }),
+            0,
         );
-        assert!(matches!(
-            crate::error::RequestError::from(error),
-            crate::error::RequestError::InvalidRequest { .. }
-        ));
+        (reply, receiver.try_iter().collect())
+    }
+
+    /// A score reaches the generation owner while it serves (which refuses
+    /// it at once on a load exporting no logits), and while it drains or has
+    /// stopped meets the error an admission is refused with then: each
+    /// answered through its callback exactly once, the command acknowledged.
+    #[test]
+    fn a_score_reaches_the_owner_and_fails_as_an_admission_once_it_ends() {
+        let (domain, bindings) = magnitude_executor::fixtures::fixture(None);
+        let limits = ServiceLimits {
+            prefill_tokens: 2,
+            decode_tokens: 2,
+            decode_share: 0.5,
+            locality_seconds: 1.0,
+            conversations: std::num::NonZeroUsize::MIN,
+        };
+        let owner = Owner::new(domain, bindings, limits, Arc::new(Unwoken)).unwrap();
+        let (pricing, _) = LoadPricing::fixture(magnitude_executor::platform::DeviceRequest::Automatic, false, None);
+        let mut execution = ExecutionOwner::new(owner, Arc::new(Plain), pricing, Arc::default());
+        let (reply, answers) = score(&mut execution);
+        assert!(matches!(reply, Ok(WorkerReply::Acknowledged)));
+        assert_eq!(answers, vec![Err(RequestError::Input("this load exports no logits to score with".into()))]);
+
+        execution.event(Event::Close, 0);
+        assert!(matches!(execution.execution, Execution::Draining(_, UnloadCause::Shutdown)));
+        let (reply, answers) = score(&mut execution);
+        assert!(matches!(reply, Ok(WorkerReply::Acknowledged)));
+        assert_eq!(answers, vec![Err(RequestError::WorkerClosed)]);
+
+        for (cause, expected) in [
+            (UnloadCause::Shutdown, RequestError::WorkerClosed),
+            (UnloadCause::MemoryPressure, RequestError::ModelUnloaded { cause: ModelUnloadCause::MemoryPressure }),
+        ] {
+            execution.execution = Execution::Stopped(cause.clone());
+            let (reply, answers) = score(&mut execution);
+            assert!(matches!(reply, Ok(WorkerReply::Acknowledged)));
+            assert_eq!(answers, vec![Err(expected.clone())], "{cause:?}");
+            assert_eq!(
+                crate::error::RequestError::from(refused(&cause)),
+                crate::error::RequestError::from(expected),
+                "{cause:?}: a score and an admission meet one error"
+            );
+        }
     }
 }

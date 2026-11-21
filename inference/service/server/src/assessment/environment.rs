@@ -2,6 +2,7 @@
 //! discovery before assessment, and what the measurement job has stored of this machine.
 
 use magnitude_engine::assessment::{AssessmentSetup, AssessmentStructure, Measurements};
+use magnitude_engine::composition::scoring_rows;
 use magnitude_engine::options::{ModelPolicy, standard_service_limits};
 use magnitude_engine::worker::protocol::EngineBuild;
 use magnitude_executor::ExecutionPath;
@@ -12,9 +13,14 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 
-/// The engine configuration the service loads and assesses every model with.
+/// The engine configuration the service loads and assesses every model with, under its
+/// [`standard_service_limits`]: each load scores prompts as well as generating, so it exports the
+/// rows of logits a scoring flight reads.
 pub fn serving_policy() -> ModelPolicy {
-    ModelPolicy::default()
+    ModelPolicy {
+        exported_logits_rows: scoring_rows(&standard_service_limits()),
+        ..ModelPolicy::default()
+    }
 }
 
 /// The request the service's device is selected by: the engine's automatic selection.

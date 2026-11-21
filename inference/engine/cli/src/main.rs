@@ -16,7 +16,7 @@ use magnitude_engine::composition::{EngineConfiguration, start_in_process};
 use magnitude_engine::invocation::{InvocationSource, SingleEngine};
 use magnitude_engine::options::{
     DraftPolicy, ExecutionManifest, ModelMethod, ModelPolicy, PackageOptions, ProjectorSelection,
-    standard_service_limits, Serve,
+    standard_service_limits,
 };
 use magnitude_engine::telemetry::{DEFAULT_TRACES_ENDPOINT, Telemetry, log_to_stderr};
 use magnitude_engine::worker::transport::stdio_worker_transport;
@@ -407,7 +407,6 @@ fn run() -> Result<(), String> {
         kernel_cache: options.kernel_cache,
         release,
         model_sha256,
-        serve: Serve::Generation,
     }
     .resolve()
     .map_err(|error| error.to_string())?;

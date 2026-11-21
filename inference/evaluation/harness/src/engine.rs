@@ -9,7 +9,7 @@ use magnitude_engine::composition::{
 };
 use magnitude_engine::load_native_domain;
 use magnitude_engine::options::{
-    ModelMethod, ModelPolicy, PackageOptions, ProjectorSelection, ResolvedMethod, Serve,
+    ModelMethod, ModelPolicy, PackageOptions, ProjectorSelection, ResolvedMethod,
 };
 use magnitude_executor::platform::{DeviceRequest, ReleaseRate};
 use magnitude_executor::{
@@ -128,7 +128,6 @@ pub fn configuration(
         kernel_cache: options.cache_dir.clone(),
         release,
         model_sha256: None,
-        serve: Serve::Generation,
     }
     .resolve()
     .map_err(|error| error.to_string())?;

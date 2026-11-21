@@ -555,14 +555,6 @@ enum Start {
     Returned(Request),
 }
 
-/// The failure a request reports for a domain error: every execution owner
-/// classifies them alike.
-impl From<DomainError> for RequestError {
-    fn from(error: DomainError) -> Self {
-        classify_domain_error(error)
-    }
-}
-
 fn classify_domain_error(error: DomainError) -> RequestError {
     match error {
         DomainError::Capacity(error) => RequestError::Capacity(ServiceCapacityError {
@@ -599,9 +591,8 @@ fn refused_alone(error: DomainError) -> RequestError {
     }
 }
 
-/// Whether a domain error stops execution rather than one request: every
-/// execution owner stops on the same errors.
-pub fn is_fatal(error: &DomainError) -> bool {
+/// Whether a domain error stops execution rather than one request.
+fn is_fatal(error: &DomainError) -> bool {
     matches!(
         error,
         DomainError::Device(_)
@@ -1150,7 +1141,13 @@ impl<F: ProgramFamily> Owner<F> {
 
     /// How the model serves now ([`ServingCensus`]).
     pub fn serving_census(&self) -> Result<ServingCensus, String> {
-        ServingCensus::of(&self.service.domain)
+        let service = &self.service;
+        let experts = service.domain.expert_residency().map_err(|error| error.to_string())?;
+        Ok(ServingCensus {
+            group_places: service.domain.group_places(),
+            group_capacity: service.domain.chain_capacity(),
+            experts,
+        })
     }
 
     /// What each store's ledger holds allocated, by class.
@@ -4202,7 +4199,7 @@ impl<F: ProgramFamily> Service<F> {
                 Err(error) if is_fatal(&error) => return Err(classify_domain_error(error)),
                 // Its sequence fails alone, its state resolved (aborted or
                 // reinserted), so it closes.
-                Err(error) => Absorbed::Ended(Err(RequestError::from(error))),
+                Err(error) => Absorbed::Ended(Err(classify_domain_error(error))),
             };
             if let Absorbed::Ended(result) = absorbed {
                 ended.insert(sequence, result);
