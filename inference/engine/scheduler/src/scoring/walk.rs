@@ -251,9 +251,20 @@ impl Walks {
         self.active.iter().map(Walk::sequence).collect()
     }
 
-    /// Defer the newest open walk: its request returns to the front of the
-    /// queue, its progress dropped. The sequence it held, to close.
+    /// Whether a shortage sheds a walk ([`Self::defer_newest`]): another
+    /// stays open beside the newest. A walk alone is never shed.
+    pub(crate) fn sheds(&self) -> bool {
+        self.active.len() > 1
+    }
+
+    /// Defer the newest open walk where a shortage sheds one
+    /// ([`Self::sheds`]): its request returns to the front of the queue, its
+    /// progress dropped. The sequence it held, to close; none for a walk
+    /// alone.
     pub(crate) fn defer_newest(&mut self) -> Option<RequestId> {
+        if !self.sheds() {
+            return None;
+        }
         let walk = self.active.pop()?;
         let sequence = walk.sequence();
         self.waiting.push_front(walk.into_request());
@@ -456,6 +467,8 @@ mod tests {
         assert_eq!(walks.defer_newest(), Some(RequestId(8)));
         assert_eq!(walks.waiting.front().map(|request| request.tokens.clone()), Some(tokens([3, 4])));
         assert!(second_outcomes.try_recv().is_err() && first_outcomes.try_recv().is_err(), "a deferral answers nothing");
+        assert_eq!(walks.sequences(), BTreeSet::from([RequestId(7)]));
+        assert_eq!(walks.defer_newest(), None, "a walk alone is never deferred");
         assert_eq!(walks.sequences(), BTreeSet::from([RequestId(7)]));
     }
 
