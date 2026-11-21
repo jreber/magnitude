@@ -1,8 +1,18 @@
 //! Teacher-forced scoring's values: the reduction of one logits row to the real token's log-probability, its
 //! rank and the top token, and the score of a whole prompt. Device-free, so they cross the worker protocol.
+//! The owner's walks that score are in [`walk`].
+
+pub(crate) mod walk;
 
 use magnitude_executor::TokenId;
 use serde::{Deserialize, Serialize};
+
+/// The most walks one scoring flight steps.
+pub const SCORING_SEQUENCES: usize = 8;
+/// The most rows of one walk one scoring flight forwards.
+pub const SCORING_WIDTH: usize = 32;
+/// The most logits rows one scoring flight exports: what a load that scores at its widest exports a launch.
+pub const SCORING_ROWS: usize = SCORING_SEQUENCES * SCORING_WIDTH;
 
 /// The highest-probability token of a row and its log-probability.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -32,6 +42,26 @@ pub struct ScoreOutcome {
 pub fn reduce_row(row: &[f32], real: TokenId, top: bool) -> Result<ScoredPosition, String> {
     let index = usize::try_from(real.0).map_err(|_| "token id exceeds the host domain".to_owned())?;
     let real_logit = f64::from(*row.get(index).ok_or("token outside the logits row")?);
+    let (likeliest, max) = argmax(row)?;
+    if real_logit == f64::NEG_INFINITY {
+        return Err(format!("token {index} has a -inf logit, so its probability is zero"));
+    }
+    let sum: f64 = row.iter().map(|&x| (f64::from(x) - max).exp()).sum();
+    let lse = max + sum.ln();
+    let larger = row.iter().filter(|&&x| f64::from(x) > real_logit).count();
+    let rank = u32::try_from(larger + 1).map_err(|_| "row too large to rank".to_owned())?;
+    let top = if top && likeliest != index {
+        let id = u32::try_from(likeliest).map_err(|_| "argmax exceeds the token id domain".to_owned())?;
+        Some(TopToken { token: TokenId(id), logprob: max - lse })
+    } else {
+        None
+    };
+    Ok(ScoredPosition { logprob: real_logit - lse, rank, top })
+}
+
+/// The most likely entry of a logits row and its logit: the lowest index wins a tie. A row with a NaN, or whose
+/// maximum is not finite, has none.
+pub(crate) fn argmax(row: &[f32]) -> Result<(usize, f64), String> {
     let (mut max, mut argmax) = (f64::NEG_INFINITY, 0usize);
     for (i, &x) in row.iter().enumerate() {
         if x.is_nan() {
@@ -45,20 +75,7 @@ pub fn reduce_row(row: &[f32], real: TokenId, top: bool) -> Result<ScoredPositio
     if !max.is_finite() {
         return Err("logits row maximum is not finite (all -inf or a +inf entry)".to_owned());
     }
-    if real_logit == f64::NEG_INFINITY {
-        return Err(format!("token {index} has a -inf logit, so its probability is zero"));
-    }
-    let sum: f64 = row.iter().map(|&x| (f64::from(x) - max).exp()).sum();
-    let lse = max + sum.ln();
-    let larger = row.iter().filter(|&&x| f64::from(x) > real_logit).count();
-    let rank = u32::try_from(larger + 1).map_err(|_| "row too large to rank".to_owned())?;
-    let top = if top && argmax != index {
-        let id = u32::try_from(argmax).map_err(|_| "argmax exceeds the token id domain".to_owned())?;
-        Some(TopToken { token: TokenId(id), logprob: max - lse })
-    } else {
-        None
-    };
-    Ok(ScoredPosition { logprob: real_logit - lse, rank, top })
+    Ok((argmax, max))
 }
 
 #[cfg(test)]

@@ -5,7 +5,8 @@
 //! [`Owner::run`], between flights, where the owner holds the
 //! [`StateBindings`] that every binding change requires. The pipeline waits
 //! only on its own flight; a request that cannot proceed waits alone, in
-//! exactly one [`State`].
+//! exactly one [`State`]. Teacher-forced scores are the owner's work too:
+//! their walks' flights are flights of the same pipeline ([`Owner::score`]).
 use super::{
     domain::{
         DomainFlight, ExecutorDomain, FlightOutcomes, OperationGroup, ResumeState, finish, group,
@@ -19,23 +20,27 @@ use super::{
         CachedPrefixKeyInfo, CachePoint, MIN_BRANCH_GAIN, MIN_PREFIX_HIT, PrefixCache,
         PrefixCacheCapacity, PrefixPath, PrefixRetention,
     },
-    protocol::{RequestSnapshot, RoomGrant, RoomRefusal, WorkerReply},
+    protocol::{RequestSnapshot, RoomGrant, RoomRefusal, ScoreRequest, WorkerReply},
     publication::{
         CapacityResource, ModelUnloadCause, PublicationPermit, PublicationQueue,
         PublicationReceiver, PublicationSender, PublicationWake, PublicationWakeKind, PublishError,
         RequestError, RequestTimings, ServiceCapacityError,
     },
     round_driver::{RoundError, lower_round, reconcile_forward},
+    scoring::{
+        ScoreOutcome,
+        walk::{Absorbed, Bounds, Shape, Turn, Walk, Walks},
+    },
     serving::ServingCensus,
     throughput::{ThroughputAccumulator, ThroughputSnapshot},
     worker::{Reread, Wakes},
 };
 use magnitude_executor::{
-    BankResize, BankResized, BankStep, BankTier, DomainError, Followed, LoadMeasures, InvariantError,
+    BankResize, BankResized, BankStep, BankTier, DeviceError, DomainError, Followed, LoadMeasures, InvariantError,
     MemoryReading, StateBytes, StoreAllocation, NativeFamily, SizingTerm, SizingTerms,
     Operation, Outcome, PendingOperationOutcome, PhysicalDecision,
-    ProgramFamily, RequestId, ResourceKind, ResourcePlan, StateBindings, SubmitError,
-    SubmitFailure, WorkKind, Yielded,
+    ProgramFamily, RequestId, ResourceKind, ResourcePlan, RowResult, StateBindings, SubmitError,
+    SubmitFailure, TargetContinuation, WorkKind, Yielded,
 };
 use magnitude_executor::memory::ledger::Relief;
 use magnitude_family_contracts::PreparedModelInput;
@@ -731,12 +736,25 @@ struct Round {
     groups: VecDeque<OperationGroup>,
 }
 
+/// The owner's one pipeline: between flights, or one flight on the device,
+/// a generation round's or a scoring flight, never both in one launch. A
+/// flight holds the bindings until completion returns them, and its
+/// outcomes reconcile only as the flight of its kind.
 enum Pipeline<F: ProgramFamily> {
     /// Between flights: the right to change store bindings is here.
     Idle(StateBindings),
-    /// One group on the device. Its flight holds the bindings until
-    /// completion returns them.
-    InFlight(Round, ActiveGroup<F>),
+    /// One group of a generation round on the device.
+    Round(Round, ActiveGroup<F>),
+    /// One scoring flight on the device: a forward of each open walk.
+    Scoring(ScoringFlight<F>),
+}
+
+/// A scoring flight ([`Service::scoring_group`]): its flight, always a
+/// target launch, and its operations, one forward of each open walk in the
+/// walks' order.
+struct ScoringFlight<F: ProgramFamily> {
+    flight: DomainFlight<F>,
+    operations: Vec<Operation>,
 }
 
 /// How provisioning a group ended.
@@ -773,6 +791,9 @@ struct Service<F: ProgramFamily> {
     wakes: Arc<dyn Wakes>,
     throughput: ThroughputAccumulator,
     cold_tier: Option<Rc<RefCell<ColdTier>>>,
+    /// The load's score walks; none where it exports no logits to score
+    /// with.
+    scoring: Option<Walks>,
 }
 
 /// What a loaded model's owner holds of its memory between flights
@@ -898,6 +919,10 @@ impl<F: ProgramFamily> Owner<F> {
     ) -> Result<Self, String> {
         // The OS's pressure events wake the owner, whose run reads memory.
         domain.watch_pressure(wakes.pressure());
+        let scoring = match Shape::of(domain.limits()) {
+            Some(shape) => Some(Walks::new(shape, Bounds::of(domain.definition())?)),
+            None => None,
+        };
         let identity = cold_identity;
         let cold_tier = match (identity, state_cache) {
             (Some(identity), Some(dir)) => {
@@ -921,6 +946,7 @@ impl<F: ProgramFamily> Owner<F> {
             wakes,
             throughput: ThroughputAccumulator::new(),
             cold_tier,
+            scoring,
         };
         if let Some(tier) = service.cold_tier.clone() {
             let identity = identity.unwrap();
@@ -1030,11 +1056,22 @@ impl<F: ProgramFamily> Owner<F> {
         now: u64,
     ) -> Result<(RequestId, PublicationReceiver), AdmissionError> {
         let members = match &mut self.pipeline {
-            Pipeline::InFlight(round, _) => Some(&mut round.members),
-            Pipeline::Idle(_) => None,
+            Pipeline::Round(round, _) => Some(&mut round.members),
+            Pipeline::Idle(_) | Pipeline::Scoring(_) => None,
         };
         self.service
             .admit(generation, input, retention, output_capacity, now, members)
+    }
+
+    /// Queue a teacher-forced score of `request.tokens`; `request.done` is called exactly once: with the outcome,
+    /// or with the request error that ends it (a load that exports no logits, a capacity refusal alone,
+    /// termination, a domain failure). Its walk opens a sequence of the domain when a scoring flight takes it, in
+    /// arrival order, with an identity of the owner's own that no request's status ever names.
+    pub fn score(&mut self, request: ScoreRequest, now: u64) {
+        match self.service.time(now) {
+            Ok(()) => self.service.score(request),
+            Err(error) => (request.done)(Err(error)),
+        }
     }
 
     /// Stop a live request through its ordered stream. Work in flight still
@@ -1049,7 +1086,7 @@ impl<F: ProgramFamily> Owner<F> {
     }
 
     fn terminate_request(&mut self, id: RequestId, release: bool) {
-        if let Pipeline::InFlight(round, _) = &mut self.pipeline {
+        if let Pipeline::Round(round, _) = &mut self.pipeline {
             if let Some(Member { mut record, state }) = round.members.remove(&id) {
                 // Work in flight reconciles as aborted; queued work is dropped.
                 let mut generation = state.terminate(true);
@@ -1074,7 +1111,7 @@ impl<F: ProgramFamily> Owner<F> {
     }
 
     pub fn snapshot(&self, request: RequestId) -> Option<RequestSnapshot> {
-        if let Pipeline::InFlight(round, _) = &self.pipeline {
+        if let Pipeline::Round(round, _) = &self.pipeline {
             if let Some(member) = round.members.get(&request) {
                 return Some(snapshot(
                     member.state.generation(),
@@ -1206,11 +1243,12 @@ impl<F: ProgramFamily> Owner<F> {
         }
     }
 
-    /// Terminate every live request with `error`: the lifecycle is draining.
+    /// Terminate every live request with `error`, and answer every score
+    /// with it: the lifecycle is draining.
     pub fn terminate_all(&mut self, error: RequestError) {
         let members = match &mut self.pipeline {
-            Pipeline::InFlight(round, _) => Some(&mut round.members),
-            Pipeline::Idle(_) => None,
+            Pipeline::Round(round, _) => Some(&mut round.members),
+            Pipeline::Idle(_) | Pipeline::Scoring(_) => None,
         };
         self.service.terminalize_all(error, members);
     }
@@ -1351,6 +1389,22 @@ impl<F: ProgramFamily> Service<F> {
             },
         );
         Ok((id, receiver))
+    }
+
+    /// Queue `request`'s walk, or refuse it at once: a load that exports no
+    /// logits scores none, and a score outside the load's bounds is invalid.
+    fn score(&mut self, request: ScoreRequest) {
+        let Some(walks) = &mut self.scoring else {
+            return (request.done)(Err(RequestError::Input("this load exports no logits to score with".into())));
+        };
+        if let Some(refusal) = walks.bounds.refusal(&request.tokens) {
+            return (request.done)(Err(refusal));
+        }
+        walks.waiting.push_back(request);
+        // An idle owner reads memory afresh before new work opens.
+        if self.memory.settled.is_some() {
+            self.memory.owed = true;
+        }
     }
 
     /// Branch points for a new request's `path`: each declared cache point
@@ -1503,7 +1557,7 @@ impl<F: ProgramFamily> Service<F> {
         request: RequestId,
         pipeline: &'a mut Pipeline<F>,
     ) -> Option<&'a mut PublicationSender> {
-        if let Pipeline::InFlight(round, _) = pipeline {
+        if let Pipeline::Round(round, _) = pipeline {
             if let Some(member) = round.members.get_mut(&request) {
                 return member.record.publication.as_mut();
             }
@@ -1552,12 +1606,17 @@ impl<F: ProgramFamily> Service<F> {
     }
 
     /// Terminate every live request with `error`, delivering each host its
-    /// outcome now.
+    /// outcome now, and answer every open and waiting score with it: the one
+    /// end of all work, whether the lifecycle drains, the model unloads or
+    /// execution stops.
     fn terminalize_all(
         &mut self,
         error: RequestError,
         members: Option<&mut BTreeMap<RequestId, Member>>,
     ) {
+        if let Some(walks) = &mut self.scoring {
+            walks.fail_all(&error);
+        }
         let terminate = |record: &mut Record, generation: &mut Generation| {
             if generation.finish_reason().is_none() {
                 generation.fail();
@@ -1644,7 +1703,7 @@ impl<F: ProgramFamily> Service<F> {
                 }
             }
             pipeline = match pipeline {
-                Pipeline::InFlight(round, mut active) => {
+                Pipeline::Round(round, mut active) => {
                     if submitted || !active.flight.completion().is_complete() {
                         // The round's members end with a fatal error, not
                         // dropped with the round.
@@ -1652,15 +1711,28 @@ impl<F: ProgramFamily> Service<F> {
                             return Err((Some(round.members), error));
                         }
                         unload |= std::mem::take(&mut self.unloaded);
-                        return Ok((Pipeline::InFlight(round, active), self.ran(true, unload)));
+                        return Ok((Pipeline::Round(round, active), self.ran(true, unload)));
                     }
                     // Reconciling reads memory at the flight's boundary and
                     // submits the round's next flight.
                     submitted = true;
                     self.reconcile(round, active)?
                 }
+                Pipeline::Scoring(mut scoring) => {
+                    if submitted || !scoring.flight.completion().is_complete() {
+                        self.step(None, false).map_err(|error| (None, error))?;
+                        unload |= std::mem::take(&mut self.unloaded);
+                        return Ok((Pipeline::Scoring(scoring), self.ran(true, unload)));
+                    }
+                    // Reconciling reads memory at the flight's boundary and
+                    // submits nothing: the idle pipeline takes the next.
+                    self.reconcile_scoring(scoring).map_err(|error| (None, error))?
+                }
                 Pipeline::Idle(mut bindings) => {
                     self.step(Some(&mut bindings), false).map_err(|error| (None, error))?;
+                    // No flight holds the sequences of walks termination
+                    // answered: they close now.
+                    self.close_unclosed().map_err(|error| (None, error))?;
                     unload |= std::mem::take(&mut self.unloaded);
                     // Unloading terminated every request: nothing is left to
                     // select, and observing again would decide it again.
@@ -1669,13 +1741,17 @@ impl<F: ProgramFamily> Service<F> {
                         return Ok((Pipeline::Idle(bindings), self.ran(false, true)));
                     }
                     self.publish_ready().map_err(|error| (None, error))?;
-                    match self.select(&mut bindings)? {
-                        Selected::Round(round) => {
+                    match self.next_flight(&mut bindings)? {
+                        Next::Scoring(group_) => {
+                            submitted = true;
+                            self.submit_scoring(group_, bindings).map_err(|error| (None, error))?
+                        }
+                        Next::Generation(Selected::Round(round)) => {
                             submitted = true;
                             self.advance(round, bindings)?
                         }
-                        Selected::Retry => Pipeline::Idle(bindings),
-                        Selected::Empty => {
+                        Next::Generation(Selected::Retry) => Pipeline::Idle(bindings),
+                        Next::Generation(Selected::Empty) => {
                             // Waiting for work is no launch's service.
                             self.domain.host_idle();
                             let ran = self.ran(false, unload);
@@ -2993,7 +3069,7 @@ impl<F: ProgramFamily> Service<F> {
                             }
                         }
                     }
-                    return Ok(Pipeline::InFlight(
+                    return Ok(Pipeline::Round(
                         round,
                         ActiveGroup {
                             flight,
@@ -3039,17 +3115,7 @@ impl<F: ProgramFamily> Service<F> {
     ) -> Result<Provisioned, RequestError> {
         let short = |current: &Result<(), DomainError>| matches!(current, Err(DomainError::Capacity(_)));
         let mut group_ = group_;
-        let mut current = self.fits(bindings, round, &group_);
-        // Retained prefixes never make the stores grow past the workload
-        // state the plan charges: the group takes the rows and banks of the
-        // least recently used ones instead. Once none is left to release,
-        // `fits` sets no ceiling.
-        let held = self.held_entries(Some(&round.members));
-        while matches!(current, Err(DomainError::StateCeiling { .. })) {
-            self.prefix_cache.release_unspared(&held);
-            current = self.fits(bindings, round, &group_);
-        }
-        let Relieved { mut current, mut pending } = self.relieve(bindings, current, true, |this, bindings| Ok(this.fits(bindings, round, &group_)))?;
+        let Relieved { mut current, mut pending } = self.fitted(bindings, Some(&round.members), &group_)?;
         // A request's state growing short with nothing else to free: the
         // round's other members stand beside it only until they leave the
         // round. They leave it now, ready, so the relief may preempt them,
@@ -3062,7 +3128,7 @@ impl<F: ProgramFamily> Service<F> {
         let others = round.members.keys().copied().filter(|id| !own.contains(id)).collect::<BTreeSet<_>>();
         if growth(&current) && !pending && !others.is_empty() {
             self.withdraw(round, &others);
-            Relieved { current, pending } = self.relieve(bindings, current, true, |this, bindings| Ok(this.fits(bindings, round, &group_)))?;
+            Relieved { current, pending } = self.relieve(bindings, current, true, |this, bindings| Ok(this.fits(bindings, Some(&round.members), &group_)))?;
         }
         if short(&current) {
             group_ = match group_.split_last() {
@@ -3078,6 +3144,28 @@ impl<F: ProgramFamily> Service<F> {
         }
     }
 
+    /// Whether the group fits ([`Self::fits`]), `members` its round's where
+    /// it is a round's (a scoring flight's is none's), its shortage relieved
+    /// as any claim's is ([`relieve`]), preempting the requests that can be
+    /// evicted now. Retained prefixes never make the stores grow past the
+    /// workload state the plan charges: the group takes the rows and banks
+    /// of the least recently used ones instead. Once none is left to
+    /// release, `fits` sets no ceiling.
+    fn fitted(
+        &mut self,
+        bindings: &mut StateBindings,
+        members: Option<&BTreeMap<RequestId, Member>>,
+        group_: &OperationGroup,
+    ) -> Result<Relieved<()>, RequestError> {
+        let mut current = self.fits(bindings, members, group_);
+        let held = self.held_entries(members);
+        while matches!(current, Err(DomainError::StateCeiling { .. })) {
+            self.prefix_cache.release_unspared(&held);
+            current = self.fits(bindings, members, group_);
+        }
+        self.relieve(bindings, current, true, |this, bindings| Ok(this.fits(bindings, members, group_)))
+    }
+
     /// Whether the group fits now: provision it, then check the reservation
     /// its requirement, derived from the layout it was just provisioned
     /// into, would take. While a retained prefix could be released instead,
@@ -3085,10 +3173,10 @@ impl<F: ProgramFamily> Service<F> {
     fn fits(
         &mut self,
         bindings: &mut StateBindings,
-        round: &Round,
+        members: Option<&BTreeMap<RequestId, Member>>,
         group_: &OperationGroup,
     ) -> Result<(), DomainError> {
-        let held = self.held_entries(Some(&round.members));
+        let held = self.held_entries(members);
         let ceiling = self
             .prefix_cache
             .holds_unspared(&held)
@@ -3214,7 +3302,7 @@ impl<F: ProgramFamily> Service<F> {
                 self.publish_members(&mut round);
                 let mut flight = DomainFlight::Priming(priming);
                 flight.completion().notify(self.wakes.completion());
-                return Ok(Pipeline::InFlight(round, ActiveGroup {
+                return Ok(Pipeline::Round(round, ActiveGroup {
                     flight, operations: Vec::new(), prefix_uses: Vec::new(),
                 }));
             }
@@ -3853,6 +3941,14 @@ impl<F: ProgramFamily> Service<F> {
                 );
             }
         }
+        if let Some(walks) = &self.scoring {
+            if let Some(at) = walks.waits {
+                assert!(
+                    self.epoch.changed_since(at) || self.domain.holds_state_beside(&walks.sequences()),
+                    "invariant violated: an idle owner holds score walks waiting on memory that nothing under way can free"
+                );
+            }
+        }
     }
 
     /// Whether a request outside `group_` holds memory whose release would
@@ -3891,6 +3987,319 @@ impl<F: ProgramFamily> Service<F> {
         self.epoch.advance();
         Ok(())
     }
+}
+
+/// Score walks: the owner's scoring flights, taken in turns with its
+/// rounds, their sequences opened, provisioned and reconciled by the owner's
+/// own paths, so memory has one owner.
+impl<F: ProgramFamily> Service<F> {
+    /// What the idle pipeline takes next: a generation round or a scoring
+    /// flight, never both in one launch. Where both have work they take
+    /// turns, a round (whatever flights it spans) and a scoring flight each;
+    /// where generation has none, scoring takes the flight whatever the
+    /// turn (a second look finds what selection's own changes let in).
+    fn next_flight(&mut self, bindings: &mut StateBindings) -> Result<Next, Fatal> {
+        if self.scoring.as_ref().is_some_and(|walks| walks.turn == Turn::Scoring) {
+            if let Some(group_) = self.scoring_group(bindings).map_err(|error| (None, error))? {
+                return Ok(Next::Scoring(group_));
+            }
+        }
+        let selected = self.select(bindings)?;
+        match (&selected, &mut self.scoring) {
+            (Selected::Round(_), Some(walks)) => walks.turn = Turn::Scoring,
+            (Selected::Empty, Some(_)) => {
+                if let Some(group_) = self.scoring_group(bindings).map_err(|error| (None, error))? {
+                    return Ok(Next::Scoring(group_));
+                }
+            }
+            _ => {}
+        }
+        Ok(Next::Generation(selected))
+    }
+
+    /// The next scoring flight's group, provisioned: the waiting walks that
+    /// may open opened, then a forward of every open walk. None where
+    /// scoring takes no flight now: no walk is open, a prompt chain is under
+    /// way (any other group's provisioning would conclude it), or the walks
+    /// wait on memory. Short of memory, the newest walk is deferred while
+    /// others remain, as a round sheds its trailing operations; a walk
+    /// alone waits for a change of ours that frees memory or, where none can
+    /// come, fails with the shortage, and the walks waiting behind it open
+    /// in its place.
+    fn scoring_group(&mut self, bindings: &mut StateBindings) -> Result<Option<OperationGroup>, RequestError> {
+        let epoch = self.epoch;
+        if self.domain.chain_holder().is_some() || !self.scoring.as_mut().is_some_and(|walks| walks.waited(epoch)) {
+            return Ok(None);
+        }
+        loop {
+            // A wait set here holds back the walks still to open, not the
+            // flight of those open; a close ends it.
+            let epoch = self.epoch;
+            if self.walks_mut().waited(epoch) {
+                self.open_walks(bindings)?;
+            }
+            let walks = self.walks_mut();
+            if walks.active.is_empty() {
+                return Ok(None);
+            }
+            let (several, forwards) = (walks.active.len() > 1, walks.forwards());
+            let Ok([group_]) = <[OperationGroup; 1]>::try_from(group(&self.domain, forwards)) else {
+                return Err(invariant("scoring flight")("a scoring flight's forwards group apart".into()));
+            };
+            let Relieved { current, pending } = self.fitted(bindings, None, &group_)?;
+            match current {
+                Ok(()) => {
+                    self.walks_mut().turn = Turn::Generation;
+                    return Ok(Some(group_));
+                }
+                Err(DomainError::Capacity(_)) if several => self.defer_newest_walk()?,
+                Err(DomainError::Capacity(_)) if pending || self.others_stand(&group_) => {
+                    let epoch = self.epoch;
+                    self.walks_mut().waits = Some(epoch);
+                    return Ok(None);
+                }
+                // Nothing of ours can make room for the walk alone, or the
+                // domain refuses the flight: its walks fail.
+                Err(error @ (DomainError::Capacity(_) | DomainError::Input(_))) => self.fail_walks(refused_alone(error))?,
+                Err(error) => return Err(classify_domain_error(error)),
+            }
+        }
+    }
+
+    /// Open waiting walks, in arrival order, while fewer than a flight's
+    /// walks are open and memory lets new work in. An open short of memory
+    /// a change of ours will free (another's end or eviction, a release
+    /// under way) waits for it, its score back at the front of the queue;
+    /// one nothing of ours can make room for fails with the shortage.
+    fn open_walks(&mut self, bindings: &mut StateBindings) -> Result<(), RequestError> {
+        loop {
+            // A real shortage holds new work back while the bank sits at its
+            // floor (`MemoryResponse::admission_waits`).
+            if self.memory.admission_waits {
+                return Ok(());
+            }
+            let walks = self.walks_mut();
+            if walks.active.len() >= walks.shape.sequences || walks.waits.is_some() {
+                return Ok(());
+            }
+            let Some(request) = walks.waiting.pop_front() else {
+                return Ok(());
+            };
+            let sequence = RequestId::admitted();
+            match self.open_walk(bindings, sequence, request.tokens.len()) {
+                Ok(Opened::Open) => self.walks_mut().active.push(Walk::new(request, sequence)),
+                Ok(Opened::Waits) => {
+                    let epoch = self.epoch;
+                    let walks = self.walks_mut();
+                    walks.waiting.push_front(request);
+                    walks.waits = Some(epoch);
+                    return Ok(());
+                }
+                Ok(Opened::Refused(error)) => (request.done)(Err(error)),
+                Err(error) => {
+                    (request.done)(Err(error.clone()));
+                    return Err(error);
+                }
+            }
+        }
+    }
+
+    /// Open `sequence` for a walk of `rows` tokens, at position zero with no
+    /// prompt, reserving the rows it writes as a request's open reserves its
+    /// prompt (`ExecutorDomain::open_state`). Short of memory, it takes the
+    /// cache alone, as a request's open does. A walk not opened leaves
+    /// nothing of its sequence.
+    fn open_walk(&mut self, bindings: &mut StateBindings, sequence: RequestId, rows: usize) -> Result<Opened, RequestError> {
+        self.domain
+            .install_input(sequence, PreparedModelInput::continuation_only())
+            .map_err(invariant("score walk"))?;
+        let rows = rows as u64;
+        let open = |this: &mut Self, bindings: &mut StateBindings| {
+            // Scoring takes no turn while a chain is under way.
+            let unchained = this
+                .domain
+                .unchained(bindings)
+                .ok_or_else(|| invariant("score walk")("a walk opens beside a prompt chain".into()))?;
+            Ok(this.domain.open_state(unchained, sequence, None, rows))
+        };
+        let first = open(self, bindings)?;
+        let relieved = self.relieve(bindings, first, false, open)?;
+        let opened = match relieved.current {
+            Ok(encodes) if encodes.is_empty() => return Ok(Opened::Open),
+            Ok(_) => Err(invariant("score walk")("a walk opened with images to encode".into())),
+            Err(DomainError::Capacity(_))
+                if relieved.pending || self.domain.holds_state_beside(&BTreeSet::from([sequence])) =>
+            {
+                Ok(Opened::Waits)
+            }
+            Err(error) if is_fatal(&error) => Err(classify_domain_error(error)),
+            Err(error) => Ok(Opened::Refused(refused_alone(error))),
+        };
+        self.domain.close(sequence).map_err(invariant("score walk"))?;
+        opened
+    }
+
+    /// Submit a provisioned scoring flight. A refusal of its input fails its
+    /// walks; any other failure stops execution.
+    fn submit_scoring(&mut self, group_: OperationGroup, bindings: StateBindings) -> Result<Pipeline<F>, RequestError> {
+        match submit_group(&mut self.domain, bindings, &group_, self.wakes.completion()) {
+            Ok(flight) => Ok(Pipeline::Scoring(ScoringFlight { flight, operations: group_.into_operations() })),
+            Err(SubmitFailure::Refused(DomainError::Input(error), bindings)) => {
+                self.fail_walks(RequestError::Input(error))?;
+                Ok(Pipeline::Idle(bindings))
+            }
+            Err(SubmitFailure::Refused(error, _) | SubmitFailure::Failed(error)) => Err(classify_domain_error(error)),
+        }
+    }
+
+    /// Reconcile a completed scoring flight and take back the bindings:
+    /// each walk's rows committed whole, the logits it reads read to the
+    /// host now, before anything else is submitted, and reduced; a walk that
+    /// scored every row closes its sequence and is answered. An outcome the
+    /// expert bank interrupted is aborted, and its rows run again; one of a
+    /// walk termination answered is aborted. Memory is read once, at the
+    /// flight's boundary.
+    fn reconcile_scoring(&mut self, scoring: ScoringFlight<F>) -> Result<Pipeline<F>, RequestError> {
+        let flight_invariant = |detail: &str| invariant("scoring flight")(detail.into());
+        let ScoringFlight { flight, operations } = scoring;
+        let finished = finish(&mut self.domain, flight, false).map_err(classify_domain_error)?;
+        let (FlightOutcomes::Target(pending), TargetContinuation::Ready(mut bindings)) = finished else {
+            return Err(flight_invariant("a scoring flight finished other than as a target launch"));
+        };
+        let forwarded = operations
+            .iter()
+            .filter_map(|operation| match operation {
+                Operation::Forward { request, position, tokens, .. } => Some((*request, *position..*position + tokens.len())),
+                Operation::Head { .. } | Operation::Encode { .. } => None,
+            })
+            .collect::<BTreeMap<_, _>>();
+        let actual = pending.iter().map(PendingOperationOutcome::request).collect::<BTreeSet<_>>();
+        if forwarded.len() != operations.len() || pending.len() != operations.len() || !actual.iter().eq(forwarded.keys()) {
+            return Err(flight_invariant("executor outcomes do not match the flight's walks"));
+        }
+        let vocabulary = self.walks_mut().bounds.vocabulary;
+        let mut ended = BTreeMap::new();
+        for item in pending {
+            let sequence = item.request();
+            let walk = self.scoring.as_mut().and_then(|walks| walks.active.iter_mut().find(|walk| walk.sequence() == sequence));
+            let Some(walk) = walk.filter(|_| !matches!(item.outcome(), Outcome::Interrupted { .. })) else {
+                // Termination answered its walk, whose sequence closes at the
+                // idle boundary; or the expert bank interrupted it, its inputs
+                // whole, and its walk forwards the same rows again.
+                self.domain.abort(item).map_err(classify_domain_error)?;
+                continue;
+            };
+            let outcome = item.outcome().clone();
+            let accepted_rows = item.rows();
+            let absorbed = match self.domain.reconcile(item, PhysicalDecision { accepted_rows }) {
+                Ok(()) => {
+                    let Outcome::Forward { rows } = outcome else {
+                        return Err(flight_invariant("a walk's outcome is not a forward's"));
+                    };
+                    let rows = host_rows(walk, forwarded[&sequence].start, rows, vocabulary)?;
+                    walk.absorb(forwarded[&sequence].clone(), rows).map_err(|detail| flight_invariant(&detail))?
+                }
+                Err(error) if is_fatal(&error) => return Err(classify_domain_error(error)),
+                // Its sequence fails alone, its state resolved (aborted or
+                // reinserted), so it closes.
+                Err(error) => Absorbed::Ended(Err(RequestError::from(error))),
+            };
+            if let Absorbed::Ended(result) = absorbed {
+                ended.insert(sequence, result);
+            }
+        }
+        let walks = self.walks_mut();
+        let (mut closing, mut open) = (Vec::new(), Vec::new());
+        for walk in std::mem::take(&mut walks.active) {
+            match ended.remove(&walk.sequence()) {
+                Some(result) => closing.push((walk, result)),
+                None => open.push(walk),
+            }
+        }
+        walks.active = open;
+        self.end_walks(closing)?;
+        // The flight's boundary: what it held is free, and memory is read
+        // once here.
+        self.epoch.advance();
+        self.step(Some(&mut bindings), true)?;
+        Ok(Pipeline::Idle(bindings))
+    }
+
+    /// Defer the newest open walk ([`Walks::defer_newest`]), its sequence
+    /// closed: no walk opens again until a change of ours past its close.
+    fn defer_newest_walk(&mut self) -> Result<(), RequestError> {
+        let sequence = self.walks_mut().defer_newest().expect("invariant violated: no open walk to defer");
+        self.close_walk(sequence)?;
+        let epoch = self.epoch;
+        self.walks_mut().waits = Some(epoch);
+        Ok(())
+    }
+
+    /// End every open walk with `error`: a flight of them refused whole.
+    fn fail_walks(&mut self, error: RequestError) -> Result<(), RequestError> {
+        let failed = std::mem::take(&mut self.walks_mut().active);
+        self.end_walks(failed.into_iter().map(|walk| (walk, Err(error.clone()))).collect())
+    }
+
+    /// Close each ended walk's sequence and answer it: every walk is
+    /// answered before a failed close stops the owner.
+    fn end_walks(&mut self, ended: Vec<(Walk, Result<ScoreOutcome, RequestError>)>) -> Result<(), RequestError> {
+        let mut fault = None;
+        for (walk, result) in ended {
+            let result = match self.close_walk(walk.sequence()) {
+                Ok(()) => result,
+                Err(error) => Err(fault.get_or_insert(error).clone()),
+            };
+            walk.answer(result);
+        }
+        fault.map_or(Ok(()), Err)
+    }
+
+    /// Close the sequences of walks termination answered: at an idle
+    /// boundary no flight holds them.
+    fn close_unclosed(&mut self) -> Result<(), RequestError> {
+        let Some(walks) = &mut self.scoring else {
+            return Ok(());
+        };
+        std::mem::take(&mut walks.unclosed).into_iter().try_for_each(|sequence| self.close_walk(sequence))
+    }
+
+    /// Close a walk's sequence: what it held is free, and what waits on
+    /// memory retries.
+    fn close_walk(&mut self, sequence: RequestId) -> Result<(), RequestError> {
+        self.domain.close(sequence).map_err(invariant("score walk"))?;
+        self.epoch.advance();
+        Ok(())
+    }
+
+    /// The load's walks: only a load that scores has scoring work.
+    fn walks_mut(&mut self) -> &mut Walks {
+        self.scoring.as_mut().expect("invariant violated: score walks of a load that scores none")
+    }
+}
+
+/// The rows of `walk` a flight forwarded from `first` on, on the host: the
+/// logits of each row the walk reads ([`Walk::reads`]). A read that fails,
+/// or a row other than the vocabulary's width, stops execution.
+fn host_rows(walk: &Walk, first: usize, rows: Vec<RowResult>, vocabulary: usize) -> Result<Vec<Option<Vec<f32>>>, RequestError> {
+    rows.into_iter()
+        .zip(first..)
+        .map(|(row, position)| match row.logits {
+            Some(logits) if walk.reads(position) => {
+                let read = logits
+                    .read_to_host()
+                    .map_err(|error| RequestError::Device(DeviceError::Transfer(format!("reading a logits row: {error}"))))?;
+                if read.len() != vocabulary {
+                    return Err(invariant("scoring flight")(format!(
+                        "a logits row has {} entries for a vocabulary of {vocabulary}",
+                        read.len()
+                    )));
+                }
+                Ok(Some(read))
+            }
+            _ => Ok(None),
+        })
+        .collect()
 }
 
 impl<F: ProgramFamily> MemoryHost for Service<F> {
@@ -3944,7 +4353,8 @@ impl<F: ProgramFamily> MemoryHost for Service<F> {
     /// Those that can be evicted now ([`Self::can_evict`]); a chain's
     /// holder between its chunks is kept: its eviction would conclude the
     /// chain (`ExecutorDomain::release_state`), dropping the chunks it has
-    /// already launched.
+    /// already launched. A score walk's sequence is never one: walks are
+    /// not requests, and only their own deferral closes them early.
     fn evictable(&self) -> BTreeSet<RequestId> {
         let holder = self.domain.chain_holder();
         self.requests.iter().filter(|(id, request)| Some(**id) != holder && Self::can_evict(request)).map(|(id, _)| *id).collect()
@@ -3962,6 +4372,23 @@ enum Selected {
     /// Selection started no work but changed some request's state.
     Retry,
     Empty,
+}
+
+/// What the idle pipeline takes next ([`Service::next_flight`]): what
+/// generation's selection came to, or a scoring flight's group, provisioned.
+enum Next {
+    Generation(Selected),
+    Scoring(OperationGroup),
+}
+
+/// What opening a walk's sequence came to ([`Service::open_walk`]).
+enum Opened {
+    Open,
+    /// Short of memory a change of ours will free: it opens once one comes.
+    Waits,
+    /// Nothing of ours can make room for it, or the domain refuses it: it
+    /// fails with this.
+    Refused(RequestError),
 }
 
 /// A disk entry a request opens from ([`Service::cold_restore`]): the saved
@@ -4358,7 +4785,7 @@ mod claim_tests {
     use magnitude_executor::fixtures;
     use magnitude_generation::{EndOfGeneration, InputLayout, MethodChoice, Options, Sampling, Shaping, TokenId};
 
-    struct NoWakes;
+    pub(super) struct NoWakes;
     impl Wakes for NoWakes {
         fn completion(&self) -> magnitude_executor::CompletionWake {
             magnitude_executor::CompletionWake::new(|| {})
@@ -4372,7 +4799,7 @@ mod claim_tests {
     /// Rounds of two rows, as the fixture's launches carry.
     const ROWS: usize = 2;
 
-    fn limits() -> ServiceLimits {
+    pub(super) fn limits() -> ServiceLimits {
         ServiceLimits {
             prefill_tokens: ROWS,
             decode_tokens: ROWS,
@@ -4436,13 +4863,13 @@ let Ok(residency) = service.make_resident(id, &mut record, generation, bindings)
 
     /// Take every byte the device's ledger would give new work now (its
     /// free room and the cache worth nothing) as a measurement's room.
-    fn take_room<F: ProgramFamily>(service: &mut Service<F>) {
+    pub(super) fn take_room<F: ProgramFamily>(service: &mut Service<F>) {
         leave_room(service, 0);
     }
 
     /// Leave `keep` bytes of what the device's ledger would give new work
     /// now, the rest taken as a measurement's room.
-    fn leave_room<F: ProgramFamily>(service: &mut Service<F>, keep: u64) {
+    pub(super) fn leave_room<F: ProgramFamily>(service: &mut Service<F>, keep: u64) {
         const PAST: u64 = u64::MAX / 4;
         service.domain.release_measurement_room();
         let room = match service.domain.claim_measurement_room(PAST) {
@@ -4737,5 +5164,429 @@ let Ok(residency) = service.make_resident(id, &mut record, generation, bindings)
         }
         let ids = admitted.iter().map(|(id, _)| *id).collect::<Vec<_>>();
         assert!(ids.windows(2).all(|pair| pair[0] < pair[1]), "unique and in admission order across loads: {ids:?}");
+    }
+}
+
+#[cfg(test)]
+mod scoring_tests {
+    use super::claim_tests::{NoWakes, leave_room, limits, take_room};
+    use super::*;
+    use crate::publication::Publication;
+    use crate::scoring::{SCORING_SEQUENCES, SCORING_WIDTH};
+    use magnitude_executor::fixtures;
+    use magnitude_generation::{EndOfGeneration, MethodChoice, Options, Sampling, Shaping, TokenId};
+    use std::sync::{Mutex, mpsc};
+    use std::task::{Context, Poll, Waker};
+
+    /// The fixture's context: room for every score and generation here.
+    const CONTEXT: u64 = 64;
+    /// The logits rows the exporting fixture exports a launch: its launch's.
+    const EXPORTED: usize = 4;
+    /// The tokens each generation here writes; its stream holds them all,
+    /// as no output credit reaches the owner.
+    const GENERATED: usize = 6;
+
+    /// An owner over a CPU load, run as the worker runs it, a millisecond a
+    /// run; the load's directory is removed once the owner is dropped.
+    struct Served {
+        owner: Option<Owner>,
+        now: u64,
+        directory: PathBuf,
+        vocabulary: usize,
+    }
+
+    impl Served {
+        /// An owner over the planning fixture's decoder exporting up to
+        /// `exported` rows of logits a launch.
+        fn new(test: &str, exported: usize) -> Self {
+            Self::chaining(test, 1, exported)
+        }
+
+        /// [`Self::new`], its prompt groups chaining up to `chain_capacity`
+        /// chunks.
+        fn chaining(test: &str, chain_capacity: usize, exported: usize) -> Self {
+            let (directory, definition, domain, bindings) = fixtures::loaded::exporting(test, CONTEXT, chain_capacity, exported);
+            let owner = Owner::new(domain, bindings, limits(), Arc::new(NoWakes)).unwrap();
+            Self { owner: Some(owner), now: 0, directory, vocabulary: definition.decoder.vocabulary as usize }
+        }
+
+        fn owner(&mut self) -> &mut Owner {
+            self.owner.as_mut().expect("the owner is between runs")
+        }
+
+        fn walks(&mut self) -> &Walks {
+            self.owner().service.scoring.as_ref().expect("the load scores")
+        }
+
+        fn run(&mut self) -> Ran {
+            let owner = self.owner.take().expect("the owner is between runs");
+            let (owner, ran) = owner.run(self.now).unwrap_or_else(|error| panic!("the owner stopped: {error}"));
+            self.owner = Some(owner);
+            self.now += 1_000_000;
+            ran
+        }
+
+        /// Run the owner until `done` holds.
+        fn until(&mut self, mut done: impl FnMut(&mut Self) -> bool) {
+            for _ in 0..10_000 {
+                if done(self) {
+                    return;
+                }
+                self.run();
+            }
+            panic!("the owner never settled");
+        }
+
+        /// `count` tokens within the vocabulary, varied by `salt`.
+        fn tokens(&self, count: usize, salt: usize) -> Vec<u32> {
+            (0..count).map(|index| ((index * 37 + salt * 11 + 5) % self.vocabulary) as u32).collect()
+        }
+
+        fn score(&mut self, tokens: &[u32], top: bool, next: bool) -> Answer {
+            let (sender, receiver) = mpsc::channel();
+            let request = ScoreRequest {
+                tokens: tokens.iter().copied().map(TokenId).collect(),
+                top,
+                next,
+                done: Box::new(move |outcome| sender.send(outcome).unwrap()),
+            };
+            let now = self.now;
+            self.owner().score(request, now);
+            Answer { receiver, answer: None }
+        }
+
+        /// The score `answer` comes to, the owner run until it is answered.
+        fn answered(&mut self, mut answer: Answer) -> ScoreOutcome {
+            self.until(|_| answer.poll());
+            answer.outcome()
+        }
+
+        /// Admit a generation of `GENERATED` tokens after a prompt of
+        /// `prompt` tokens, greedy, or sampled at temperature 1 within the
+        /// top 0.9.
+        fn admit(&mut self, prompt: usize, sampled: bool) -> Stream {
+            let (sampling, shaping) = match sampled {
+                false => (Sampling::Greedy, Shaping { temperature: 0.0, ..Default::default() }),
+                true => (Sampling::Categorical, Shaping { temperature: 1.0, top_p: 0.9, ..Default::default() }),
+            };
+            let prompt = self.tokens(prompt, 1).into_iter().map(TokenId).collect::<Vec<_>>();
+            let options = Options {
+                max_tokens: GENERATED,
+                output_capacity: GENERATED,
+                context_limit: CONTEXT as usize,
+                vocabulary: self.vocabulary,
+                stop_tokens: BTreeSet::new(),
+                suppressed_tokens: BTreeSet::new(),
+                sampling,
+                shaping,
+                seed: 7,
+                forced_quantum: 0,
+                method: MethodChoice::Plain,
+                end_of_generation: EndOfGeneration::Stop,
+                reasoning_budget: None,
+            };
+            let generation = Generation::new(prompt.clone(), InputLayout::new(prompt.len(), vec![]).unwrap(), options, None).unwrap();
+            let now = self.now;
+            let (_, receiver) = self
+                .owner()
+                .admit(generation, PreparedModelInput::continuation_only(), PrefixRetention::Transient, GENERATED, now)
+                .unwrap();
+            Stream { prompt, receiver, tokens: Vec::new(), end: None }
+        }
+    }
+
+    impl Drop for Served {
+        fn drop(&mut self) {
+            self.owner.take();
+            std::fs::remove_dir_all(&self.directory).ok();
+        }
+    }
+
+    /// A score's callback, as its host receives it.
+    struct Answer {
+        receiver: mpsc::Receiver<Result<ScoreOutcome, RequestError>>,
+        answer: Option<Result<ScoreOutcome, RequestError>>,
+    }
+
+    impl Answer {
+        /// Whether it is answered.
+        fn poll(&mut self) -> bool {
+            if self.answer.is_none() {
+                self.answer = self.receiver.try_recv().ok();
+            }
+            self.answer.is_some()
+        }
+
+        /// Its answer, the one its callback gave: no second follows.
+        fn result(mut self) -> Result<ScoreOutcome, RequestError> {
+            assert!(self.poll(), "the score is answered");
+            assert!(matches!(self.receiver.try_recv(), Err(mpsc::TryRecvError::Disconnected)), "a score is answered once");
+            self.answer.take().unwrap()
+        }
+
+        fn outcome(self) -> ScoreOutcome {
+            self.result().unwrap_or_else(|error| panic!("the score failed: {error}"))
+        }
+    }
+
+    /// A generation's prompt, the tokens its stream published, and its end.
+    struct Stream {
+        prompt: Vec<TokenId>,
+        receiver: PublicationReceiver,
+        tokens: Vec<TokenId>,
+        end: Option<Result<FinishReason, RequestError>>,
+    }
+
+    impl Stream {
+        /// Take what the stream published; whether it ended.
+        fn poll(&mut self) -> bool {
+            while self.end.is_none() {
+                match self.receiver.poll_next(&mut Context::from_waker(Waker::noop())) {
+                    Poll::Ready(Some(Publication::Output(output))) => self.tokens.extend(output.iter().map(|output| output.token)),
+                    Poll::Ready(Some(Publication::Completed { finish, .. })) => self.end = Some(Ok(finish)),
+                    Poll::Ready(Some(Publication::Failed(error))) => self.end = Some(Err(error)),
+                    Poll::Ready(None) => panic!("a stream ends with a terminal publication"),
+                    Poll::Pending => break,
+                }
+            }
+            self.end.is_some()
+        }
+    }
+
+    /// A score of n tokens on an idle owner gives n - 1 positions, each a
+    /// log-probability and a rank, the top token where it differs and the
+    /// next token where asked; the same tokens score the same again. Its
+    /// walk is no request's: no status names it, and no relief evicts it.
+    #[test]
+    fn a_score_on_an_idle_owner_scores_every_token_after_the_first() {
+        let mut served = Served::new("score-on-an-idle-owner", EXPORTED);
+        let tokens = served.tokens(7, 0);
+        let first = served.score(&tokens, true, true);
+        assert!(served.run().in_flight, "the score's first flight is submitted");
+        let walk = served.walks().active.first().map(Walk::sequence).expect("the score's walk is open");
+        assert!(served.owner().snapshot(walk).is_none(), "no status names a walk");
+        assert!(!MemoryHost::evictable(&served.owner().service).contains(&walk), "no relief evicts a walk");
+        let first = served.answered(first);
+        assert_eq!(first.positions.len(), tokens.len() - 1);
+        for position in &first.positions {
+            assert!(position.logprob <= 0.0 && position.rank >= 1, "{position:?}");
+            if let Some(top) = position.top {
+                assert!(top.logprob >= position.logprob && position.rank > 1, "{position:?}");
+            }
+        }
+        assert!(first.next.is_some(), "the next token was asked for");
+        let again = served.score(&tokens, true, true);
+        assert_eq!(served.answered(again), first, "the same tokens score the same");
+        assert!(served.walks().active.is_empty() && served.walks().unclosed.is_empty());
+        let closed = served.owner().inspect_domain(|domain| Ok(!domain.holds_state_beside(&BTreeSet::new()))).unwrap();
+        assert!(closed, "an answered walk's sequence is closed");
+    }
+
+    /// A score submitted while a greedy request decodes, and one beside a
+    /// sampled request, complete in launches of their own, a round and a
+    /// scoring flight in turn: each request's tokens are those it generates
+    /// alone. A score of the greedy request's prompt and output ranks each
+    /// token it generated first, and names the last as the next.
+    #[test]
+    fn scores_beside_greedy_and_sampled_generation_leave_their_tokens_unchanged() {
+        let mut served = Served::new("scores-beside-generation", EXPORTED);
+        for sampled in [false, true] {
+            let mut alone = served.admit(5, sampled);
+            served.until(|_| alone.poll());
+            assert_eq!(alone.end, Some(Ok(FinishReason::Length)));
+            assert_eq!(alone.tokens.len(), GENERATED);
+            let mut beside = served.admit(5, sampled);
+            served.until(|_| {
+                beside.poll();
+                !beside.tokens.is_empty()
+            });
+            assert!(beside.end.is_none(), "the request decodes as the score arrives");
+            let tokens = served.tokens(9, 2);
+            let mut score = served.score(&tokens, false, true);
+            // Whether each flight while both have work is a scoring one.
+            let mut flights = Vec::new();
+            served.until(|served| {
+                let (ended, answered) = (beside.poll(), score.poll());
+                if !ended && !answered {
+                    flights.push(matches!(served.owner().pipeline, Pipeline::Scoring(_)));
+                }
+                ended && answered
+            });
+            assert!(flights.contains(&true) && flights.windows(2).all(|pair| pair[0] != pair[1]), "rounds and scoring flights take turns: {flights:?}");
+            assert_eq!(beside.end, Some(Ok(FinishReason::Length)));
+            assert_eq!(beside.tokens, alone.tokens, "sampled {sampled}: generation beside a score is unchanged");
+            assert_eq!(score.outcome().positions.len(), tokens.len() - 1);
+            if sampled {
+                continue;
+            }
+            let written = alone.prompt.iter().chain(&alone.tokens[..GENERATED - 1]).map(|token| token.0).collect::<Vec<_>>();
+            let scored = served.score(&written, false, true);
+            let scored = served.answered(scored);
+            let ranks = scored.positions[alone.prompt.len() - 1..].iter().map(|position| position.rank).collect::<Vec<_>>();
+            assert_eq!(ranks, vec![1; GENERATED - 1], "each greedy token is its row's most likely");
+            assert_eq!(scored.next, alone.tokens.last().copied(), "the next token is the greedy one");
+        }
+    }
+
+    /// More scores than a flight walks wait in arrival order and complete,
+    /// each answered once; scores of equal length are answered as they
+    /// arrived, and no more walks than a flight's are ever open.
+    #[test]
+    fn more_scores_than_walk_at_once_each_complete_once_in_arrival_order() {
+        let mut served = Served::new("more-scores-than-walk", EXPORTED);
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let answers = (0..SCORING_SEQUENCES + 2)
+            .map(|index| {
+                let (sender, receiver) = mpsc::channel();
+                let order = Arc::clone(&order);
+                let request = ScoreRequest {
+                    tokens: served.tokens(5, index).into_iter().map(TokenId).collect(),
+                    top: false,
+                    next: false,
+                    done: Box::new(move |outcome| {
+                        order.lock().unwrap().push(index);
+                        sender.send(outcome).unwrap()
+                    }),
+                };
+                let now = served.now;
+                served.owner().score(request, now);
+                Answer { receiver, answer: None }
+            })
+            .collect::<Vec<_>>();
+        let sequences = served.walks().shape.sequences;
+        served.until(|served| {
+            assert!(served.walks().active.len() <= sequences, "at most a flight's walks are open");
+            order.lock().unwrap().len() == answers.len()
+        });
+        assert_eq!(*order.lock().unwrap(), (0..answers.len()).collect::<Vec<_>>());
+        for answer in answers {
+            assert_eq!(answer.outcome().positions.len(), 4);
+        }
+    }
+
+    /// A score over several flights scores each row as its prefix's score
+    /// does: the walk's flights concatenate.
+    #[test]
+    fn a_score_over_several_flights_agrees_with_its_prefix() {
+        let mut served = Served::new("score-over-several-flights", EXPORTED);
+        let prefix = SCORING_WIDTH + 2;
+        let long = served.tokens(prefix + 3, 3);
+        assert!(long.len() > 2 * served.walks().shape.width, "the long score takes several flights");
+        let (whole, part) = (served.score(&long, true, true), served.score(&long[..prefix], true, true));
+        let (whole, part) = (served.answered(whole), served.answered(part));
+        assert_eq!(whole.positions.len(), long.len() - 1);
+        assert_eq!(part.positions.len(), prefix - 1);
+        for (index, (whole, part)) in whole.positions.iter().zip(&part.positions).enumerate() {
+            assert_eq!((whole.rank, whole.top.map(|top| top.token)), (part.rank, part.top.map(|top| top.token)), "position {index}");
+            assert!((whole.logprob - part.logprob).abs() < 1e-5, "position {index}: {} and {}", whole.logprob, part.logprob);
+        }
+    }
+
+    /// Termination answers every waiting and open score once, with its
+    /// error; the flight its walks were in reconciles, and every walk's
+    /// sequence closes.
+    #[test]
+    fn terminate_all_answers_waiting_and_active_scores_once() {
+        let mut served = Served::new("terminate-scores", EXPORTED);
+        let shape = served.walks().shape;
+        let answers = (0..shape.sequences + 2)
+            .map(|index| {
+                let tokens = served.tokens(3 * shape.width + 1, index);
+                served.score(&tokens, false, false)
+            })
+            .collect::<Vec<_>>();
+        assert!(served.run().in_flight, "a scoring flight is out");
+        assert!(matches!(served.owner().pipeline, Pipeline::Scoring(_)));
+        assert_eq!((served.walks().active.len(), served.walks().waiting.len()), (shape.sequences, 2));
+        served.owner().terminate_all(RequestError::WorkerClosed);
+        for answer in answers {
+            assert_eq!(answer.result(), Err(RequestError::WorkerClosed));
+        }
+        served.until(|served| !served.run().in_flight);
+        served.run();
+        let closed = served.owner().inspect_domain(|domain| Ok(!domain.holds_state_beside(&BTreeSet::new()))).unwrap();
+        assert!(closed, "every walk's sequence closed");
+        assert!(served.walks().unclosed.is_empty());
+    }
+
+    /// With room beside the load for one walk's open, two walks open (the
+    /// first in the load's request slot) and their flight's export slot does
+    /// not fit: the newest walk is deferred, its progress dropped, and the
+    /// room its open held lets the first fly alone. The deferred walk opens
+    /// again past that flight's boundary, and both complete.
+    #[test]
+    fn a_flight_short_of_memory_defers_its_newest_walk() {
+        let mut served = Served::new("score-defers-its-newest-walk", EXPORTED);
+        let tokens = [served.tokens(5, 1), served.tokens(5, 2)];
+        let open = {
+            let domain = &served.owner().service.domain;
+            fixtures::reserved_bytes(domain, fixtures::opening_rows(domain, 5))
+        };
+        leave_room(&mut served.owner().service, open);
+        let mut answers = tokens.map(|tokens| served.score(&tokens, false, false));
+        assert!(served.run().in_flight, "a flight is out");
+        let walks = served.walks();
+        assert_eq!((walks.active.len(), walks.waiting.len()), (1, 1), "the newest walk is deferred");
+        assert!(walks.waits.is_some(), "it opens again only past a change of ours");
+        served.until(|_| answers.iter_mut().all(Answer::poll));
+        for answer in answers {
+            assert_eq!(answer.outcome().positions.len(), 4);
+        }
+    }
+
+    /// Scoring takes no turn while a prompt chain runs, whose chunks any
+    /// other group's provisioning would conclude: a score arriving mid-chain
+    /// walks once the chain ends, and both complete.
+    #[test]
+    fn a_score_takes_no_turn_while_a_prompt_chain_runs() {
+        let mut served = Served::chaining("score-beside-a-chain", 3, EXPORTED);
+        let mut chained = served.admit(16, false);
+        served.until(|served| served.owner().service.domain.chain_holder().is_some());
+        let tokens = served.tokens(5, 5);
+        let mut score = served.score(&tokens, false, false);
+        let mut chained_flights = 0;
+        served.until(|served| {
+            let owner = served.owner();
+            let chain = owner.service.domain.chain_holder().is_some();
+            assert!(!(chain && matches!(owner.pipeline, Pipeline::Scoring(_))), "a scoring flight runs while a chain is under way");
+            chained_flights += usize::from(chain && !score.poll());
+            chained.poll() & score.poll()
+        });
+        assert!(chained_flights > 0, "the score arrived mid-chain");
+        assert_eq!(chained.end, Some(Ok(FinishReason::Length)));
+        assert_eq!(score.outcome().positions.len(), tokens.len() - 1);
+    }
+
+    /// A load that exports no logits refuses a score at once, as invalid.
+    #[test]
+    fn an_owner_exporting_no_logits_refuses_a_score_at_once() {
+        let mut served = Served::new("score-without-logits", 0);
+        assert!(served.owner().service.scoring.is_none());
+        let mut answer = served.score(&[1, 2, 3], false, true);
+        assert!(answer.poll(), "answered before any run");
+        assert!(matches!(answer.result(), Err(RequestError::Input(_))));
+    }
+
+    /// With every byte of room taken, a score whose flight cannot fit even
+    /// alone fails with the shortage, one score at a time, the owner never
+    /// stopping; once the room is free the next score completes.
+    #[test]
+    fn a_score_that_cannot_fit_alone_fails_with_the_shortage() {
+        let mut served = Served::new("score-short-alone", EXPORTED);
+        take_room(&mut served.owner().service);
+        let tokens = served.tokens(5, 4);
+        let mut answers = [served.score(&tokens, false, false), served.score(&tokens, false, false)];
+        // The first walk opens in the load's request slot, and the second's
+        // open waits beside it; the first fails alone, and the second opens
+        // in its place within the same run, no event needed to wake it.
+        served.run();
+        assert!(answers.iter_mut().all(Answer::poll), "both fail within one run");
+        for answer in answers {
+            let failed = answer.result();
+            assert!(matches!(failed, Err(RequestError::Capacity(_))), "{failed:?}");
+        }
+        served.owner().service.domain.release_measurement_room();
+        let next = served.score(&tokens, false, false);
+        assert_eq!(served.answered(next).positions.len(), tokens.len() - 1);
     }
 }

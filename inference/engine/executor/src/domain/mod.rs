@@ -2823,6 +2823,14 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     pub fn resource_identity(&self) -> &ResourceDomainId {
         self.domain.id()
     }
+    /// The service bounds the load was planned for.
+    pub fn limits(&self) -> crate::ResourceLimits {
+        self.execution.policy().limits()
+    }
+    /// The model the load serves, at the context it was planned for.
+    pub fn definition(&self) -> &ModelDefinition {
+        &self.definition
+    }
     pub fn execution_path(&self) -> crate::ExecutionPath {
         self.execution.policy().path()
     }

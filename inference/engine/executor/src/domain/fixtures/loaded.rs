@@ -3,7 +3,7 @@
 //! first work. Test-only: what tests of real steps, and an owner over a
 //! real domain, run on.
 // Most of it is the executor's own tests'; the `fixtures` feature serves
-// only [`drafted`], [`plain`] and [`chaining`] above.
+// only [`drafted`], [`plain`], [`chaining`] and [`exporting`] above.
 #![cfg_attr(not(test), allow(dead_code))]
 
 use crate::planning::fixtures::{qwen4exp_fixture_definition, stored_table_manifest};
@@ -76,6 +76,22 @@ pub fn chaining(
     Box<ExecutorDomain>,
     crate::StateBindings,
 ) {
+    exporting(test, context, chain_capacity, 0)
+}
+
+/// [`chaining`], exporting up to `logits` rows of logits a launch: what an
+/// owner's tests of scoring beside generation run on.
+pub fn exporting(
+    test: &str,
+    context: u64,
+    chain_capacity: usize,
+    logits: usize,
+) -> (
+    std::path::PathBuf,
+    Rc<ModelDefinition>,
+    Box<ExecutorDomain>,
+    crate::StateBindings,
+) {
     let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
     let mut definition = crate::planning::fixtures::fixture_definition();
     definition.decoder.context_limit = context;
@@ -85,7 +101,7 @@ pub fn chaining(
         definition: &definition,
         package: &package,
         backend: seismic::BackendName::Cpu,
-        limits: limits(4, false, chain_capacity, 0),
+        limits: limits(4, false, chain_capacity, logits),
         banked: Banked::Resident,
         method: PlannedMethod::Plain,
         codec: KvCodec::Dense,
