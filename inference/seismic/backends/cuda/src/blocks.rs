@@ -194,6 +194,11 @@ impl Range {
         self.bytes
     }
 
+    /// The bytes carved for its allocation's entry from its block's.
+    pub(crate) fn charged(&self) -> u64 {
+        self.carved.as_ref().expect("invariant violated: a live range holds its carve").bytes()
+    }
+
     /// Precondition (this crate's own): the bytes lie within the range.
     pub(crate) fn upload_at(&self, offset: usize, bytes: &[u8]) -> Result<(), DriverError> {
         self.assert_within(offset, bytes.len(), "upload_at");
@@ -230,6 +235,11 @@ impl DeviceBlock {
 
     pub(crate) fn bytes(&self) -> u64 {
         self.backed.bytes as u64
+    }
+
+    /// Its whole allocation granules, charged to its entry.
+    pub(crate) fn charged(&self) -> u64 {
+        self.backed.charge().bytes()
     }
 
     /// Precondition (this crate's own): the bytes lie within the block.

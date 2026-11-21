@@ -1577,6 +1577,13 @@ pub trait DeviceService<T: seismic_native_target::TargetFamily>: Send + Sync + '
         alignment: u64,
         entry: &std::sync::Arc<dyn seismic_memory::entry::Entry>,
     ) -> Result<Self::Writable, ExecutionError>;
+    /// The bytes `buffer` holds charged to the entry it was allocated
+    /// through ([`Self::allocate`], or a backend's pool block): what the
+    /// entry was charged for it, the backing's rounding included, and is
+    /// freed of as it drops; a range of a block shared with others, the
+    /// bytes it takes of the block. The one figure of what the buffer
+    /// costs, which every report of its charge reads.
+    fn charged_bytes(&self, buffer: &Self::Writable) -> u64;
     fn write(&self, buffer: &Self::Writable, offset: u64, bytes: &[u8])
         -> Result<(), ExecutionError>;
     fn read(
@@ -2735,6 +2742,9 @@ mod allocation_size_tests {
             _: u64,
             _: &Arc<dyn seismic_memory::entry::Entry>,
         ) -> Result<(), ExecutionError> {
+            unreachable!()
+        }
+        fn charged_bytes(&self, _: &()) -> u64 {
             unreachable!()
         }
         fn write(&self, _: &(), _: u64, _: &[u8]) -> Result<(), ExecutionError> {

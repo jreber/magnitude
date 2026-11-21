@@ -804,11 +804,16 @@ fn a_bank_holds_its_stored_table_in_granule_records() {
     assert_eq!(held.record_table_entries().unwrap(), records);
     let ported = banked.clone().with_record_ports(seismic::BackendName::Cuda);
     assert_eq!(ported.weight_device_allocations(held).unwrap(), Vec::<u64>::new(), "banked stored table's slot table is host-shared, not device-only");
-    let directory = held.storage_bytes().unwrap() - held.resident_bytes;
+    // Its directory and slot address table are host-shared: CUDA's pinned
+    // host memory, each allocation charged whole host pages.
+    let shared = |bytes| seismic::allocation_charge(seismic::BackendName::Cuda, seismic::Contract::Shared, bytes);
+    let [directory, staging, landed, notice] = held.streamed_bytes().unwrap();
+    assert_eq!(held.storage_bytes().unwrap() - held.resident_bytes, directory + staging + landed + notice);
     let slot_table = seismic::record_table_bytes(records).unwrap();
+    let planned = [directory, staging, landed, notice, slot_table].into_iter().filter(|bytes| *bytes > 0).map(shared).sum::<u64>();
     assert_eq!(
         ported.weight_storage_bytes(held).unwrap(),
-        held.resident_bytes + directory + slot_table,
+        held.resident_bytes + planned,
         "planned storage bytes include the banked stored table's host-shared slot address table"
     );
     assert_eq!(banked.clone().unbanked().target(), resident.target());

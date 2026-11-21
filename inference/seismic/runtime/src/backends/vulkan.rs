@@ -132,6 +132,9 @@ impl Storage for VulkanStorage {
     fn host_address(&self) -> Option<std::ptr::NonNull<u8>> {
         self.buffer.host_address()
     }
+    fn charged(&self) -> u64 {
+        self.buffer.charged()
+    }
 }
 
 /// The device address of byte `offset` of a Vulkan allocation.

@@ -67,6 +67,11 @@ pub(crate) struct Registered {
 }
 
 impl RegisteredBlock {
+    /// Its whole registration granules, charged to its entry.
+    pub(crate) fn charged(&self) -> u64 {
+        self.0.charge().bytes()
+    }
+
     /// At least `bytes`, in whole registration granules
     /// (`seismic_memory::registration_granule`, a large page where the
     /// host has them), charged to `entry` before it is backed.

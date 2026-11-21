@@ -1045,6 +1045,19 @@ impl Buffer {
         self.range.bytes()
     }
 
+    /// The bytes its allocation's entry is charged for it, freed from it as
+    /// it drops: a pool range's bytes carved from its block, or a block of
+    /// its own's whole charge (its whole words and the driver's rounding).
+    pub fn charged(&self) -> u64 {
+        match &self.carved {
+            Some(carved) => carved.bytes(),
+            None => match &self.range.block.held {
+                Held::Charged(charge) => charge.bytes(),
+                Held::Driver => panic!("invariant violated: a buffer over a block the driver holds"),
+            },
+        }
+    }
+
     /// The kind the allocation lies in: its block's memory type, the one of
     /// the kinds it was asked for that it landed on.
     pub fn kind(&self) -> u32 {

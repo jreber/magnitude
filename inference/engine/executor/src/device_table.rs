@@ -85,7 +85,7 @@ impl ResidentTable {
         }
     }
 
-    /// What a table allocates beside its slots and its stagings
+    /// What a table is charged beside its slots and its stagings
     /// ([`Self::staging_bytes`]): a streamed table's directory, landing
     /// staging and notice, or a stored table's directory
     /// (`WeightPlan::streamed_bytes` holds these and the stagings).
@@ -93,19 +93,19 @@ impl ResidentTable {
         match self {
             Self::Whole => 0,
             Self::Streamed(table) => {
-                table.shared.directory.storage_bytes()
-                    + table.shared.landing_staging.storage_bytes()
-                    + table.shared.notice.storage_bytes()
+                table.shared.directory.charged_bytes()
+                    + table.shared.landing_staging.charged_bytes()
+                    + table.shared.notice.charged_bytes()
             }
             Self::Stored(table) => table.directory_bytes(),
         }
     }
 
-    /// The stagings a streamed table holds now, for the class of places it
-    /// serves (`DeviceTable::hold_places`).
+    /// What the stagings a streamed table holds now are charged, for the
+    /// class of places it serves (`DeviceTable::hold_places`).
     pub fn staging_bytes(&self) -> u64 {
         match self {
-            Self::Streamed(table) => table.staging.borrow().values().map(seismic::Tensor::storage_bytes).sum(),
+            Self::Streamed(table) => table.staging.borrow().values().map(seismic::Tensor::charged_bytes).sum(),
             Self::Whole | Self::Stored(_) => 0,
         }
     }
@@ -640,14 +640,15 @@ impl DeviceTable {
             .expect("a release makes no staging");
     }
 
-    /// The bytes of the stagings a class of `places` places holds
-    /// ([`Self::hold_places`]).
+    /// What the stagings a class of `places` places holds are charged
+    /// ([`Self::hold_places`]): each an allocation of its own, charged by its
+    /// device's rule (`seismic::allocation_charge`).
     pub fn staging_bytes(&self, places: usize) -> Result<u64, String> {
         let shape = std::iter::once(self.staging_rows)
             .chain(self.slots.extents()[1..].iter().copied())
             .collect::<Vec<_>>();
         let entry = self.stored.canonical_byte_len(&shape).map_err(|error| format!("device table staging: {error}"))?;
-        entry
+        seismic::allocation_charge(self.slots.device().backend(), seismic::Contract::DeviceOnly, entry)
             .checked_mul(self.flights.stagings(places) as u64)
             .ok_or_else(|| "device table staging bytes overflow".to_owned())
     }

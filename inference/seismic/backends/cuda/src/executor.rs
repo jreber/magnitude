@@ -266,6 +266,9 @@ impl DeviceService<Cuda> for Device {
             kind => panic!("invariant violated: CUDA has no memory kind {kind}"),
         }
     }
+    fn charged_bytes(&self, buffer: &Buffer) -> u64 {
+        buffer.charged()
+    }
     fn write(&self, buffer: &Buffer, offset: u64, bytes: &[u8]) -> Result<(), ExecutionError> {
         let offset = usize::try_from(offset)
             .unwrap_or_else(|_| panic!("prepared CUDA upload offset exceeds usize"));

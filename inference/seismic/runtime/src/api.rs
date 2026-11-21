@@ -3152,6 +3152,34 @@ pub mod tensor {
             assert_eq!(view.observe_storage().charged_bytes(), Some(128));
         }
 
+        /// An allocation reports the charge its backing took, its rounding
+        /// included, never the bytes it asked for: the ledger rises by it
+        /// as the allocation is made and falls by it as it is released, so
+        /// a release counted from the report is what the ledger freed. A
+        /// size past the CPU's carved buffers and short of a whole page
+        /// rounds on the CPU (whole host pages) and on Metal (its size
+        /// class), each checked where the host opens it.
+        #[test]
+        fn an_allocation_reports_the_charge_its_release_frees() {
+            let devices = crate::devices::Devices::discover(&[]).unwrap();
+            let bytes = (1 << 20) + 100;
+            for backend in [registry::BackendName::Cpu, registry::BackendName::Metal] {
+                let device = match devices.open_backend(backend) {
+                    Ok(device) => device,
+                    Err(_) if !(backend == registry::BackendName::Cpu || cfg!(target_os = "macos")) => continue,
+                    Err(error) => panic!("the host opens {backend:?}: {error:?}"),
+                };
+                let before = device.allocated();
+                let allocation = crate::memory::Charges::tally(&device).allocate(bytes, 256).unwrap();
+                let charged = device.allocated() - before;
+                assert!(charged > bytes, "{backend:?} took {charged} bytes for {bytes}");
+                assert_eq!(allocation.charged_bytes(), charged, "{backend:?}");
+                assert_eq!(allocation.path_charges().iter().map(|(_, bytes)| bytes).sum::<u64>(), charged, "{backend:?}");
+                drop(allocation);
+                assert_eq!(device.allocated(), before, "{backend:?}");
+            }
+        }
+
         /// A view's bytes are attributed from its storage's own bytes alone:
         /// the record tables the storage holds lie elsewhere, so a range
         /// past the storage reaches past its charge however many it holds.

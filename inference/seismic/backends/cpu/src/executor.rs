@@ -39,6 +39,10 @@ impl DeviceService<Cpu> for Device {
         WritableBuffer::new(bytes, alignment, entry)
     }
 
+    fn charged_bytes(&self, buffer: &WritableBuffer) -> u64 {
+        buffer.charged()
+    }
+
     fn write(&self, buffer: &WritableBuffer, offset: u64, bytes: &[u8]) -> Result<(), ExecutionError> {
         buffer.write(offset, bytes);
         Ok(())

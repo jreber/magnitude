@@ -1142,6 +1142,11 @@ unsafe impl Send for HostNode {}
 unsafe impl Sync for HostNode {}
 
 impl HostNodeBlock {
+    /// Its whole allocation granules, charged to its entry.
+    pub(crate) fn charged(&self) -> u64 {
+        self.0.charge().bytes()
+    }
+
     pub fn new(
         context: &Arc<Context>,
         entry: &Arc<dyn Entry>,
@@ -1873,6 +1878,11 @@ impl std::ops::Deref for HostMapped {
 }
 
 impl HostMapped {
+    /// Its whole host pages, charged to its entry.
+    pub(crate) fn charged(&self) -> u64 {
+        self.0.charge().bytes()
+    }
+
     /// Mapped host memory of `bytes`, its whole host pages charged to
     /// `entry`.
     pub fn new(
@@ -1880,7 +1890,7 @@ impl HostMapped {
         entry: &Arc<dyn Entry>,
         bytes: usize,
     ) -> Result<Self, seismic_compiler::errors::ExecutionError> {
-        Backed::take(entry, host_pages_of(bytes)?, Wiring::Pageable, |_| Mapped::allocate(context, bytes)).map(Self)
+        Backed::take(entry, seismic_compiler::charge::host_pages(bytes as u64), Wiring::Pageable, |_| Mapped::allocate(context, bytes)).map(Self)
     }
 }
 
@@ -1985,16 +1995,6 @@ impl Drop for Mapped {
     }
 }
 
-/// The bytes a pinned host allocation of `bytes` takes: whole host pages,
-/// which the driver pins.
-fn host_pages_of(bytes: usize) -> Result<u64, seismic_compiler::errors::ExecutionError> {
-    let page = seismic_memory::host_page()
-        .map_err(|error| seismic_compiler::errors::ExecutionError::AllocationFailed(format!("the host page: {error}")))?;
-    (bytes.max(1) as u64)
-        .checked_next_multiple_of(page)
-        .ok_or_else(|| seismic_compiler::errors::ExecutionError::AllocationFailed("a pinned host allocation overflows".into()))
-}
-
 /// Pinned host staging retained until every asynchronous upload that reads
 /// it has completed on the submission stream, with its bytes charged:
 /// allocated and freed inside the change that records them ([`Backed`]).
@@ -2022,7 +2022,7 @@ impl PinnedUpload {
         entry: &Arc<dyn Entry>,
         bytes: usize,
     ) -> Result<Self, seismic_compiler::errors::ExecutionError> {
-        Backed::take(entry, host_pages_of(bytes)?, Wiring::Pageable, |_| Pinned::allocate(context, bytes)).map(Self)
+        Backed::take(entry, seismic_compiler::charge::host_pages(bytes as u64), Wiring::Pageable, |_| Pinned::allocate(context, bytes)).map(Self)
     }
 }
 

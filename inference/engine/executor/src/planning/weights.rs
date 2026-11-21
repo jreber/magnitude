@@ -481,12 +481,17 @@ impl WeightPlan {
     /// `DeviceTable::hold_places`); none of a weight held whole or a stored
     /// table.
     pub fn staging_bytes(&self, places: usize) -> Result<u64, String> {
+        let (each, count) = self.stagings(places)?;
+        each.checked_mul(count).ok_or_else(|| "a streamed table's stagings overflow".to_owned())
+    }
+
+    /// [`Self::staging_bytes`] by allocation: one staging's bytes and how
+    /// many a class of `places` places holds, each an allocation of its own.
+    pub fn stagings(&self, places: usize) -> Result<(u64, u64), String> {
         let Some(StreamedRows { fill: TableFill::Imported(flights), staging_rows, .. }) = self.streamed() else {
-            return Ok(0);
+            return Ok((0, 0));
         };
-        representation_bytes(self.upload, &self.table_rows_shape(staging_rows))?
-            .checked_mul(flights.stagings(places) as u64)
-            .ok_or_else(|| "a streamed table's stagings overflow".to_owned())
+        Ok((representation_bytes(self.upload, &self.table_rows_shape(staging_rows))?, flights.stagings(places) as u64))
     }
 
     /// Every resident byte of the weight: its representation, its scale, its
@@ -1983,7 +1988,8 @@ pub struct ModelLoadPlan {
     /// The backend whose native import entries write the weights through
     /// record ports (`with_record_ports`), which on a backend that binds
     /// record tables leaves each imported weight's storage holding one
-    /// (`WeightPlan::record_table_entries`); none of a load no native
+    /// (`WeightPlan::record_table_entries`), into allocations it charges by
+    /// its rule (`seismic::allocation_charge`); none of a load no native
     /// entry imports.
     pub(super) record_ports: Option<seismic::BackendName>,
     /// Whether the load traces its routes: any expert bank it streams
@@ -2869,12 +2875,32 @@ impl ModelLoadPlan {
 
     /// The load as `backend`'s native import entries import it: through
     /// record ports, whose tables its weights' storage holds where the
-    /// backend binds them.
+    /// backend binds them, into allocations `backend` charges.
     pub fn with_record_ports(self, backend: seismic::BackendName) -> Self {
         Self {
             record_ports: Some(backend),
             ..self
         }
+    }
+
+    /// What one allocation of `bytes` of `contract` is charged: what the
+    /// load's native backend's allocator takes for it
+    /// (`seismic::allocation_charge`), the one rule the ledger is charged
+    /// by; its bytes where no native entry imports the load. None for none.
+    fn charge(&self, contract: seismic::Contract, bytes: u64) -> u64 {
+        match (self.record_ports, bytes) {
+            (_, 0) => 0,
+            (Some(backend), bytes) => seismic::allocation_charge(backend, contract, bytes),
+            (None, bytes) => bytes,
+        }
+    }
+
+    /// The charges of `allocations` of `contract` ([`Self::charge`]).
+    fn charges(&self, contract: seismic::Contract, allocations: impl IntoIterator<Item = u64>) -> Result<u64, String> {
+        allocations
+            .into_iter()
+            .try_fold(0u64, |total, bytes| total.checked_add(self.charge(contract, bytes)))
+            .ok_or_else(|| format!("{contract:?} weight storage overflows"))
     }
 
     /// Every byte `weight`, one of this load's, holds: its allocations
@@ -2886,39 +2912,38 @@ impl ModelLoadPlan {
     }
 
     /// A weight's physical demand ([`Self::weight_storage_bytes`]) by where
-    /// each of its allocations lies: its device storage is
+    /// each of its allocations lies, each priced at its charge
+    /// ([`Self::charge`]): its device storage is
     /// [`Self::weight_device_allocations`].
     fn weight_storage_demand(&self, weight: &WeightPlan) -> Result<ClaimDemand, String> {
-        let bytes = weight.storage_bytes()?;
-        let device = self
-            .weight_device_allocation_sizes(weight)?
-            .into_iter()
-            .try_fold(0u64, u64::checked_add)
-            .ok_or("device weight storage overflows")?;
+        use seismic::Contract::{DeviceOnly, Shared};
+        let device = self.charges(DeviceOnly, self.weight_device_allocations(weight)?)?;
         // A banked weight's resident bytes are granules of the bank's pool.
         let pooled = ClaimDemand::pooled(crate::planning::BankTier::Bank, weight.resident_bytes);
         if weight.banked().is_some() {
             return pooled.checked_plus(ClaimDemand { device, ..ClaimDemand::default() }).ok_or_else(|| "banked weight demand overflows".to_owned());
         }
+        let [directory, staging, landed, notice] = weight.streamed_bytes()?;
+        let scale = weight.scale.as_ref().map_or(0, |scale| scale.resident_bytes);
+        let bound = weight.bound.checked_mul(4).ok_or("packing bound byte count overflows")?;
         if weight.stored_in_slots() {
             if let Some(table) = self.bank_table(weight) {
                 // StoredTable::new claims every record at load, not its
                 // floor, a granule each (`BankTable::plan`). Its own slot
                 // address table (`Slots::allocate_table`) replaces the
-                // ordinary record table, in host-shared storage.
-                let directory = bytes.checked_sub(weight.resident_bytes).ok_or("stored table directory charge underflows")?;
+                // ordinary record table, in host-shared storage beside its
+                // directory.
                 let slot_table = seismic::record_table_bytes(table.records.get())
                     .ok_or_else(|| "stored table record table byte count overflows".to_owned())?;
-                let shared = directory.checked_add(slot_table).ok_or("stored table shared demand overflows")?;
+                let shared = self.charges(Shared, [scale, bound, directory, staging, landed, notice, slot_table])?;
                 return pooled.checked_plus(ClaimDemand { shared, ..ClaimDemand::default() }).ok_or_else(|| "stored table demand overflows".to_owned());
             }
-            return Ok(ClaimDemand { shared: bytes, device, ..ClaimDemand::default() });
+            let shared = self.charges(Shared, [weight.resident_bytes, scale, bound, directory, staging, landed, notice])?;
+            return Ok(ClaimDemand { shared, device, ..ClaimDemand::default() });
         }
         // DeviceTable owns ordinary slots and regular staging, but its
         // directory, landed-read staging and notice are host-shared.
-        let [directory, _, landed, notice] = weight.streamed_bytes()?;
-        let shared = directory.checked_add(landed).and_then(|bytes| bytes.checked_add(notice))
-            .ok_or("streamed table shared storage overflows")?;
+        let shared = self.charges(Shared, [directory, landed, notice])?;
         Ok(ClaimDemand { device, shared, ..ClaimDemand::default() })
     }
 
@@ -2938,37 +2963,34 @@ impl ModelLoadPlan {
     /// record table its import binds (Seismic's rule,
     /// `seismic::record_table_bytes`; ordinary record tables use
     /// `DeviceInner::allocate` on every backend, independently of the
-    /// tensor's own placement) and a streamed table's staging. A banked
-    /// stack's records lie in the bank's reserved pages, and a stored
-    /// table's slots and every table's directory, landing staging and
-    /// notice in host-shared storage, outside these. Their sum is the
-    /// weight's device demand.
-    fn weight_device_allocation_sizes(&self, weight: &WeightPlan) -> Result<[u64; 5], String> {
+    /// tensor's own placement) and a streamed table's stagings, each its
+    /// own. A banked stack's records lie in the bank's reserved pages, and a
+    /// stored table's slots and every table's directory, landing staging and
+    /// notice in host-shared storage, outside these. The sum of their
+    /// charges ([`Self::charge`]) is the weight's device demand.
+    pub fn weight_device_allocations(&self, weight: &WeightPlan) -> Result<Vec<u64>, String> {
         let tables = match self.record_ports {
             Some(_) => seismic::record_table_bytes(weight.record_table_entries()?)
                 .ok_or_else(|| "record table byte count overflows".to_owned())?,
             None => 0,
         };
-        if weight.stored_in_slots() {
+        let allocations: Vec<u64> = if weight.stored_in_slots() {
             // The bank's own table replaces the ordinary record table.
-            Ok([if self.bank_table(weight).is_some() { 0 } else { tables }, 0, 0, 0, 0])
+            vec![if self.bank_table(weight).is_some() { 0 } else { tables }]
         } else {
-            Ok([
+            // Each staging is an allocation of its own.
+            let (staging, stagings) = weight.stagings(1)?;
+            [
                 if weight.banked().is_some() { 0 } else { weight.resident_bytes },
                 weight.bound.checked_mul(4).ok_or("packing bound byte count overflows")?,
                 weight.scale.as_ref().map_or(0, |scale| scale.resident_bytes),
                 tables,
-                weight.streamed_bytes()?[1],
-            ])
-        }
-    }
-
-    pub fn weight_device_allocations(&self, weight: &WeightPlan) -> Result<Vec<u64>, String> {
-        Ok(self
-            .weight_device_allocation_sizes(weight)?
+            ]
             .into_iter()
-            .filter(|bytes| *bytes > 0)
-            .collect())
+            .chain(std::iter::repeat_n(staging, stagings as usize))
+            .collect()
+        };
+        Ok(allocations.into_iter().filter(|bytes| *bytes > 0).collect())
     }
 
     /// Every device allocation of the load's weights
@@ -2981,11 +3003,7 @@ impl ModelLoadPlan {
             + self.vision.as_ref().map_or(0, Vec::len);
         let mut allocations = Vec::with_capacity(capacity * 2);
         visit_weight_storages(self, |_, weight| {
-            for bytes in self.weight_device_allocation_sizes(weight)? {
-                if bytes > 0 {
-                    allocations.push(bytes);
-                }
-            }
+            allocations.extend(self.weight_device_allocations(weight)?);
             Ok(())
         })?;
         Ok(allocations)
