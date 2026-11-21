@@ -449,18 +449,14 @@ pub struct ExecutionManifest {
     pub release: ReleaseRate,
     /// The model package's SHA-256 content hash, when the host names one;
     /// `None` identifies no model for the disk tier.
-    #[serde(default)]
     pub model_sha256: Option<String>,
     /// The directory the host keeps its SSD state cache under; `None` caches
     /// no state on disk.
-    #[serde(default)]
     pub state_cache: Option<PathBuf>,
     /// The bytes the SSD state cache may occupy.
-    #[serde(default = "default_state_cache_budget")]
     pub state_cache_budget_bytes: u64,
     /// The hex identity the SSD state cache's entries are keyed by, set by
     /// `EngineConfiguration::resolve`; `None` keys no disk state.
-    #[serde(default)]
     pub state_cache_identity: Option<String>,
     /// How the model's Prepare tunes, and the budget its load reads records
     /// under: [`TuningSettings::STANDARD`] unless a diagnostic host chooses

@@ -322,7 +322,8 @@ fn open_domain(
 fn prompt_chunk(request: RequestId, chunk: usize, chunks: usize, rows: usize) -> Operation {
     let position = chunk * rows;
     let last = chunk + 1 == chunks;
-    let demand = crate::batching::Demand::FEATURES | crate::batching::Demand::LOGITS;
+    // No logits: a launch that exports is never queued (`build_successor`), so it would not chain.
+    let demand = crate::batching::Demand::FEATURES;
     Operation::Forward {
         request,
         kind: WorkKind::Prefill,
@@ -499,7 +500,7 @@ fn run_workload(
 /// `slots == floor`, `host_slots == 0`) streams chained 2048-row prompt groups
 /// where cold experts exceed `window_slots` by >4x without deadlock, scores
 /// bit-for-bit identically to both the resident load and the unwindowed floor
-/// bank across every prompt row and decode step, and reduces the device
+/// bank across every prompt row's features and every decode step, and reduces the device
 /// ledger's committed floor bytes with zero accounting violations.
 #[test]
 fn a_windowed_conveyor_streams_cold_layers_bit_identically_within_its_bounded_ledger() {

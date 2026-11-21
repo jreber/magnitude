@@ -2038,12 +2038,13 @@ fn shrunk_bank_scores_as_resident(
 const CHUNK_ROWS: usize = 2 * magnitude_kernels::constants::VERIFY_ROWS as usize;
 
 /// Prompt chunk `chunk` of `chunks` of `rows` rows of `request`'s own
-/// prompt, each row's features and its last row's logits demanded; the last
-/// chunk selects the first token.
+/// prompt, each row's features demanded; the last chunk selects the first
+/// token. It exports no logits, as a served prompt's chunks do: a launch
+/// that exports is never queued (`build_successor`), so it would not chain.
 fn prompt_chunk(request: RequestId, chunk: usize, chunks: usize, rows: usize) -> Operation {
     let position = chunk * rows;
     let last = chunk + 1 == chunks;
-    let demand = crate::batching::Demand::FEATURES | crate::batching::Demand::LOGITS;
+    let demand = crate::batching::Demand::FEATURES;
     Operation::Forward {
         request,
         kind: WorkKind::Prefill,
@@ -2219,8 +2220,8 @@ fn chained_prompts_at_pass(
 }
 
 /// Two runs of `prompts` in chains of different lengths (`label` names the
-/// pair) are equal: in every output byte (each row's features and each
-/// chunk's last logits), in each committed position both publish (a chain
+/// pair) are equal: in every output byte (each row's features and the last
+/// chunk's selection), in each committed position both publish (a chain
 /// publishes its last chunk's; one of chunks alone, every chunk's), and in
 /// the two decode steps of each request after the prompts, which read every
 /// committed history row and recurrent state: their logits bytes and
@@ -2232,9 +2233,9 @@ fn assert_steps_equal(
     label: &str,
 ) {
     let chunks = prompts.requests as usize * prompts.chunks;
-    // Every prompt row reads back its features, and every step's last row
-    // its logits.
-    assert!(one
+    // Every prompt row reads back its features, and every decode step's
+    // last row its logits.
+    assert!(one[chunks..]
         .iter()
         .all(|(bits, _)| bits.last().is_some_and(|(_, logits, _)| logits.is_some())));
     assert!(one[..chunks].iter().all(|(bits, _)| {
