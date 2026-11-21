@@ -595,9 +595,10 @@ fn exporting_load(exported: usize) -> Fixture {
 
 /// Strict upgrade: a load that exports 256 rows of logits plans, charges
 /// and holds the readout of the same load exporting none (its launch
-/// pool's floor, and the output slot a served launch's retained output
-/// grows by), a served launch takes its readout slots from it as there,
-/// and its graph pools commit nothing more until a launch exports.
+/// pool's floor), a served launch takes its readout slots from it as there,
+/// a served launch finding the floor's outputs all retained grows the same
+/// output slot there, and its graph pools commit nothing more until a
+/// launch exports.
 #[test]
 fn an_exporting_loads_served_readout_is_a_load_exporting_nones() {
     let readout = |(mut domain, mut bindings): Fixture| {
@@ -607,17 +608,145 @@ fn an_exporting_loads_served_readout_is_a_load_exporting_nones() {
             (pool.committed_bytes().unwrap(), pool.output_slot_bytes(), pool.available_output())
         };
         let floor = pool(&domain);
-        let request = RequestId(1);
+        let (request, retaining) = (RequestId(1), RequestId(2));
         open(&mut domain, &mut bindings, request);
+        open(&mut domain, &mut bindings, retaining);
         let reserved = domain
             .reserve(&mut bindings, &[sampling(request, crate::batching::Demand::NONE, crate::Shaping::default())])
             .unwrap();
         let serving = pool(&domain);
         drop(reserved);
-        (planned, floor, serving, domain.resources.committed_bytes().unwrap())
+        // Every output the floor holds retained, a served launch grows one.
+        let launch = domain.resources.target_readout_graph(served_readout(usize::MAX));
+        let retained = std::iter::from_fn(|| launch.acquire_output().ok()).collect::<Vec<_>>();
+        let reserved = domain
+            .reserve(&mut bindings, &[sampling(retaining, crate::batching::Demand::NONE, crate::Shaping::default())])
+            .unwrap();
+        let grown = pool(&domain);
+        assert!(grown.0 > floor.0, "the served launch grew a retained output slot");
+        drop((reserved, retained));
+        (planned, floor, serving, grown, domain.resources.committed_bytes().unwrap())
     };
-    let (served, exporting) = (readout(exporting_load(0)), readout(exporting_load(256)));
-    assert_eq!(exporting, served);
+    let (served, exported) = (readout(exporting_load(0)), readout(exporting_load(256)));
+    assert_eq!(exported, served);
+}
+
+/// A group with a row demanding logits is admitted before anything is
+/// provisioned for it (the scheduler provisions a group before it asks
+/// for its requirements): refused as invalid input, with nothing grown,
+/// where its load exports no logits or it shapes a selection.
+#[test]
+fn a_logits_group_is_refused_before_it_provisions() {
+    let shaped = crate::Shaping { temperature: 0.7, top_k: 2, ..crate::Shaping::default() };
+    let refused = |result: Result<(), DomainError>| match result {
+        Err(DomainError::Input(detail)) => detail,
+        other => panic!("not refused as invalid input: {other:?}"),
+    };
+    let (mut domain, mut bindings) = exporting_load(0);
+    open(&mut domain, &mut bindings, RequestId(1));
+    let detail = refused(domain.provision(&mut bindings, &[exporting(RequestId(1), 1)], None));
+    assert!(detail.contains("exports none"), "{detail}");
+    let (mut domain, mut bindings) = exporting_load(256);
+    open(&mut domain, &mut bindings, RequestId(1));
+    let detail = refused(domain.provision(&mut bindings, &[sampling(RequestId(1), crate::batching::Demand::LOGITS, shaped)], None));
+    assert!(detail.contains("selects unshaped"), "{detail}");
+    assert_eq!(export_slots(&domain), (crate::GraphSlots { activations: 0, output: 0 }, 0), "nothing was grown");
+}
+
+/// A prompt chunk that exports logits is never queued behind another: a
+/// launch that exports claims the export readout's slots as it reserves
+/// (`provision_export`), so no queued step takes them outside that claim,
+/// their idle slots, which the ledger counts as cache, least of all.
+#[test]
+fn a_chunk_that_exports_is_never_queued_behind_another() {
+    let (mut domain, mut bindings) = fixture_of(
+        tiny_definition(),
+        ResourceLimits { exported_logits_rows: 2, ..limits(4, 1, true) },
+        None,
+        false,
+        platform::DeviceRequest::Automatic,
+    );
+    let (scored, served, prompted) = (RequestId(1), RequestId(2), RequestId(3));
+    for request in [scored, served, prompted] {
+        open(&mut domain, &mut bindings, request);
+    }
+    // The export slots, idle.
+    drop(domain.reserve(&mut bindings, &[exporting(scored, 1)]).unwrap());
+    drop(domain.reserve(&mut bindings, &[sampling(served, crate::batching::Demand::NONE, crate::Shaping::default())]).unwrap());
+    let free = |domain: &ExecutorDomain<TestFamily>| {
+        let pool = domain.resources.target_readout_export_graph().unwrap();
+        (pool.available_workspace(), pool.available_output())
+    };
+    assert_eq!(free(&domain), (1, 1));
+    let exporting_chunk = Operation::Forward {
+        request: prompted,
+        kind: WorkKind::Prefill,
+        tokens: vec![crate::TokenId(2)],
+        position: 1,
+        conditioning: None,
+        demand: crate::batching::Demand::LOGITS,
+        select: Vec::new(),
+        committed: 1,
+        prime: None,
+    };
+    domain.plan_successors(vec![exporting_chunk]);
+    let flight = submit_reserved_target(&mut domain, bindings, vec![prefill(prompted, 0)]);
+    assert_eq!(domain.queue.len(), 0, "nothing is queued behind the chunk");
+    assert_eq!(free(&domain), (1, 1), "no queued step took an export slot");
+    let (pending, _) = finish_one(&mut domain, flight);
+    domain.reconcile(pending, PhysicalDecision { accepted_rows: 1 }).unwrap();
+}
+
+/// On the CPU, consecutive steps of one request that export logits, each
+/// outcome read and let go before the next reserves (as a score walk's
+/// steps are), take one export output slot between them: a launch's
+/// exported logits are held only by its outcome's views.
+#[test]
+fn consecutive_exporting_steps_hold_one_export_output_slot() {
+    use super::fixtures::loaded::{fixture, limits, load, Banked};
+    let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
+    let (directory, definition, package) = fixture("consecutive-exports");
+    let (mut domain, mut bindings, _, _) =
+        load(&catalog, &definition, &package, seismic::BackendName::Cpu, limits(4, false, 1, 2), Banked::Resident);
+    let request = RequestId(1);
+    open(&mut domain, &mut bindings, request);
+    for position in 0..3 {
+        let step = Operation::Forward {
+            request,
+            kind: WorkKind::Decode,
+            tokens: vec![crate::TokenId(position as u32 + 1)],
+            position,
+            conditioning: None,
+            demand: crate::batching::Demand::LOGITS | crate::batching::Demand::SELECT,
+            select: vec![crate::SelectSpec {
+                sampling: crate::Sampling::Greedy,
+                seed: 0,
+                position,
+                domain: 0,
+                mask: None,
+                shaping: crate::Shaping::default(),
+                history: None,
+            }],
+            committed: 1,
+            prime: None,
+        };
+        let flight = submit_reserved_target(&mut domain, bindings, vec![step]);
+        let (pending, returned) = finish_one(&mut domain, flight);
+        bindings = returned;
+        let Outcome::Forward { rows } = pending.outcome() else {
+            panic!("a step has a forward outcome");
+        };
+        let logits = rows[0].logits.as_ref().expect("the step exports its logits").read_to_host().unwrap();
+        assert_eq!(logits.len(), definition.decoder.vocabulary as usize);
+        domain.reconcile(pending, PhysicalDecision { accepted_rows: 1 }).unwrap();
+        assert_eq!(
+            export_slots(&domain).0,
+            crate::GraphSlots { activations: 1, output: 1 },
+            "step {position}: one export activation and output slot"
+        );
+    }
+    drop(domain);
+    std::fs::remove_dir_all(&directory).ok();
 }
 
 /// What a served launch projecting `projected` rows reads out: the readout

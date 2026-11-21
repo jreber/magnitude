@@ -303,6 +303,13 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         if self.claim_slots(operations).is_some() {
             return Ok(());
         }
+        // Admitted before anything is provisioned for it: the scheduler
+        // provisions a group before it asks for its requirements, and a
+        // launch that exports would otherwise grow the export readout's
+        // slots, or find none, before its refusal.
+        if let Some(lane) = operations.first().map(ReservationLane::of) {
+            self.admit_selection(lane, operations)?;
+        }
         // Any other group resolves the queue: a chain under way concludes,
         // its holder's state the one its reconciled chunks reached, from
         // which a group of its holder's that is not its queued chunk

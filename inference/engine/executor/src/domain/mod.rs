@@ -459,11 +459,6 @@ pub struct DomainReservation {
     resources: ReservedResources,
 }
 
-/// The logits rows a target launch of `operations` projects: a forward's
-/// rows that demand logits (decode and verification rows carry the demand,
-/// a prompt chunk's only its final row), else the rows it selects. Its
-/// readout slot is of the class that holds them
-/// (`AllocatedResources::target_readout_graph`).
 /// What a target launch of `operations` reads out: the rows it projects
 /// ([`projected_rows`]), and whether it exports their logits, which it does
 /// exactly when a forward demands `Demand::LOGITS`.
@@ -476,6 +471,11 @@ pub(super) fn launch_readout(operations: &[Operation]) -> crate::resources::Laun
     }
 }
 
+/// The logits rows a target launch of `operations` projects: a forward's
+/// rows that demand logits (decode and verification rows carry the demand,
+/// a prompt chunk's only its final row), else the rows it selects. Its
+/// readout slot is of the class that holds them
+/// (`AllocatedResources::target_readout_graph`).
 pub(super) fn projected_rows(operations: &[Operation]) -> usize {
     operations
         .iter()
