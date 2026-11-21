@@ -931,7 +931,9 @@ fn a_whole_bank_shrunk_between_decode_steps_scores_as_resident() {
 /// so a shrink with no memory left to allocate, every ledger of the device
 /// bound to what it charges, begins and completes, and its step records
 /// none. The steps before it ran the whole bank's resident forms; none after
-/// it does.
+/// it does. The load exports logits, as the service's does; its steps export
+/// none, as a launch that exports runs an export class, no decode launch,
+/// whose graphs are recorded at first use.
 #[test]
 #[ignore = "needs a CUDA device: run with --ignored on one"]
 fn a_whole_banks_shrink_step_records_no_graph() {
@@ -945,11 +947,11 @@ fn a_whole_banks_shrink_step_records_no_graph() {
     let request = RequestId(1);
     domain.install_input(request, PreparedModelInput::continuation_only()).unwrap();
     domain.open_served(&mut bindings, request, None).unwrap();
-    let (_, mut bindings) = run(&mut domain, bindings, scored(forward(request, WorkKind::Prefill, &[5, 1], 0, true)), false, cuda);
+    let (_, mut bindings) = run(&mut domain, bindings, forward(request, WorkKind::Prefill, &[5, 1], 0, true), false, cuda);
     let mut position = 2;
     let mut decode = |domain: &mut ExecutorDomain, bindings: crate::StateBindings| {
         let token = (position * 37 % 256) as u32;
-        let (_, next, _) = step(domain, bindings, scored(forward(request, WorkKind::Decode, &[token], position, true)), cuda);
+        let (_, next, _) = step(domain, bindings, forward(request, WorkKind::Decode, &[token], position, true), cuda);
         position += 1;
         next
     };
@@ -1048,12 +1050,14 @@ impl DecodeSteps {
     }
 
     /// A decode step of the first `count` requests, its recordings kept as
-    /// `step`'s.
+    /// `step`'s: it exports no logits, as a launch that exports runs an
+    /// export class, no decode launch, whose graphs are recorded at first
+    /// use.
     fn step(&mut self, domain: &mut ExecutorDomain, mut bindings: crate::StateBindings, count: usize, step: &'static str, backend: seismic::BackendName) -> crate::StateBindings {
         let operations = self.requests[..count]
             .iter()
             .zip(&self.positions)
-            .map(|(&request, &position)| scored(forward(request, WorkKind::Decode, &[(position * 37 % 256) as u32], position, true)))
+            .map(|(&request, &position)| forward(request, WorkKind::Decode, &[(position * 37 % 256) as u32], position, true))
             .collect::<Vec<_>>();
         let before = domain.family_graph_replays();
         let reserved = domain.reserve(&mut bindings, &operations).unwrap().into_resources();
