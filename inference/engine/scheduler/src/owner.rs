@@ -2425,11 +2425,15 @@ impl<F: ProgramFamily> Service<F> {
                 .min(remaining_rows);
             attempted += 1;
             let (record, candidate) = candidates.remove(&id).expect("selected candidate");
-            // Work composed before this round joins as it is, or waits.
-            if candidate
-                .composed()
-                .is_some_and(|work| selection_charge(work) > remaining_selections)
-            {
+            // Work composed before this round joins as it is, or waits: for
+            // selections, or for rows beside work that joined before it. With
+            // no work before it, it always joins, so it is never held by the
+            // budget alone.
+            if candidate.composed().is_some_and(|work| {
+                selection_charge(work) > remaining_selections
+                    || (!operations.is_empty()
+                        && work.iter().map(Operation::row_count).sum::<usize>() > remaining_rows)
+            }) {
                 self.requests.insert(
                     id,
                     Request {
@@ -4979,6 +4983,39 @@ let Ok(residency) = service.make_resident(id, &mut record, generation, bindings)
         assert_eq!(service.prefix_cache.len(), entries, "no prefix entry is touched");
     }
 
+    /// A chunk composed alone with the whole row budget and parked on
+    /// memory, beside a peer selected ahead of it once the wait ends.
+    fn parked_chunk_beside_a_peer() -> (Owner<fixtures::TestFamily>, [(RequestId, PublicationReceiver); 2]) {
+        let (domain, bindings) = fixtures::fixture(None);
+        let mut owner = Owner::new(domain, bindings, limits(), Arc::new(NoWakes)).unwrap();
+        let vocabulary = fixtures::tiny_definition().decoder.vocabulary as usize;
+        let requests = [0, 1].map(|_| {
+            owner.admit(fresh(vocabulary), PreparedModelInput::continuation_only(), PrefixRetention::Transient, 4, 0).unwrap()
+        });
+        let (peer, parked) = (requests[0].0, requests[1].0);
+        let Owner { service, pipeline: Pipeline::Idle(bindings) } = &mut owner else { panic!("an idle owner") };
+        assert_eq!(residency(service, bindings, parked), Some(true));
+        let held = service.requests.remove(&peer).expect("the peer");
+        let Ok(Selected::Round(mut alone)) = service.select(bindings) else { panic!("a round of one") };
+        let chunk = alone.groups.pop_front().expect("its group");
+        assert_eq!(chunk.operations().iter().map(Operation::row_count).sum::<usize>(), ROWS, "alone it takes the budget");
+        let wait = Wait { at: service.epoch, on: WaitsOn::Memory };
+        service.park(&mut alone, chunk, wait);
+        service.epoch.advance();
+        service.requests.insert(peer, held);
+        assert_eq!(residency(service, bindings, peer), Some(true));
+        (owner, requests)
+    }
+
+    #[test]
+    fn parked_work_keeps_to_the_row_budget() {
+        let (mut owner, _requests) = parked_chunk_beside_a_peer();
+        let Owner { service, pipeline: Pipeline::Idle(bindings) } = &mut owner else { panic!("an idle owner") };
+        let Ok(Selected::Round(round)) = service.select(bindings) else { panic!("a round") };
+        let rows = round.groups.iter().flat_map(|group| group.operations()).map(Operation::row_count).sum::<usize>();
+        assert!(rows <= ROWS, "the round holds {rows} rows of a budget of {ROWS}");
+    }
+
     /// Relief carried out for a claim short of memory evicts exactly the
     /// requests its plan names, the latest admitted first and just enough,
     /// never the first.
@@ -5417,6 +5454,45 @@ mod scoring_tests {
                 }
             }
             self.end.is_some()
+        }
+    }
+
+    /// A prompt chunk parked on memory with the whole budget, beside a peer
+    /// selected ahead of it once the wait ends: both complete, generating
+    /// every token, neither refused for the launch's rows.
+    #[test]
+    fn parked_work_and_its_peer_both_complete() {
+        const ROWS: usize = 4;
+        let (directory, definition, domain, bindings) = fixtures::loaded::exporting("parked-beside-a-peer", CONTEXT, 1, EXPORTED);
+        let budget = ServiceLimits { prefill_tokens: ROWS, decode_tokens: ROWS, ..limits() };
+        let mut served = Served {
+            owner: Some(Owner::new(domain, bindings, budget, Arc::new(NoWakes)).unwrap()),
+            now: 0,
+            directory,
+            vocabulary: definition.decoder.vocabulary as usize,
+            context: definition.decoder.context_limit as usize,
+            method: MethodChoice::Plain,
+        };
+        let peer = served.admit(8, false);
+        // Older by more than residency's preference, the peer is taken first.
+        served.now = 3_000_000_000;
+        let parked = served.admit(8, false);
+        let now = served.now;
+        let Owner { service, pipeline: Pipeline::Idle(bindings) } = served.owner() else { panic!("an idle owner") };
+        service.now = now;
+        let held = service.requests.remove(&peer.id).expect("the peer");
+        let Ok(Selected::Round(mut alone)) = service.select(bindings) else { panic!("a round of one") };
+        let chunk = alone.groups.pop_front().expect("its group");
+        assert_eq!(chunk.operations().iter().map(Operation::row_count).sum::<usize>(), ROWS, "alone it takes the budget");
+        let wait = Wait { at: service.epoch, on: WaitsOn::Memory };
+        service.park(&mut alone, chunk, wait);
+        service.epoch.advance();
+        service.requests.insert(peer.id, held);
+        let mut chats = [peer, parked];
+        served.until(|_| chats.iter_mut().all(Stream::poll));
+        for chat in chats {
+            assert_eq!(chat.end, Some(Ok(FinishReason::Length)));
+            assert_eq!(chat.tokens.len(), GENERATED);
         }
     }
 
